@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
+from pathlib import Path
+
+# Ensure local script and bundled directories are resolvable
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+_SCRIPTS = Path(os.environ.get("LOCALAPPDATA", "")) / "opencode-unlimited" / "scripts"
+if _SCRIPTS.is_dir() and str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 from ouc_common import (
     GUARD_LOG_FILE,
@@ -62,18 +73,7 @@ def _save_state(state: dict) -> None:
 def _dispatch_auto_resume() -> None:
     """Dispatches 'continue' to the active OpenCode session once the limit is bypassed."""
     try:
-        try:
-            from auto_resume import resume_active_session, is_auto_resume_enabled, clear_opencode_free_limit
-        except ImportError:
-            import sys
-            from pathlib import Path
-            src_dir = Path(__file__).resolve().parent
-            if str(src_dir) not in sys.path:
-                sys.path.insert(0, str(src_dir))
-            scripts_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "opencode-unlimited" / "scripts"
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
-            from auto_resume import resume_active_session, is_auto_resume_enabled, clear_opencode_free_limit
+        from auto_resume import resume_active_session, is_auto_resume_enabled, clear_opencode_free_limit
 
         # Always clear client-side free-limit locks immediately upon rotation
         clear_opencode_free_limit()

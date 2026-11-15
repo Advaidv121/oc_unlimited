@@ -15,23 +15,30 @@ from tor_manager import (
     start_portable_tor,
 )
 
+import sys
+
 EgressType = Literal["warp", "tor", "custom"]
 EGRESS_CONFIG_FILE = LANE_DIR / "egress_mode.json"
 
 
+def get_default_warp_scope() -> str:
+    return "tun" if sys.platform == "win32" else "isolated"
+
+
 def get_egress_config() -> dict:
     """Read the active egress routing configuration."""
+    default_scope = get_default_warp_scope()
     if EGRESS_CONFIG_FILE.is_file():
         try:
             cfg = json.loads(EGRESS_CONFIG_FILE.read_text(encoding="utf-8"))
             if "warp_scope" not in cfg:
-                cfg["warp_scope"] = "isolated"
+                cfg["warp_scope"] = default_scope
             return cfg
         except Exception:
             pass
     return {
         "mode": "warp",
-        "warp_scope": "isolated",
+        "warp_scope": default_scope,
         "custom_proxy": "127.0.0.1:10808",
         "custom_type": "socks5",
     }
@@ -41,13 +48,17 @@ def set_egress_config(
     mode: EgressType,
     custom_proxy: str = "127.0.0.1:10808",
     custom_type: str = "socks5",
-    warp_scope: str = "isolated",
+    warp_scope: str | None = None,
 ) -> dict:
     """Save the active egress configuration."""
     ensure_dirs()
+    if warp_scope is None or not warp_scope.strip():
+        chosen_scope = get_default_warp_scope()
+    else:
+        chosen_scope = "tun" if warp_scope.lower().strip() == "tun" else "isolated"
     cfg = {
         "mode": mode,
-        "warp_scope": "tun" if warp_scope.lower().strip() == "tun" else "isolated",
+        "warp_scope": chosen_scope,
         "custom_proxy": custom_proxy.strip(),
         "custom_type": custom_type.lower().strip(),
     }
@@ -166,8 +177,9 @@ def open_multi_egress_upstream(host: str, port: int, warp_fallback_fn) -> socket
 
     if mode == "custom":
         ptype = cfg.get("custom_type", "socks5").lower()
-        pool = cfg.get("custom_pool", [])
-        tries = max(1, len(pool))
+        raw = cfg.get("custom_proxy", "127.0.0.1:10808").strip()
+        proxies = parse_proxy_list(raw)
+        tries = max(1, len(proxies))
         last_err = None
 
         for _ in range(tries):

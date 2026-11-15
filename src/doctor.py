@@ -82,12 +82,13 @@ def main() -> int:
 
     # 2. Egress Mode Check (WARP, Tor, or Custom Proxy)
     mode = "warp"
-    warp_scope = "isolated"
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    warp_scope = default_scope
     try:
         from proxy_chain import get_egress_config
         cfg = get_egress_config()
         mode = cfg.get("mode", "warp")
-        warp_scope = cfg.get("warp_scope", "isolated")
+        warp_scope = cfg.get("warp_scope", default_scope)
     except Exception:
         pass
 
@@ -136,6 +137,8 @@ def main() -> int:
                 from tor_manager import test_socks5_alive
                 if test_socks5_alive(40000, host="127.0.0.1"):
                     _ok("WARP isolated SOCKS5 proxy: active on 127.0.0.1:40000 (app-only mode)")
+                elif connected:
+                    _ok("WARP running in Full TUN mode (adapter-bound IPv6 active) — port 40000 proxy bypassed")
                 else:
                     _warn("WARP isolated port 40000 not responding — click Auto-Heal or Rotate in app")
             except Exception:

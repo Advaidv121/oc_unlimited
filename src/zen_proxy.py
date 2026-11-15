@@ -124,6 +124,13 @@ def _relay(a: socket.socket, b: socket.socket) -> None:
             # Windows TCP keepalive parameters: idle 15s, interval 5s
             if hasattr(socket, "SIO_KEEPALIVE_VALS"):
                 s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
+            # Linux TCP keepalive parameters: idle 15s, interval 5s, 5 probes
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
         except Exception:
             pass
 
@@ -186,10 +193,11 @@ def _open_warp_direct(
     port: int,
     warp_state: _WarpState,
 ) -> socket.socket:
-    scope = "isolated"
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    scope = default_scope
     try:
         from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", "isolated")
+        scope = get_egress_config().get("warp_scope", default_scope)
     except Exception:
         pass
 
@@ -200,14 +208,11 @@ def _open_warp_direct(
         or clean_host.endswith(".opencode.com")
     )
 
-    # 1. Isolated (App-Only) mode: tunnel via local WARP SOCKS5 proxy (port 40000) if listening
+    # 1. Isolated (App-Only) mode: tunnel via local WARP SOCKS5 proxy (port 40000)
     if scope == "isolated":
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_chk:
-                s_chk.settimeout(0.2)
-                if s_chk.connect_ex(("127.0.0.1", 40000)) == 0:
-                    from tor_manager import open_socks5_tunnel
-                    return open_socks5_tunnel(clean_host, port, socks_host="127.0.0.1", socks_port=40000, timeout=8.0)
+            from tor_manager import open_socks5_tunnel
+            return open_socks5_tunnel(clean_host, port, socks_host="127.0.0.1", socks_port=40000, timeout=2.0)
         except Exception:
             pass
 
@@ -220,13 +225,10 @@ def _open_warp_direct(
             except Exception:
                 pass
 
-        # Try local WARP SOCKS5 if TUN socket bind failed and port 40000 is open
+        # Try local WARP SOCKS5 if TUN socket bind failed
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_chk:
-                s_chk.settimeout(0.2)
-                if s_chk.connect_ex(("127.0.0.1", 40000)) == 0:
-                    from tor_manager import open_socks5_tunnel
-                    return open_socks5_tunnel(clean_host, port, socks_host="127.0.0.1", socks_port=40000, timeout=8.0)
+            from tor_manager import open_socks5_tunnel
+            return open_socks5_tunnel(clean_host, port, socks_host="127.0.0.1", socks_port=40000, timeout=2.0)
         except Exception:
             pass
 

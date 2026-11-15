@@ -31,6 +31,12 @@ def main() -> int:
         print("-- registration/tunnel failed — keeper will keep retrying --")
         return 1
 
+    try:
+        from auto_resume import clear_opencode_free_limit
+        clear_opencode_free_limit()
+    except Exception:
+        pass
+
     print(f"new /64: {new_v6}")
     old_prefix = normalize_v6_64(old_v6)
     new_prefix = normalize_v6_64(new_v6)

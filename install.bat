@@ -1,5 +1,5 @@
 @echo off
-:: Opencode Unlimited v2.4.0 Windows Installer
+:: Opencode Unlimited v2.4.2 Windows Installer
 setlocal
 set "SCRIPT_DIR=%~dp0"
 set "NOPAUSE=0"

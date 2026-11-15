@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -265,37 +266,89 @@ def warp_mode(warp_bin: str | None = None) -> str:
     return ""
 
 
+def get_warp_protocol(warp_bin: str | None = None) -> str:
+    """Return current WARP protocol (e.g. 'wireguard' or 'masque') in lowercase."""
+    rc, out = run_warp(["-j", "settings"], warp_bin=warp_bin, timeout=5.0)
+    if rc == 0 and "{" in out:
+        try:
+            idx_start = out.find("{")
+            idx_end = out.rfind("}")
+            if idx_start != -1 and idx_end != -1:
+                data = json.loads(out[idx_start : idx_end + 1])
+                proto = (
+                    data.get("settings", {})
+                    .get("warp_tunnel_protocol", "")
+                    .lower()
+                    .strip()
+                )
+                if proto:
+                    return proto
+        except Exception:
+            pass
+    rc2, out2 = run_warp(["settings"], warp_bin=warp_bin, timeout=5.0)
+    if rc2 == 0 and out2:
+        for line in out2.splitlines():
+            if "protocol" in line.lower():
+                if "wireguard" in line.lower():
+                    return "wireguard"
+                if "masque" in line.lower():
+                    return "masque"
+    return ""
+
+
+def ensure_warp_protocol(desired: str = "wireguard", warp_bin: str | None = None) -> bool:
+    """Ensure WARP tunnel protocol is set to desired without touching it if already set."""
+    current = get_warp_protocol(warp_bin=warp_bin)
+    if current == desired.lower():
+        return True
+    rc, _ = run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin, timeout=10.0)
+    return rc == 0
+
+
 def warp_status(warp_bin: str | None = None) -> tuple[bool, str, str]:
     """Return (is_connected, mode_name, raw_text) for WARP."""
     rc, out = run_warp(["-j", "status"], warp_bin=warp_bin, timeout=8.0)
-    if rc == 0 and out.startswith("{"):
+    if rc == 0 and "{" in out:
         try:
-            data = json.loads(out)
-            status = str(data.get("status", ""))
-            connected = status.lower() == "connected"
-            mode = ""
-            reason = data.get("reason")
-            if isinstance(reason, dict):
-                cur = (
-                    reason.get("SettingsChanged", {}).get("current", {})
-                    if isinstance(reason.get("SettingsChanged"), dict)
-                    else {}
-                )
-                op_mode = cur.get("operation_mode")
-                if isinstance(op_mode, str):
-                    mode = op_mode
-                elif isinstance(op_mode, dict):
-                    mode = ",".join(op_mode.keys())
-            if not mode:
-                mode = warp_mode(warp_bin=warp_bin)
-            return connected, mode, status
+            idx_start = out.find("{")
+            idx_end = out.rfind("}")
+            if idx_start != -1 and idx_end != -1:
+                data = json.loads(out[idx_start : idx_end + 1])
+                status = str(data.get("status", "")).strip()
+                connected = status.lower() == "connected"
+                mode = ""
+                reason = data.get("reason")
+                if isinstance(reason, dict):
+                    cur = (
+                        reason.get("SettingsChanged", {}).get("current", {})
+                        if isinstance(reason.get("SettingsChanged"), dict)
+                        else {}
+                    )
+                    op_mode = cur.get("operation_mode")
+                    if isinstance(op_mode, str):
+                        mode = op_mode
+                    elif isinstance(op_mode, dict):
+                        mode = ",".join(op_mode.keys())
+                if not mode:
+                    mode = warp_mode(warp_bin=warp_bin)
+                return connected, mode, status
         except Exception:
             pass
 
     rc2, out2 = run_warp(["status"], warp_bin=warp_bin, timeout=8.0)
-    first = out2.splitlines()[0] if out2 else ""
-    connected = rc2 == 0 and "Connected" in first and "Disconnected" not in first
-    return connected, "", first
+    connected = False
+    raw_status = ""
+    for line in (out2 or "").splitlines():
+        line_s = line.strip()
+        if "status" in line_s.lower() or "connected" in line_s.lower():
+            if not raw_status:
+                raw_status = line_s
+            if "connected" in line_s.lower() and "disconnected" not in line_s.lower():
+                connected = True
+                break
+    if not raw_status and out2:
+        raw_status = out2.splitlines()[0].strip()
+    return connected, "", raw_status
 
 
 def is_cloudflare_v6(addr: str) -> bool:
@@ -312,6 +365,7 @@ def is_cloudflare_v6(addr: str) -> bool:
 
 def get_warp_local_v6() -> str | None:
     """Return the active CloudflareWARP adapter global IPv6 address, or None."""
+    # 1. Try directly querying the CloudflareWARP named interface
     try:
         res = run_hidden(
             ["netsh", "interface", "ipv6", "show", "addresses", "CloudflareWARP"],
@@ -333,10 +387,33 @@ def get_warp_local_v6() -> str | None:
                     return str(ip)
     except Exception:
         pass
+
+    # 2. Localized Windows fallback: query all IPv6 addresses and look for Cloudflare ranges
+    try:
+        res_all = run_hidden(
+            ["netsh", "interface", "ipv6", "show", "addresses"],
+            timeout=5.0,
+        )
+        if res_all.returncode == 0:
+            for line in res_all.stdout.splitlines():
+                m = _IPV6_RE.search(line)
+                if not m:
+                    continue
+                cand = m.group(1).split("%", 1)[0]
+                try:
+                    ip = ipaddress.IPv6Address(cand)
+                except ValueError:
+                    continue
+                if ip.is_link_local or ip.is_loopback or ip.is_multicast:
+                    continue
+                if is_cloudflare_v6(str(ip)):
+                    return str(ip)
+    except Exception:
+        pass
     return None
 
 
-def get_egress_v6(timeout: float = 8.0) -> str:
+def get_egress_v6(timeout: float = 6.0) -> str:
     """Query external IPv6 egress via curl.exe or urllib using Cloudflare trace endpoints."""
     curl = shutil.which("curl.exe") or shutil.which("curl")
     endpoints = (
@@ -345,68 +422,91 @@ def get_egress_v6(timeout: float = 8.0) -> str:
         "https://api64.ipify.org",
     )
 
-    if curl:
-        # 1. Try SOCKS5 proxy port 40000 (isolated mode)
-        for ep in endpoints:
-            try:
-                res = run_hidden(
-                    [curl, "-x", "socks5h://127.0.0.1:40000", "-s", "-m", str(int(timeout)), ep],
-                    timeout=timeout + 1.5,
-                )
-                text = res.stdout.strip()
-                if "ip=" in text:
-                    for line in text.splitlines():
-                        if line.startswith("ip="):
-                            cand = line.split("=", 1)[1].strip()
-                            if ":" in cand:
-                                ipaddress.IPv6Address(cand)
-                                return cand
-                elif ":" in text:
-                    ipaddress.IPv6Address(text)
-                    return text
-            except Exception:
-                pass
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    scope = default_scope
+    mode = "warp"
+    try:
+        from proxy_chain import get_egress_config
+        cfg = get_egress_config()
+        scope = cfg.get("warp_scope", default_scope)
+        mode = cfg.get("mode", "warp")
+    except Exception:
+        pass
 
-        # 2. Try native IPv6 (-6) via TUN adapter
+    def _extract_ip(text: str) -> str:
+        if "ip=" in text:
+            for line in text.splitlines():
+                if line.startswith("ip="):
+                    cand = line.split("=", 1)[1].strip()
+                    if ":" in cand:
+                        try:
+                            ipaddress.IPv6Address(cand)
+                            return cand
+                        except ValueError:
+                            pass
+        elif ":" in text:
+            try:
+                ipaddress.IPv6Address(text)
+                return text
+            except ValueError:
+                pass
+        return ""
+
+    if curl:
+        # 1. Isolated WARP scope: probe via SOCKS5 proxy port 40000
+        if mode == "warp" and scope == "isolated":
+            for ep in endpoints:
+                try:
+                    res = run_hidden(
+                        [curl, "-x", "socks5h://127.0.0.1:40000", "-s", "-m", str(int(timeout)), ep],
+                        timeout=timeout + 1.0,
+                    )
+                    cand = _extract_ip(res.stdout.strip())
+                    if cand:
+                        return cand
+                except Exception:
+                    pass
+
+        # 2. Tor mode: probe via Tor SOCKS5
+        elif mode == "tor":
+            for p in (9050, 9150):
+                for ep in endpoints:
+                    try:
+                        res = run_hidden(
+                            [curl, "-x", f"socks5h://127.0.0.1:{p}", "-s", "-m", str(int(timeout)), ep],
+                            timeout=timeout + 1.0,
+                        )
+                        cand = _extract_ip(res.stdout.strip())
+                        if cand:
+                            return cand
+                    except Exception:
+                        pass
+
+        # 3. TUN scope or fallback: probe native IPv6 (-6)
         for ep in endpoints:
             try:
                 res = run_hidden(
                     [curl, "-6", "-s", "-m", str(int(timeout)), ep],
-                    timeout=timeout + 1.5,
+                    timeout=timeout + 1.0,
                 )
-                text = res.stdout.strip()
-                if "ip=" in text:
-                    for line in text.splitlines():
-                        if line.startswith("ip="):
-                            cand = line.split("=", 1)[1].strip()
-                            if ":" in cand:
-                                ipaddress.IPv6Address(cand)
-                                return cand
-                elif ":" in text:
-                    ipaddress.IPv6Address(text)
-                    return text
+                cand = _extract_ip(res.stdout.strip())
+                if cand:
+                    return cand
             except Exception:
                 pass
 
-    # 3. Direct urllib fallback
-    for ep in endpoints:
-        try:
-            req = urllib.request.Request(ep, headers={"User-Agent": "curl/8.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                text = resp.read().decode("utf-8", errors="replace").strip()
-                if "ip=" in text:
-                    for line in text.splitlines():
-                        if line.startswith("ip="):
-                            cand = line.split("=", 1)[1].strip()
-                            if ":" in cand:
-                                ipaddress.IPv6Address(cand)
-                                return cand
-                elif ":" in text:
-                    ipaddress.IPv6Address(text)
-                    return text
-        except Exception:
-            pass
-    return ""
+    # Direct urllib fallback (for TUN mode)
+    if scope != "isolated":
+        for ep in endpoints:
+            try:
+                req = urllib.request.Request(ep, headers={"User-Agent": "curl/8.0"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    text = resp.read().decode("utf-8", errors="replace").strip()
+                    cand = _extract_ip(text)
+                    if cand:
+                        return cand
+            except Exception:
+                pass
     return ""
 
 
@@ -552,10 +652,11 @@ def hop_once(warp_bin: str, max_reg_tries: int = 3) -> str:
     if not registered:
         return ""
 
-    scope = "isolated"
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    scope = default_scope
     try:
         from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", "isolated")
+        scope = get_egress_config().get("warp_scope", default_scope)
     except Exception:
         pass
 

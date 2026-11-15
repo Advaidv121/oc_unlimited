@@ -32,100 +32,111 @@ def ensure_connected(warp_bin: str | None = None) -> bool:
     if not warp_bin:
         return False
 
-    scope = "isolated"
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    scope = default_scope
     try:
         from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", "isolated")
+        scope = get_egress_config().get("warp_scope", default_scope)
     except Exception:
         pass
 
-    connected, mode, _ = warp_status(warp_bin)
+    connected, mode, raw = warp_status(warp_bin)
+
+    # 1. If already connected, DO NOT TOUCH IT!
+    # Re-setting protocol, ports or endpoints tears down the adapter and drops active sockets (causing ECONNRESET).
+    if connected:
+        return True
+
+    raw_lower = (raw or "").lower()
+
+    # 2. If WARP is currently establishing handshake (Connecting / Reconnecting),
+    # give it a generous grace window (up to 8s) rather than declaring it dead.
+    if "connecting" in raw_lower:
+        for _ in range(8):
+            time.sleep(1.0)
+            connected, mode, raw = warp_status(warp_bin)
+            if connected:
+                return True
+            if "connecting" not in (raw or "").lower():
+                break
+
+    # 3. Disconnected state: apply configuration once and connect
     if scope == "isolated":
-        run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
-        run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
-        if mode and "proxy" not in mode.lower():
+        if not mode or "proxy" not in mode.lower():
             run_warp(["mode", "proxy"], warp_bin=warp_bin)
-        elif not mode:
-            run_warp(["mode", "proxy"], warp_bin=warp_bin)
+            run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
 
-        if connected:
-            return True
         run_warp(["connect"], warp_bin=warp_bin)
-        time.sleep(2)
-        connected, _, _ = warp_status(warp_bin)
-        if connected:
-            return True
+        for _ in range(8):
+            time.sleep(1.0)
+            connected, _, raw = warp_status(warp_bin)
+            if connected:
+                return True
+            if "connecting" not in (raw or "").lower() and not connected:
+                pass
 
-        # If still not connected, rotate keys, set WireGuard protocol, and clear endpoint overrides
-        append_log(KEEPER_LOG_FILE, "isolated tunnel not connected — rotating keys & setting WireGuard protocol")
+        # If still not connected after grace window, rotate keys and reset endpoints (NO nuclear registration deletion!)
+        append_log(KEEPER_LOG_FILE, "isolated tunnel disconnected — rotating keys & reconnecting")
         run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-        run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
         run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
         run_warp(["mode", "proxy"], warp_bin=warp_bin)
         run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
         run_warp(["connect"], warp_bin=warp_bin)
-        time.sleep(2)
+
+        for _ in range(8):
+            time.sleep(1.0)
+            connected, _, _ = warp_status(warp_bin)
+            if connected:
+                return True
+
+        # Only register new if registration is explicitly missing or corrupt
+        raw_check = (raw or "").lower()
+        if "registration missing" in raw_check or "not registered" in raw_check:
+            append_log(KEEPER_LOG_FILE, "registration missing — registering fresh WARP client")
+            run_warp(["registration", "new"], warp_bin=warp_bin)
+            run_warp(["mode", "proxy"], warp_bin=warp_bin)
+            run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
+            run_warp(["connect"], warp_bin=warp_bin)
+            time.sleep(3)
+            connected, _, _ = warp_status(warp_bin)
+
+        return connected
+
+    # Full System TUN mode (only when scope is explicitly set to full TUN)
+    if not mode or "warp" not in mode.lower():
+        run_warp(["mode", "warp"], warp_bin=warp_bin)
+
+    run_warp(["connect"], warp_bin=warp_bin)
+    for _ in range(8):
+        time.sleep(1.0)
+        connected, _, raw = warp_status(warp_bin)
+        if connected:
+            return True
+        if "connecting" not in (raw or "").lower() and not connected:
+            pass
+
+    append_log(KEEPER_LOG_FILE, "TUN tunnel disconnected — rotating keys & reconnecting")
+    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
+    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
+    run_warp(["mode", "warp"], warp_bin=warp_bin)
+    run_warp(["connect"], warp_bin=warp_bin)
+
+    for _ in range(8):
+        time.sleep(1.0)
         connected, _, _ = warp_status(warp_bin)
         if connected:
             return True
 
-        # If still failing, re-register
-        append_log(KEEPER_LOG_FILE, "re-registering isolated tunnel")
-        run_warp(["disconnect"], warp_bin=warp_bin)
-        run_warp(["registration", "delete"], warp_bin=warp_bin)
-        rc, msg = run_warp(["registration", "new"], warp_bin=warp_bin)
-        if rc != 0:
-            append_log(KEEPER_LOG_FILE, f"isolated registration new failed: {msg}")
-            try:
-                from clean_endpoint import auto_heal_warp_endpoint
-                heal_ok, heal_msg = auto_heal_warp_endpoint()
-                append_log(KEEPER_LOG_FILE, f"clean endpoint heal: {heal_msg}")
-            except Exception:
-                pass
-
-        run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
-        run_warp(["mode", "proxy"], warp_bin=warp_bin)
-        run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
+    raw_check = (raw or "").lower()
+    if "registration missing" in raw_check or "not registered" in raw_check:
+        append_log(KEEPER_LOG_FILE, "registration missing — registering fresh TUN client")
+        run_warp(["registration", "new"], warp_bin=warp_bin)
+        run_warp(["mode", "warp"], warp_bin=warp_bin)
         run_warp(["connect"], warp_bin=warp_bin)
-        time.sleep(3)
+        time.sleep(4)
         connected, _, _ = warp_status(warp_bin)
-        return connected
 
-    # Full System TUN mode (only when scope is explicitly set to full TUN)
-    run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
-    if mode and "warp" not in mode.lower():
-        run_warp(["mode", "warp"], warp_bin=warp_bin)
-    elif not mode:
-        run_warp(["mode", "warp"], warp_bin=warp_bin)
-
-    if connected and get_warp_local_v6():
-        return True
-
-    run_warp(["connect"], warp_bin=warp_bin)
-    time.sleep(4)
-    connected, _, _ = warp_status(warp_bin)
-    if connected and get_warp_local_v6():
-        append_log(KEEPER_LOG_FILE, "reconnected existing registration")
-        return True
-
-    append_log(KEEPER_LOG_FILE, "tunnel dead — rotating keys & registration to repair")
-    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-    run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
-    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
-    run_warp(["disconnect"], warp_bin=warp_bin)
-    run_warp(["registration", "delete"], warp_bin=warp_bin)
-    rc, msg = run_warp(["registration", "new"], warp_bin=warp_bin)
-    if rc != 0:
-        append_log(KEEPER_LOG_FILE, f"registration new failed: {msg}")
-        return False
-
-    run_warp(["mode", "warp"], warp_bin=warp_bin)
-    run_warp(["connect"], warp_bin=warp_bin)
-    time.sleep(5)
-    connected, _, _ = warp_status(warp_bin)
-    ok = connected and bool(get_warp_local_v6())
-    append_log(KEEPER_LOG_FILE, "tunnel repaired ✓" if ok else "repair still waiting for IPv6")
-    return ok
+    return connected
 
 
 def main() -> int:

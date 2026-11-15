@@ -11,7 +11,7 @@ WARP="$(command -v warp-cli || echo /usr/bin/warp-cli)"
 ok(){ echo -e "  \e[32m✓\e[0m $*"; }
 
 echo ""
-echo "  removing Opencode Unlimited Usage…"
+echo "  removing Opencode Unlimited Usage (v2.4.2)…"
 echo ""
 
 # stop services first

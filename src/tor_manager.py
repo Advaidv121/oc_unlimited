@@ -324,13 +324,17 @@ def open_socks5_tunnel(
         raise ConnectionError(f"SOCKS5 proxy connection failed (error code {code})")
 
     atyp = reply[3]
-    if atyp == 1:
-        sock.recv(4 + 2)
-    elif atyp == 3:
-        dlen = sock.recv(1)[0]
-        sock.recv(dlen + 2)
-    elif atyp == 4:
-        sock.recv(16 + 2)
+    to_read = 6 if atyp == 1 else (18 if atyp == 4 else 0)
+    if atyp == 3:
+        raw_len = sock.recv(1)
+        if raw_len:
+            to_read = raw_len[0] + 2
+    read_so_far = 0
+    while read_so_far < to_read:
+        chunk = sock.recv(min(512, to_read - read_so_far))
+        if not chunk:
+            break
+        read_so_far += len(chunk)
 
     sock.settimeout(None)
     return sock

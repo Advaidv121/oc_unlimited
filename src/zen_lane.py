@@ -52,7 +52,8 @@ def _ensure_tunnel_up() -> bool:
         mode = cfg.get("mode", "warp")
         if mode in ("tor", "custom"):
             return True
-        scope = cfg.get("warp_scope", "isolated")
+        default_scope = "tun" if sys.platform == "win32" else "isolated"
+        scope = cfg.get("warp_scope", default_scope)
         if scope == "isolated":
             import socket
             try:

@@ -62,7 +62,7 @@ from ouc_common import (
 )
 from ouc_firewall import install_killswitch, is_killswitch_installed, remove_killswitch
 
-WINDOW_TITLE = "Opencode Unlimited v2.4.0 — Made by Avatar"
+WINDOW_TITLE = "Opencode Unlimited v2.4.2 — Made by Avatar"
 DETACHED_PROCESS = 0x00000008
 _WORKER_FILES = (
     "ouc_common.py",
@@ -140,7 +140,7 @@ def free_service_port(port: int = 42914) -> int:
                 if len(parts) >= 5 and "LISTENING" in parts:
                     pid = parts[-1]
                     if pid.isdigit() and int(pid) != os.getpid():
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=CREATE_NO_WINDOW)
                         killed += 1
         except Exception:
             pass
@@ -347,15 +347,16 @@ class AvatarControlApi:
 
     def _auto_heal_warp_startup(self) -> None:
         def _check_and_heal() -> None:
-            time.sleep(2.5)
+            time.sleep(3.0)
             wb = find_warp_cli()
             if not wb:
                 return
             try:
                 conn, mode, raw = warp_status(wb)
                 raw_lower = raw.lower()
-                # If WARP has handshake block, MITM error, or unstable connection on launch, self-heal automatically
-                if (not conn) or ("unstable" in raw_lower) or ("mitm" in raw_lower) or ("unable" in raw_lower):
+                # Only auto-heal if there is an explicit handshake MITM or cryptographic failure.
+                # Never wipe registration on simple startup disconnected state!
+                if ("mitm" in raw_lower) or ("cf_happy_eyeballs" in raw_lower):
                     self.repair_warp_connection()
             except Exception:
                 pass
@@ -395,15 +396,32 @@ class AvatarControlApi:
         connected, mode, status_text = warp_status(warp_bin) if warp_bin else (False, "", "Not Installed")
         local_v6 = get_warp_local_v6() or ""
 
-        if local_v6 != self._last_local_v6:
-            self._last_local_v6 = local_v6
-            if local_v6:
+        default_scope = "tun" if sys.platform == "win32" else "isolated"
+        scope = default_scope
+        try:
+            from proxy_chain import get_egress_config
+            scope = get_egress_config().get("warp_scope", default_scope)
+        except Exception:
+            pass
+
+        if scope == "isolated":
+            if connected and not self._egress_v6:
                 self._refresh_egress_async(force=True)
-            else:
+            elif not connected:
                 with self._egress_lock:
                     self._egress_v6 = ""
-        elif force_egress:
-            self._refresh_egress_async(force=True)
+            elif force_egress:
+                self._refresh_egress_async(force=True)
+        else:
+            if local_v6 != self._last_local_v6:
+                self._last_local_v6 = local_v6
+                if local_v6:
+                    self._refresh_egress_async(force=True)
+                else:
+                    with self._egress_lock:
+                        self._egress_v6 = ""
+            elif force_egress:
+                self._refresh_egress_async(force=True)
 
         with self._egress_lock:
             egress_v6 = self._egress_v6
@@ -595,10 +613,11 @@ class AvatarControlApi:
         warp = find_warp_cli()
         if not warp:
             return {"ok": False, "message": "warp-cli.exe not found."}
-        scope = "isolated"
+        default_scope = "tun" if sys.platform == "win32" else "isolated"
+        scope = default_scope
         try:
             from proxy_chain import get_egress_config
-            scope = get_egress_config().get("warp_scope", "isolated")
+            scope = get_egress_config().get("warp_scope", default_scope)
         except Exception:
             pass
 
@@ -622,8 +641,8 @@ class AvatarControlApi:
         # Auto-repair CF_HAPPY_EYEBALLS_MITM_FAILURE or broken endpoint
         run_warp(["disconnect"], warp_bin=warp)
         run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp)
-        run_warp(["registration", "delete"], warp_bin=warp)
-        run_warp(["registration", "new"], warp_bin=warp)
+        run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp)
+        run_warp(["tunnel", "rotate-keys"], warp_bin=warp)
         if scope == "isolated":
             run_warp(["mode", "proxy"], warp_bin=warp)
             run_warp(["proxy", "port", "40000"], warp_bin=warp)
@@ -931,16 +950,21 @@ class AvatarControlApi:
         if not wb:
             return {"ok": False, "message": "warp-cli.exe not found."}
         try:
-            scope = "isolated"
+            default_scope = "tun" if sys.platform == "win32" else "isolated"
+            scope = default_scope
             try:
                 from proxy_chain import get_egress_config
-                scope = get_egress_config().get("warp_scope", "isolated")
+                scope = get_egress_config().get("warp_scope", default_scope)
             except Exception:
                 pass
 
             # Phase 1: Rapid key rotation and endpoint reset (preserves active client registration)
             run_warp(["tunnel", "endpoint", "reset"], warp_bin=wb)
-            run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=wb)
+            try:
+                from ouc_common import ensure_warp_protocol
+                ensure_warp_protocol("wireguard", warp_bin=wb)
+            except Exception:
+                pass
             run_warp(["tunnel", "rotate-keys"], warp_bin=wb)
             if scope == "isolated":
                 run_warp(["mode", "proxy"], warp_bin=wb)
@@ -949,32 +973,38 @@ class AvatarControlApi:
                 run_warp(["mode", "warp"], warp_bin=wb)
             run_warp(["connect"], warp_bin=wb)
 
-            for _ in range(3):
+            for _ in range(5):
                 time.sleep(1.0)
                 conn, _, raw = warp_status(wb)
                 raw_low = raw.lower()
-                if conn and "unstable" not in raw_low and "mitm" not in raw_low and "unable" not in raw_low:
+                # "unstable" simply means ping latency is elevated; traffic still flows normally!
+                if conn and "mitm" not in raw_low and "unable" not in raw_low:
                     self._refresh_egress_async(force=True)
                     return {"ok": True, "message": f"WARP encryption keys rotated successfully. Connected ({'App-Only proxy' if scope == 'isolated' else 'TUN'})!"}
 
-            # Phase 2: Full re-registration if key rotation alone did not resolve the handshake block
-            run_warp(["disconnect"], warp_bin=wb)
-            run_warp(["registration", "delete"], warp_bin=wb)
-            run_warp(["registration", "new"], warp_bin=wb)
-            run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=wb)
-            if scope == "isolated":
-                run_warp(["mode", "proxy"], warp_bin=wb)
-                run_warp(["proxy", "port", "40000"], warp_bin=wb)
-            else:
-                run_warp(["mode", "warp"], warp_bin=wb)
-            run_warp(["connect"], warp_bin=wb)
+            # Phase 2: Re-register only if registration is actually corrupted, missing, or blocked by MITM
+            if "registration missing" in raw_low or "not registered" in raw_low or "mitm" in raw_low:
+                run_warp(["disconnect"], warp_bin=wb)
+                run_warp(["registration", "delete"], warp_bin=wb)
+                run_warp(["registration", "new"], warp_bin=wb)
+                try:
+                    from ouc_common import ensure_warp_protocol
+                    ensure_warp_protocol("wireguard", warp_bin=wb)
+                except Exception:
+                    pass
+                if scope == "isolated":
+                    run_warp(["mode", "proxy"], warp_bin=wb)
+                    run_warp(["proxy", "port", "40000"], warp_bin=wb)
+                else:
+                    run_warp(["mode", "warp"], warp_bin=wb)
+                run_warp(["connect"], warp_bin=wb)
 
-            for _ in range(6):
-                time.sleep(1.0)
-                conn, _, _ = warp_status(wb)
-                if conn:
-                    self._refresh_egress_async(force=True)
-                    return {"ok": True, "message": f"WARP keys & endpoints reset successfully. Connected ({'App-Only proxy' if scope == 'isolated' else 'TUN'})!"}
+                for _ in range(6):
+                    time.sleep(1.0)
+                    conn, _, _ = warp_status(wb)
+                    if conn:
+                        self._refresh_egress_async(force=True)
+                        return {"ok": True, "message": f"WARP keys & endpoints reset successfully. Connected ({'App-Only proxy' if scope == 'isolated' else 'TUN'})!"}
 
             return {"ok": True, "message": "WARP reset executed. Reconnecting in background..."}
         except Exception as exc:
@@ -1116,15 +1146,22 @@ class AvatarControlApi:
         env["HTTPS_PROXY"] = proxy_url
         env["HTTP_PROXY"] = proxy_url
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
-        subprocess.Popen(
-            [
-                desktop,
-                f"--proxy-server={proxy_url}",
-                "--proxy-bypass-list=127.0.0.1;localhost;::1;*.local",
-            ],
-            env=env,
-            close_fds=True,
-        )
+        args_str = f"--proxy-server={proxy_url} --proxy-bypass-list=127.0.0.1;localhost;::1;*.local"
+        launched = False
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            try:
+                os.startfile(desktop, arguments=args_str)
+                launched = True
+            except Exception:
+                pass
+        if not launched:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) if sys.platform == "win32" else 0
+            subprocess.Popen(
+                [desktop, f"--proxy-server={proxy_url}", "--proxy-bypass-list=127.0.0.1;localhost;::1;*.local"],
+                env=env,
+                creationflags=flags,
+                close_fds=False if sys.platform == "win32" else True,
+            )
         return {"ok": True, "message": "Launched OpenCode Desktop through WARP IPv6 lane."}
 
     def fix_opencode_service(self) -> dict:
@@ -1132,9 +1169,14 @@ class AvatarControlApi:
         killed = 0
         try:
             import psutil
-            for p in psutil.process_iter(["name"]):
-                name = p.name().lower()
-                if "opencode-cli" in name or "opencode.exe" in name:
+            for p in psutil.process_iter(["pid", "name", "exe"]):
+                if p.pid == os.getpid():
+                    continue
+                name = (p.info.get("name") or "").lower()
+                exe = (p.info.get("exe") or "").lower()
+                if BRAND in exe or BRAND in name:
+                    continue
+                if "opencode-cli" in name or name == "opencode.exe":
                     try:
                         p.kill()
                         killed += 1
@@ -1171,13 +1213,14 @@ class AvatarControlApi:
         if not shim.is_file():
             return {"ok": False, "message": "opencode CLI shim not ready; run Install / Repair first."}
         wt = shutil.which("wt.exe")
+        use_close_fds = False if sys.platform == "win32" else True
         if wt:
-            subprocess.Popen([wt, "cmd.exe", "/k", str(shim)], close_fds=True)
+            subprocess.Popen([wt, "cmd.exe", "/k", str(shim)], close_fds=use_close_fds)
         else:
             subprocess.Popen(
                 ["cmd.exe", "/c", "start", "OpenCode Unlimited CLI", "cmd.exe", "/k", str(shim)],
                 shell=False,
-                close_fds=True,
+                close_fds=use_close_fds,
             )
         return {"ok": True, "message": "Opened OpenCode CLI terminal via Zen Lane."}
 

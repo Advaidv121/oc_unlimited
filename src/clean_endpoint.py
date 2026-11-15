@@ -77,18 +77,24 @@ def set_custom_endpoint(endpoint: str) -> tuple[bool, str]:
     if not warp_bin:
         return False, "Cloudflare warp-cli.exe not found."
 
-    # When setting custom endpoint (typically port 2408 WireGuard), switch protocol to WireGuard
-    # to avoid MASQUE HTTP/3 TLS certificate mismatch (CF_HAPPY_EYEBALLS_MITM_FAILURE).
-    run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
+    # Ensure WireGuard protocol is active to avoid MASQUE HTTP/3 MITM errors (CF_HAPPY_EYEBALLS_MITM_FAILURE).
+    # Only set protocol if not already WireGuard, to prevent unnecessary tunnel teardown.
+    try:
+        from ouc_common import ensure_warp_protocol
+        ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+    except Exception:
+        pass
+
     rc, msg = run_warp(["tunnel", "endpoint", "set", endpoint.strip()], warp_bin=warp_bin)
     if rc == 0:
         run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
         run_warp(["connect"], warp_bin=warp_bin)
-        for _ in range(4):
+        for _ in range(6):
             time.sleep(0.8)
             conn, _, raw = warp_status(warp_bin)
             raw_low = raw.lower()
-            if conn and "unstable" not in raw_low and "unable" not in raw_low:
+            # "unstable" simply means ping latency is elevated; traffic still flows normally!
+            if conn and "unable" not in raw_low and "mitm" not in raw_low:
                 return True, f"Cloudflare WARP endpoint connected to {endpoint} (WireGuard)."
         return True, f"Cloudflare WARP endpoint set to {endpoint} (handshake establishing...)."
     return False, f"Failed to set endpoint: {msg}"
@@ -101,7 +107,11 @@ def reset_custom_endpoint() -> tuple[bool, str]:
         return False, "Cloudflare warp-cli.exe not found."
 
     run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-    run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin)
+    try:
+        from ouc_common import ensure_warp_protocol
+        ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+    except Exception:
+        pass
     run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
     run_warp(["connect"], warp_bin=warp_bin)
     return True, "Cloudflare WARP endpoint reset to official default (WireGuard protocol)."

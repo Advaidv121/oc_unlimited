@@ -68,6 +68,10 @@ done
 NEW_V6=$(cur_v6)
 echo "new /64: ${NEW_V6:-?}"
 if [ "$NEW_V6" != "$OLD_V6" ] && [ -n "$NEW_V6" ]; then
+  # Clear client-side rate limit lockouts from drafts.sqlite
+  for db in "$HOME/.config/ai.opencode.desktop/drafts.sqlite" "$HOME/.local/share/opencode/drafts.sqlite"; do
+    [ -f "$db" ] && sqlite3 "$db" "DELETE FROM state WHERE key IN ('free-limit', 'go-upsell') OR key LIKE '%free%limit%' OR key LIKE '%quota%exceeded%' OR key LIKE '%upsell%';" >/dev/null 2>&1 || true
+  done
   echo "== FRESH /64 ✓ — re-send your message =="
   exit 0
 fi

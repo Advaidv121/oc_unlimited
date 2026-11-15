@@ -32,19 +32,19 @@ fi
 MODE="${OUC_WARP_MODE:-proxy}"
 
 ensure_connected(){
+  # 1. Already connected: do not touch anything
   wo status | head -1 | grep -q Connected && return 0
-  w connect; sleep 4
-  wo status | head -1 | grep -q Connected && return 0
-  # Try rotating encryption keys first to fix MITM / handshake failures
-  w tunnel rotate-keys
-  w tunnel endpoint reset
-  w tunnel protocol reset
-  w connect; sleep 3
-  wo status | head -1 | grep -q Connected && return 0
-  # old registration is dead — burn it and make a fresh registration
-  w disconnect
-  w registration delete
-  w registration new || return 1
+
+  # 2. In-flight handshake grace window
+  if wo status | head -1 | grep -qi "connecting"; then
+    for i in $(seq 1 8); do
+      sleep 1
+      wo status | head -1 | grep -q Connected && return 0
+      wo status | head -1 | grep -qi "connecting" || break
+    done
+  fi
+
+  # 3. Disconnected: ensure mode and connect
   if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
     w mode warp
   else
@@ -52,7 +52,47 @@ ensure_connected(){
     w proxy port 40000
   fi
   w connect
-  sleep 5
+
+  for i in $(seq 1 8); do
+    sleep 1
+    wo status | head -1 | grep -q Connected && return 0
+  done
+
+  # 4. Gentle recovery: rotate keys & reset endpoint (preserves registration)
+  w tunnel endpoint reset
+  STATUS="$(wo status 2>/dev/null)"
+  if echo "$STATUS" | grep -qiE "mitm|happy_eyeball|unable"; then
+    w tunnel protocol set WireGuard
+  fi
+  w tunnel rotate-keys
+  if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
+    w mode warp
+  else
+    w mode proxy
+    w proxy port 40000
+  fi
+  w connect
+
+  for i in $(seq 1 6); do
+    sleep 1
+    wo status | head -1 | grep -q Connected && return 0
+  done
+
+  # 5. Only register new if registration is explicitly missing
+  STATUS="$(wo status 2>/dev/null)"
+  if echo "$STATUS" | grep -qiE "registration missing|not registered"; then
+    w registration new || return 1
+    if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
+      w mode warp
+    else
+      w mode proxy
+      w proxy port 40000
+    fi
+    w connect
+    sleep 4
+    wo status | head -1 | grep -q Connected && return 0
+  fi
+
   wo status | head -1 | grep -q Connected
 }
 
@@ -119,12 +159,6 @@ for i in 1 2 3 4 5 6; do
 done
 
 while true; do
-  if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
-    w mode warp
-  else
-    w mode proxy
-    w proxy port 40000
-  fi
   ensure_connected || true
   ensure_guard
   sleep $TICK

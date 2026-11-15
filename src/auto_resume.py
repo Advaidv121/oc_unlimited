@@ -14,6 +14,10 @@ import sys
 import time
 from pathlib import Path
 
+_SRC = Path(__file__).resolve().parent
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 from ouc_common import LANE_DIR, find_opencode_cli
 
 AUTO_RESUME_FLAG = LANE_DIR / "auto_resume.flag"
@@ -44,6 +48,7 @@ def clear_opencode_free_limit() -> int:
     candidates = [
         Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "ai.opencode.desktop" / "drafts.sqlite",
         Path.home() / ".config" / "ai.opencode.desktop" / "drafts.sqlite",
+        Path.home() / ".local" / "share" / "opencode" / "drafts.sqlite",
     ]
     deleted = 0
     for db_path in candidates:
@@ -52,9 +57,7 @@ def clear_opencode_free_limit() -> int:
         try:
             conn = sqlite3.connect(str(db_path), timeout=3.0)
             cur = conn.cursor()
-            cur.execute("DELETE FROM state WHERE key IN ('free-limit', 'go-upsell')")
-            deleted += cur.rowcount
-            cur.execute("DELETE FROM state WHERE key LIKE '%free%limit%'")
+            cur.execute("DELETE FROM state WHERE key IN ('free-limit', 'go-upsell') OR key LIKE '%free%limit%' OR key LIKE '%quota%exceeded%' OR key LIKE '%upsell%'")
             deleted += cur.rowcount
             conn.commit()
             conn.close()
@@ -91,6 +94,17 @@ def get_latest_session_info() -> tuple[str, str, str] | None:
 def send_continue_keystroke(reload_first: bool = True) -> bool:
     """Send reload (^r) and 'continue{ENTER}' to active OpenCode Desktop or Terminal window."""
     if sys.platform != "win32":
+        try:
+            import shutil
+            if shutil.which("xdotool"):
+                if reload_first:
+                    subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "opencode", "key", "--clearmodifiers", "ctrl+r"], capture_output=True, timeout=2.0)
+                    time.sleep(1.2)
+                subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "opencode", "type", "--clearmodifiers", "continue"], capture_output=True, timeout=2.0)
+                subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "opencode", "key", "--clearmodifiers", "Return"], capture_output=True, timeout=2.0)
+                return True
+        except Exception:
+            pass
         return False
 
     # 1. Native Windows Win32 API window focus and key dispatch
@@ -128,7 +142,7 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
             user32.SetForegroundWindow(hwnd)
             time.sleep(0.3)
             # If requested, send Ctrl+R to reload UI (reloading drops the free-limit block screen)
-            if reload_first and "desktop" in pname or "opencode.exe" in pname:
+            if reload_first and ("desktop" in pname or "opencode.exe" in pname):
                 ps_reload = """
                 Add-Type -AssemblyName System.Windows.Forms
                 [System.Windows.Forms.SendKeys]::SendWait("^r")
@@ -207,27 +221,24 @@ def resume_active_session() -> tuple[bool, str]:
         cmd = [oc, "run", "--session", sess_id, "continue"]
         cwd = directory if (directory and os.path.isdir(directory)) else None
         try:
-            CREATE_NO_WINDOW = 0x08000000
-            DETACHED_PROCESS = 0x00000008
-            subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
-                close_fds=True,
-            )
+            kwargs = {"cwd": cwd, "close_fds": True}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0x08000000 | 0x00000008
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(cmd, **kwargs)
             cli_dispatched = True
             details.append(f"dispatched CLI resume to session {sess_id[:8]}... ({title or 'active'})")
         except Exception as exc:
             details.append(f"CLI resume attempt failed: {exc}")
     elif oc:
         try:
-            CREATE_NO_WINDOW = 0x08000000
-            DETACHED_PROCESS = 0x00000008
-            subprocess.Popen(
-                [oc, "run", "--continue", "continue"],
-                creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
-                close_fds=True,
-            )
+            kwargs = {"close_fds": True}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0x08000000 | 0x00000008
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen([oc, "run", "--continue", "continue"], **kwargs)
             cli_dispatched = True
             details.append("dispatched generic CLI continue")
         except Exception:

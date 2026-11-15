@@ -62,9 +62,18 @@ if [ "$CAN_UNSHARE" = "1" ]; then
   ' _ "$TD" "$REAL" "$@"
 else
   # Container / VPS fallback: unshare is blocked by kernel security policy (/proc/self/uid_map restricted).
-  # Route via proxy lane directly without needing unprivileged mount namespaces!
-  export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:41987}"
-  export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:41987}"
+  # Dynamically detect active egress proxy: port 41987 (zen_proxy) or port 40000 (warp-cli SOCKS5)
+  PROXY_TARGET=""
+  if (echo > /dev/tcp/127.0.0.1/41987) 2>/dev/null; then
+    PROXY_TARGET="http://127.0.0.1:41987"
+  elif (echo > /dev/tcp/127.0.0.1/40000) 2>/dev/null; then
+    PROXY_TARGET="socks5h://127.0.0.1:40000"
+  else
+    PROXY_TARGET="http://127.0.0.1:41987"
+  fi
+  export HTTPS_PROXY="${HTTPS_PROXY:-$PROXY_TARGET}"
+  export HTTP_PROXY="${HTTP_PROXY:-$PROXY_TARGET}"
+  export ALL_PROXY="${ALL_PROXY:-$PROXY_TARGET}"
   export NO_PROXY="127.0.0.1,localhost,::1"
   exec "$REAL" "$@"
 fi

@@ -25,7 +25,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
 
 echo ""
 echo "  ==================================================="
-echo "  Opencode Unlimited Usage (Linux v2.4.0)"
+echo "  Opencode Unlimited Usage (Linux v2.4.2)"
 echo "  Created & Maintained by Avatar (ShadowySphinX)"
 echo "  ==================================================="
 echo ""

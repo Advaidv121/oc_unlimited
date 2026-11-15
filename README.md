@@ -69,7 +69,7 @@ Install these components before setup:
 > You do **not** need Python installed. Everything is bundled into a single standalone program.
 
 1. **Download & Run:**
-   * Download **`OpencodeUnlimited-Multi.exe`** from the repository releases or clone.
+   * Download **`OpencodeUnlimited-Multi.exe`** from the repository root, or clone the source and build it.
    * Double-click to launch the dashboard.
 2. **Verify Protection Controls (Left Panel):**
    * Ensure these switches are **ON** (they are on by default):
@@ -187,7 +187,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 ### 8. Windows SmartScreen or antivirus warning
 * **Cause:** PyInstaller one-file executables are occasionally flagged by heuristics or reputation checks. This is more common for unsigned binaries.
 * **What the build does:** The build uses `--noupx` and embeds a version resource to reduce avoidable heuristic triggers.
-* **Options:** Build from source, verify the release file's SHA-256 hash, or sign the executable with your own code-signing certificate (`OUC_SIGN_PFX` + `OUC_SIGN_PASSWORD`, or `OUC_SIGN_THUMBPRINT`). A trusted signature is the reliable way to clear SmartScreen reputation warnings.
+* **Options:** Build from source, verify the downloaded file's SHA-256 hash, or sign the executable with your own code-signing certificate (`OUC_SIGN_PFX` + `OUC_SIGN_PASSWORD`, or `OUC_SIGN_THUMBPRINT`). A trusted signature is the reliable way to clear SmartScreen reputation warnings.
 
 ---
 

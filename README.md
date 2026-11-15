@@ -1,5 +1,5 @@
 # PLEASE GIVE PROPER CREDITS. JUST DONT REBRAND AND LAUNCH IT AS YOURS.
-# NEW VERSION-2.4.2 (hotfix: ECONNRESET, keeper flapping, quota resets, drafts.sqlite unlock, WireGuard enforcement, auto-resume)
+# NEW VERSION-2.4.2 (503,ECONNRESET, keeper flapping, quota resets, drafts.sqlite unlock, WireGuard enforcement, auto-resume and some other BUGS)
 # Opencode-Unlimited-Limit-Bypass
 
 [![Version](https://img.shields.io/badge/Version-v2.4.2-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)

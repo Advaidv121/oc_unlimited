@@ -1,17 +1,16 @@
 #!/bin/bash
-# zen guard — the self-healing part. watches opencode's own error log for
-# the free-usage wall and rotates your /64 automatically.
+# zen guard — watches OpenCode's error log for the free-usage wall and
+# rotates your /64 automatically.
 #
 # opencode writes its errors to ~/.local/share/opencode/log/opencode.log —
-# we tail it with a byte offset (only ever read new bytes). the moment a
-# quota error shows up:
-#   1. current /64 goes on the lifetime blacklist (never reused again)
-#   2. keeper pauses (its 45s tick would race the rotation)
-#   3. warp re-registers → fresh /64 → keeper resumes
-#   4. if cloudflare hands back a blacklisted block, try again (up to 8)
-#   5. if literally everything comes back burned, recycle the oldest —
-#      these buckets reset around midnight anyway
-# then you, the human, just re-send your message and the wall is gone.
+# we tail it with a byte offset and only read new bytes. When a quota error
+# appears:
+#   1. current /64 goes on the blacklist
+#   2. keeper pauses (its tick would race the rotation)
+#   3. warp renews its WireGuard session keys → fresh /64 → keeper resumes
+#   4. if cloudflare returns a blacklisted block, try again (up to 4)
+#   5. if all retries return blacklisted blocks, recycle the oldest entry
+# after a successful rotation, re-send your message.
 set -u
 
 LOGF="$HOME/.local/share/opencode/log/opencode.log"
@@ -32,8 +31,8 @@ fi
 KEEPER="${OUC_KEEPER_UNIT:-opencode-unlimited-keeper}"
 
 COOLDOWN=75        # seconds between rotations (a rotation takes ~15s)
-MAX_HOP_TRIES=8
-BLACKLIST_MAX=200  # lifetime blacklist cap — burnt /64s never come back
+MAX_HOP_TRIES=4
+BLACKLIST_MAX=200  # blacklist cap; oldest entries are recycled when full
 
 mkdir -p "$STATE_DIR"
 
@@ -62,17 +61,29 @@ if [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ] || [ -n "${SSH_CONNECTION:-
 fi
 
 cur_v6(){
+  local v ep
   if [ "$IS_VPS" = "1" ]; then
-    timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 https://api64.ipify.org 2>/dev/null || timeout 10 curl -x http://127.0.0.1:41987 -s -m 8 https://api64.ipify.org 2>/dev/null
+    for ep in https://api6.ipify.org https://api64.ipify.org; do
+      v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 "$ep" 2>/dev/null)
+      case "$v" in *:*) echo "$v"; return;; esac
+    done
+    v=$(timeout 10 curl -x http://127.0.0.1:41987 -s -m 8 https://api6.ipify.org 2>/dev/null)
+    case "$v" in *:*) echo "$v"; return;; esac
   else
-    timeout 10 curl -s -m 8 https://api64.ipify.org 2>/dev/null
+    for ep in https://api6.ipify.org https://api64.ipify.org; do
+      v=$(timeout 10 curl -6 -s -m 8 "$ep" 2>/dev/null)
+      case "$v" in *:*) echo "$v"; return;; esac
+    done
   fi
+  echo ""
 }
 
-# blacklist entries are /64-normalized (first 4 groups) — same mohalla,
-# same bucket. comparing full addresses was the original bug: the same
-# block came back with a different interface-id and sailed right through.
+m64(){ echo "$1" | cut -d: -f1-4; }
+
+# blacklist entries are /64-normalized (first 4 groups) so the same block
+# cannot return with a different interface ID and pass the check.
 blacklist_add(){
+  [ -n "$1" ] || return 0
   python3 - "$1" <<'PY' 2>/dev/null
 import json,sys,os
 def m64(a): return ":".join(a.split(":")[:4])
@@ -98,15 +109,22 @@ PY
 }
 
 hop_once(){
-  # one keeper-safe registration cycle. prints the new /64 or empty.
+  # one non-destructive session rotation. prints the new IPv6 or empty.
+  local old="$1" v="" i
   svc stop "$KEEPER"
   w disconnect
-  w registration delete
-  local ok=0 i
-  for i in 1 2 3; do
-    w registration new && { ok=1; break; }
-    sleep 6
-  done
+
+  # Recreate a registration only when it is actually missing.
+  if ! wo registration show >/dev/null 2>&1; then
+    for i in 1 2 3; do
+      w registration new && break
+      sleep 4
+    done
+  fi
+
+  # rotate-keys keeps the device registration and renews the WireGuard
+  # session, so Cloudflare assigns a new client /64.
+  w tunnel rotate-keys
   if [ "$IS_VPS" = "1" ]; then
     w mode proxy
     w proxy port 40000
@@ -114,16 +132,24 @@ hop_once(){
     w mode warp
   fi
   w connect
-  svc start "$KEEPER"
-  [ "$ok" = 1 ] || { echo ""; return; }
-  local V=""
-  for i in $(seq 1 12); do
-    sleep 3
-    V=$(cur_v6)
-    [ -n "$V" ] && break
-    V=""
+
+  for i in $(seq 1 10); do
+    sleep 2
+    v=$(cur_v6)
+    case "$v" in
+      *:*)
+        if [ -z "$old" ] || [ "$(m64 "$v")" != "$(m64 "$old")" ]; then
+          svc start "$KEEPER"
+          echo "$v"
+          return
+        fi
+        ;;
+    esac
+    v=""
   done
-  echo "$V"
+
+  svc start "$KEEPER"
+  echo ""
 }
 
 # fresh state: start reading from the end of the current log
@@ -132,7 +158,7 @@ if [ ! -f "$STATE" ]; then
   printf '{"blacklist":[],"offset":%s,"last_hop":0,"hops":0,"current":""}' "$OFF" > "$STATE"
 fi
 
-glog "zen-guard up (cooldown ${COOLDOWN}s, blacklist lifetime)"
+glog "zen-guard up (cooldown ${COOLDOWN}s, blacklist cap ${BLACKLIST_MAX})"
 
 while true; do
   sleep 20
@@ -141,6 +167,7 @@ while true; do
   [ -f "$LOGF" ] || continue
   SIZE=$(wc -c < "$LOGF" 2>/dev/null || echo 0)
   OFF=$(state_get offset); OFF=${OFF:-0}
+  PREV_OFF="$OFF"
   NEWBYTES=$((SIZE - OFF))
   WALL=0
   if [ "$NEWBYTES" -gt 0 ] && [ "$NEWBYTES" -lt 50000000 ]; then
@@ -156,21 +183,21 @@ while true; do
 
   if [ "$WALL" = 1 ] && [ "$AGE" -ge "$COOLDOWN" ]; then
     OLD=$(cur_v6)
-    glog "wall detected — rotating (was: $OLD)"
+    glog "wall detected — rotating (was: ${OLD:-?})"
     blacklist_add "$OLD"
     NEW=""
     TRY=0
     while [ "$TRY" -lt "$MAX_HOP_TRIES" ]; do
       TRY=$((TRY + 1))
-      V=$(hop_once)
-      if [ -z "$V" ]; then glog "try $TRY: tunnel repair failed"; continue; fi
+      V=$(hop_once "$OLD")
+      if [ -z "$V" ]; then glog "try $TRY: rotation produced no fresh /64"; continue; fi
       if is_burnt "$V"; then glog "try $TRY: cloudflare returned a blacklisted /64 ($V) — again"; continue; fi
       NEW="$V"; break
     done
-    # every block burned → recycle the oldest (they reset around midnight)
+    # every block burned → recycle the oldest blacklist entry
     if [ -z "$NEW" ]; then
       glog "everything blacklisted — recycling oldest block"
-      V=$(hop_once)
+      V=$(hop_once "$OLD")
       [ -n "$V" ] && NEW="$V"
     fi
     if [ -n "$NEW" ]; then
@@ -178,29 +205,30 @@ while true; do
       state_set current "$NEW"
       H=$(state_get hops); H=${H:-0}; H=$((H + 1))
       state_set hops "$H"
-      glog "rotated #$H: $OLD → $NEW ✓"
+      glog "rotated #$H: $OLD → $NEW"
       python3 -c "
 import sqlite3, os
 from pathlib import Path
 for db in [Path.home() / '.config' / 'ai.opencode.desktop' / 'drafts.sqlite', Path.home() / '.local' / 'share' / 'opencode' / 'drafts.sqlite']:
     if db.is_file():
         try:
-            c = sqlite3.connect(str(db))
-            c.execute(\"DELETE FROM state WHERE key IN ('free-limit', 'go-upsell')\")
-            c.execute(\"DELETE FROM state WHERE key LIKE '%free%limit%'\")
+            c = sqlite3.connect(str(db), timeout=5.0)
+            c.execute(\"DELETE FROM state WHERE key IN ('free-limit', 'go-upsell', 'free_usage_limit', 'usage_limit', 'quota_exceeded')\")
             c.commit(); c.close()
         except: pass
 " 2>/dev/null || true
       sleep 2
       if command -v opencode >/dev/null 2>&1; then
         nohup opencode run --continue "continue" >/dev/null 2>&1 &
-        glog "[auto-resume] Limit bypassed -> sent 'continue' to active session ✓"
+        glog "[auto-resume] sent 'continue' to active session"
       fi
     else
-      state_set last_hop "$NOW"
+      # Keep the wall pending so the next tick retries instead of losing it.
+      state_set offset "$PREV_OFF"
       glog "rotation failed — keeper will keep the tunnel alive, retrying next tick"
     fi
   elif [ "$WALL" = 1 ]; then
+    state_set offset "$PREV_OFF"
     glog "wall seen but in cooldown (${AGE}s < ${COOLDOWN}s) — waiting"
   fi
 done

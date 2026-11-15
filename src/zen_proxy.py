@@ -1,4 +1,4 @@
-"""Local IPv6-pinning HTTP/CONNECT proxy bound to Cloudflare WARP on Windows."""
+"""Local HTTP/CONNECT proxy that routes through the selected egress route."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import random
 import select
 import socket
 import socketserver
+import sys
 import threading
 import time
 import urllib.parse
@@ -110,7 +111,8 @@ class _WarpState:
 
 
 class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
+    # SO_REUSEADDR on Windows lets a second process bind an active port.
+    allow_reuse_address = sys.platform != "win32"
     daemon_threads = True
 
 
@@ -241,21 +243,29 @@ def _open_warp_direct(
         except Exception:
             pass
 
-    # 3. Resilient failover: If WARP is down, try active Tor before failing
+    # 3. Strict fail-closed privacy mode never silently uses Tor or a
+    #    different route; the caller performs a repair attempt and retries.
+    if is_strict:
+        raise ConnectionRefusedError(
+            "Cloudflare WARP tunnel unavailable (fail-closed strict mode)"
+        )
+
+    # 4. Resilient failover: if WARP is down, try an active Tor client.
     try:
         from tor_manager import get_active_tor_target, open_socks5_tunnel
         tor_target = get_active_tor_target()
         if tor_target:
-            return open_socks5_tunnel(clean_host, port, socks_host=tor_target[0], socks_port=tor_target[1], timeout=6.0)
+            return open_socks5_tunnel(
+                clean_host,
+                port,
+                socks_host=tor_target[0],
+                socks_port=tor_target[1],
+                timeout=6.0,
+            )
     except Exception:
         pass
 
-    # 4. Strict fail-closed privacy mode: only fail if explicitly enabled by user
-    if is_strict:
-        raise ConnectionRefusedError("Cloudflare WARP tunnel unavailable (fail-closed strict mode)")
-
-    # 5. Resilient Direct Fallback:
-    # If WARP is unavailable or dropped, route directly so OpenCode NEVER throws 502/503 errors!
+    # 5. Direct fallback keeps OpenCode usable when the tunnel drops.
     if is_opencode_host:
         try:
             _, pinned_edge = warp_state.get(wait_if_rotating=False)
@@ -274,12 +284,77 @@ def _open_warp_direct(
     return sock
 
 
+_REPAIR_LOCK = threading.Lock()
+_LAST_REPAIR = 0.0
+_REPAIR_INTERVAL = 20.0
+
+
+def _strict_mode() -> bool:
+    return os.environ.get("OUC_STRICT_PROXY") == "1" or (
+        LANE_DIR / "strict_proxy.flag"
+    ).is_file()
+
+
+def _repair_warp_tunnel(warp_state: _WarpState) -> bool:
+    """Reconnect a dropped WARP tunnel once per interval before failing."""
+    global _LAST_REPAIR
+    if not _strict_mode():
+        return False
+    with _REPAIR_LOCK:
+        if time.monotonic() - _LAST_REPAIR < _REPAIR_INTERVAL:
+            return False
+        _LAST_REPAIR = time.monotonic()
+
+    try:
+        from proxy_chain import get_egress_config
+
+        cfg = get_egress_config()
+        if str(cfg.get("mode", "warp")) not in ("warp", "clean"):
+            return False
+        from ouc_common import (
+            ensure_warp_mode,
+            ensure_warp_protocol,
+            find_warp_cli,
+            repair_warp_registration,
+            run_warp,
+            warp_registration_healthy,
+        )
+
+        warp_bin = find_warp_cli()
+        if not warp_bin:
+            return False
+        if not warp_registration_healthy(warp_bin):
+            if not repair_warp_registration(warp_bin, 2):
+                return False
+        try:
+            ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+        except Exception:
+            pass
+        scope = str(cfg.get("warp_scope", "tun"))
+        ensure_warp_mode(warp_bin, scope)
+        run_warp(["connect"], warp_bin=warp_bin, timeout=12.0)
+        for _ in range(8):
+            time.sleep(0.75)
+            if scope == "isolated":
+                try:
+                    with socket.create_connection(("127.0.0.1", 40000), timeout=0.6):
+                        return True
+                except OSError:
+                    pass
+            if get_warp_local_v6():
+                warp_state.poll_controls()
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _open_upstream(
     host: str,
     port: int,
     warp_state: _WarpState,
 ) -> socket.socket:
-    """Connect upstream: supports WARP IPv6, Tor, and Custom SOCKS5/HTTP with resilient fallback."""
+    """Connect upstream through the active WARP, Tor, or custom route."""
     clean_host = host.strip("[]").lower()
     if clean_host in ("127.0.0.1", "localhost", "::1"):
         sock = socket.create_connection((clean_host, port), timeout=10.0)
@@ -288,6 +363,7 @@ def _open_upstream(
 
     try:
         from proxy_chain import get_egress_config, open_multi_egress_upstream
+
         cfg = get_egress_config()
         if cfg.get("mode") in ("tor", "custom"):
             try:
@@ -297,15 +373,34 @@ def _open_upstream(
                     lambda h, p: _open_warp_direct(h, p, warp_state),
                 )
             except Exception as exc:
-                is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (LANE_DIR / "strict_proxy.flag").is_file()
-                if is_strict:
-                    raise ConnectionRefusedError(f"Multi-egress ({cfg.get('mode')}) upstream error: {exc}")
-                # Fall back to resilient direct path if upstream proxy dropped
+                if _strict_mode():
+                    raise ConnectionRefusedError(
+                        f"Multi-egress ({cfg.get('mode')}) upstream error: {exc}"
+                    ) from exc
                 return _open_warp_direct(clean_host, port, warp_state)
+    except ConnectionRefusedError:
+        raise
     except Exception:
         pass
 
     return _open_warp_direct(clean_host, port, warp_state)
+
+
+def _connect_upstream(
+    host: str,
+    port: int,
+    warp_state: _WarpState,
+) -> socket.socket:
+    """Open the configured route, repairing a dropped WARP tunnel once."""
+    try:
+        return _open_upstream(host, port, warp_state)
+    except Exception as first:
+        if _repair_warp_tunnel(warp_state):
+            try:
+                return _open_upstream(host, port, warp_state)
+            except Exception as second:
+                raise second from first
+        raise
 
 
 def _make_handler(warp_state: _WarpState):
@@ -331,6 +426,8 @@ def _make_handler(warp_state: _WarpState):
                 low = line.decode("latin-1").lower()
                 if low.startswith("proxy-connection:"):
                     continue
+                if low.startswith("proxy-authorization:"):
+                    continue
                 if low.startswith("content-length:"):
                     try:
                         content_len = int(low.split(":", 1)[1].strip())
@@ -349,13 +446,12 @@ def _make_handler(warp_state: _WarpState):
                         self._send_err(400, "Bad Request")
                         return
                 try:
-                    upstream = _open_upstream(host, port, warp_state)
+                    upstream = _connect_upstream(host, port, warp_state)
                 except Exception as exc:
-                    is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (LANE_DIR / "strict_proxy.flag").is_file()
-                    if is_strict:
+                    if _strict_mode():
                         self._send_err(503, f"Service Unavailable: {exc}")
                         return
-                    # Seamless direct fallback so user never gets 502/503 errors
+                    # Direct fallback keeps OpenCode usable when the route drops.
                     try:
                         upstream = socket.create_connection((host, port), timeout=8.0)
                         upstream.settimeout(None)
@@ -382,13 +478,12 @@ def _make_handler(warp_state: _WarpState):
                 path = f"{path}?{parsed.query}"
 
             try:
-                upstream = _open_upstream(host, port, warp_state)
+                upstream = _connect_upstream(host, port, warp_state)
             except Exception as exc:
-                is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (LANE_DIR / "strict_proxy.flag").is_file()
-                if is_strict:
+                if _strict_mode():
                     self._send_err(503, f"Service Unavailable: {exc}")
                     return
-                # Seamless direct fallback so user never gets 502/503 errors
+                # Direct fallback keeps OpenCode usable when the route drops.
                 try:
                     upstream = socket.create_connection((host, port), timeout=8.0)
                     upstream.settimeout(None)
@@ -412,7 +507,8 @@ def _make_handler(warp_state: _WarpState):
 
         def _send_err(self, code: int, reason: str) -> None:
             try:
-                msg = f"HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                safe = reason.replace("\r", " ").replace("\n", " ")
+                msg = f"HTTP/1.1 {code} {safe}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
                 self.wfile.write(msg.encode("ascii", errors="replace"))
                 self.wfile.flush()
             except OSError:
@@ -451,8 +547,6 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
 
 
 if __name__ == "__main__":
-    import sys
-
     bind_port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     server, listening_port, edge = start_proxy_server(bind_port)
     print(f"zen-proxy listening on 127.0.0.1:{listening_port} (edge={edge})", flush=True)

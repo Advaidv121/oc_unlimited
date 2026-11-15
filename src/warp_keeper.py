@@ -1,8 +1,9 @@
-"""Windows WARP keeper: enforces TUN mode and auto-repairs WARP connections."""
+"""Windows WARP keeper: keeps the selected WARP mode connected and repairs dropped tunnels."""
 
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import time
 
@@ -12,131 +13,140 @@ from ouc_common import (
     acquire_mutex,
     append_log,
     ensure_dirs,
+    ensure_warp_mode,
+    ensure_warp_protocol,
     find_warp_cli,
-    get_warp_local_v6,
     is_admin,
     is_keeper_paused,
+    repair_warp_registration,
     run_warp,
+    warp_mode,
     warp_status,
 )
 from ouc_firewall import install_killswitch, is_killswitch_installed
 from zen_proxy import start_proxy_server
 
 TICK_SECONDS = 45
+REPAIR_COOLDOWN_SECONDS = 120.0
+_last_repair = 0.0
+
+
+def _active_scope() -> str:
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    try:
+        from proxy_chain import get_egress_config
+
+        return str(get_egress_config().get("warp_scope", default_scope))
+    except Exception:
+        return default_scope
+
+
+def _wait_connected(warp_bin: str, attempts: int = 10) -> bool:
+    for _ in range(attempts):
+        time.sleep(1.0)
+        connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+        if connected:
+            return True
+    return False
+
+
+def _connect(warp_bin: str, scope: str) -> bool:
+    ensure_warp_mode(warp_bin, scope)
+    ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+    run_warp(["connect"], warp_bin=warp_bin, timeout=12.0)
+    return _wait_connected(warp_bin)
+
+
+def _registration_missing(raw: str) -> bool:
+    low = (raw or "").lower()
+    return any(
+        marker in low
+        for marker in ("registration missing", "not registered", "no registration")
+    )
 
 
 def ensure_connected(warp_bin: str | None = None) -> bool:
-    """Verify WARP connection based on active scope (isolated proxy or full TUN)."""
+    """Keep the WARP tunnel connected without resetting a healthy session."""
+    global _last_repair
+
     if not warp_bin:
         warp_bin = find_warp_cli()
     if not warp_bin:
         return False
 
-    default_scope = "tun" if sys.platform == "win32" else "isolated"
-    scope = default_scope
-    try:
-        from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", default_scope)
-    except Exception:
-        pass
-
-    connected, mode, raw = warp_status(warp_bin)
-
-    # 1. If already connected, DO NOT TOUCH IT!
-    # Re-setting protocol, ports or endpoints tears down the adapter and drops active sockets (causing ECONNRESET).
+    scope = _active_scope()
+    desired_mode = "proxy" if scope == "isolated" else "warp"
+    connected, _mode, raw = warp_status(warp_bin=warp_bin, force=True)
     if connected:
+        current_mode = warp_mode(warp_bin=warp_bin)
+        if not current_mode or current_mode == desired_mode:
+            return True
+        # The selected scope changed while the tunnel stayed up. Apply the
+        # mode before returning so the isolated proxy port is actually bound.
+        append_log(
+            KEEPER_LOG_FILE,
+            f"operation mode drift ({current_mode} -> {desired_mode}) — applying selected scope",
+        )
+        ensure_warp_mode(warp_bin, scope)
+        if _wait_connected(warp_bin, 8):
+            return True
+        _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+
+    low = (raw or "").lower()
+    if "connecting" in low or "reconnecting" in low:
+        if _wait_connected(warp_bin, 8):
+            return True
+        _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+
+    if _registration_missing(raw):
+        append_log(KEEPER_LOG_FILE, "registration missing — creating a new one")
+        if not repair_warp_registration(warp_bin, 3):
+            return False
+        raw = ""
+
+    if _connect(warp_bin, scope):
         return True
 
-    raw_lower = (raw or "").lower()
+    if time.monotonic() - _last_repair < REPAIR_COOLDOWN_SECONDS:
+        return False
+    _last_repair = time.monotonic()
 
-    # 2. If WARP is currently establishing handshake (Connecting / Reconnecting),
-    # give it a generous grace window (up to 8s) rather than declaring it dead.
-    if "connecting" in raw_lower:
-        for _ in range(8):
-            time.sleep(1.0)
-            connected, mode, raw = warp_status(warp_bin)
-            if connected:
-                return True
-            if "connecting" not in (raw or "").lower():
-                break
+    append_log(KEEPER_LOG_FILE, "tunnel disconnected — renewing keys and reconnecting")
+    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin, timeout=15.0)
+    if _connect(warp_bin, scope):
+        return True
 
-    # 3. Disconnected state: apply configuration once and connect
-    if scope == "isolated":
-        if not mode or "proxy" not in mode.lower():
-            run_warp(["mode", "proxy"], warp_bin=warp_bin)
-            run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
-
-        run_warp(["connect"], warp_bin=warp_bin)
-        for _ in range(8):
-            time.sleep(1.0)
-            connected, _, raw = warp_status(warp_bin)
-            if connected:
-                return True
-            if "connecting" not in (raw or "").lower() and not connected:
-                pass
-
-        # If still not connected after grace window, rotate keys and reset endpoints (NO nuclear registration deletion!)
-        append_log(KEEPER_LOG_FILE, "isolated tunnel disconnected — rotating keys & reconnecting")
-        run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-        run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
-        run_warp(["mode", "proxy"], warp_bin=warp_bin)
-        run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
-        run_warp(["connect"], warp_bin=warp_bin)
-
-        for _ in range(8):
-            time.sleep(1.0)
-            connected, _, _ = warp_status(warp_bin)
-            if connected:
-                return True
-
-        # Only register new if registration is explicitly missing or corrupt
-        raw_check = (raw or "").lower()
-        if "registration missing" in raw_check or "not registered" in raw_check:
-            append_log(KEEPER_LOG_FILE, "registration missing — registering fresh WARP client")
-            run_warp(["registration", "new"], warp_bin=warp_bin)
-            run_warp(["mode", "proxy"], warp_bin=warp_bin)
-            run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
-            run_warp(["connect"], warp_bin=warp_bin)
-            time.sleep(3)
-            connected, _, _ = warp_status(warp_bin)
-
-        return connected
-
-    # Full System TUN mode (only when scope is explicitly set to full TUN)
-    if not mode or "warp" not in mode.lower():
-        run_warp(["mode", "warp"], warp_bin=warp_bin)
-
-    run_warp(["connect"], warp_bin=warp_bin)
-    for _ in range(8):
-        time.sleep(1.0)
-        connected, _, raw = warp_status(warp_bin)
-        if connected:
+    _, _, raw = warp_status(warp_bin=warp_bin, force=True)
+    if _registration_missing(raw):
+        if repair_warp_registration(warp_bin, 3) and _connect(warp_bin, scope):
             return True
-        if "connecting" not in (raw or "").lower() and not connected:
-            pass
+    return False
 
-    append_log(KEEPER_LOG_FILE, "TUN tunnel disconnected — rotating keys & reconnecting")
-    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
-    run_warp(["mode", "warp"], warp_bin=warp_bin)
-    run_warp(["connect"], warp_bin=warp_bin)
 
-    for _ in range(8):
-        time.sleep(1.0)
-        connected, _, _ = warp_status(warp_bin)
-        if connected:
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.6):
             return True
+    except OSError:
+        return False
 
-    raw_check = (raw or "").lower()
-    if "registration missing" in raw_check or "not registered" in raw_check:
-        append_log(KEEPER_LOG_FILE, "registration missing — registering fresh TUN client")
-        run_warp(["registration", "new"], warp_bin=warp_bin)
-        run_warp(["mode", "warp"], warp_bin=warp_bin)
-        run_warp(["connect"], warp_bin=warp_bin)
-        time.sleep(4)
-        connected, _, _ = warp_status(warp_bin)
 
-    return connected
+def _start_service_proxy() -> object | None:
+    if _port_open(SERVICE_PROXY_PORT):
+        return None
+    try:
+        srv, bound_port, edge = start_proxy_server(SERVICE_PROXY_PORT)
+        append_log(
+            KEEPER_LOG_FILE,
+            f"service proxy listening on 127.0.0.1:{bound_port} (edge={edge})",
+        )
+        return srv
+    except Exception as exc:
+        append_log(
+            KEEPER_LOG_FILE,
+            f"service proxy bind failed on port {SERVICE_PROXY_PORT}: {exc}",
+        )
+        return None
 
 
 def main() -> int:
@@ -148,13 +158,9 @@ def main() -> int:
     warp_bin = find_warp_cli()
     append_log(KEEPER_LOG_FILE, f"keeper up (tick={TICK_SECONDS}s, warp={'found' if warp_bin else 'none'})")
 
-    # 1. ALWAYS start the desktop/service proxy on port 41987 first so OpenCode can route in all modes
-    proxy_srv = None
-    try:
-        proxy_srv, bound_port, edge = start_proxy_server(SERVICE_PROXY_PORT)
-        append_log(KEEPER_LOG_FILE, f"desktop/service proxy listening on 127.0.0.1:{bound_port} (edge={edge})")
-    except Exception as exc:
-        append_log(KEEPER_LOG_FILE, f"service proxy bind failed on port {SERVICE_PROXY_PORT}: {exc}")
+    # Start the desktop/service proxy on 41987 so every egress mode is routable.
+    proxy_srv = _start_service_proxy()
+    reported_external = proxy_srv is None and _port_open(SERVICE_PROXY_PORT)
 
     # On startup, allow network interface initialization if booting and warp is installed
     if warp_bin:
@@ -166,6 +172,15 @@ def main() -> int:
 
     while True:
         try:
+            if proxy_srv is None and not _port_open(SERVICE_PROXY_PORT):
+                proxy_srv = _start_service_proxy()
+            elif proxy_srv is None and not reported_external:
+                append_log(KEEPER_LOG_FILE, "service proxy is already listening")
+                reported_external = True
+
+            if warp_bin is None:
+                warp_bin = find_warp_cli()
+
             mode = "warp"
             try:
                 from proxy_chain import get_egress_config
@@ -183,11 +198,33 @@ def main() -> int:
                         if not is_killswitch_installed():
                             install_killswitch()
             elif mode == "tor":
-                # Ensure Tor daemon is healthy if managed
+                # Restart the managed Tor daemon only when its process is gone,
+                # or when a live process has not opened its SOCKS port after a
+                # generous bootstrap window. Restarting on every tick would kill
+                # a slow first bootstrap before it completes.
                 try:
-                    from tor_manager import get_active_tor_target, is_portable_tor_running, start_portable_tor
-                    if not get_active_tor_target() and is_portable_tor_running():
-                        start_portable_tor()
+                    from tor_manager import (
+                        TOR_PID_FILE,
+                        get_active_tor_target,
+                        is_portable_tor_running,
+                        start_portable_tor,
+                        stop_portable_tor,
+                    )
+                    if not get_active_tor_target():
+                        if not is_portable_tor_running():
+                            start_portable_tor()
+                        else:
+                            try:
+                                age = time.time() - TOR_PID_FILE.stat().st_mtime
+                            except OSError:
+                                age = 0.0
+                            if age > 240.0:
+                                append_log(
+                                    KEEPER_LOG_FILE,
+                                    "Tor SOCKS port did not open within 240s — restarting Tor",
+                                )
+                                stop_portable_tor()
+                                start_portable_tor()
                 except Exception:
                     pass
         except Exception as exc:

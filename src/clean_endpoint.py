@@ -89,14 +89,19 @@ def set_custom_endpoint(endpoint: str) -> tuple[bool, str]:
     if rc == 0:
         run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
         run_warp(["connect"], warp_bin=warp_bin)
-        for _ in range(6):
+        raw = msg
+        for _ in range(10):
             time.sleep(0.8)
-            conn, _, raw = warp_status(warp_bin)
-            raw_low = raw.lower()
-            # "unstable" simply means ping latency is elevated; traffic still flows normally!
+            conn, _, raw = warp_status(warp_bin, force=True)
+            raw_low = (raw or "").lower()
+            # "unstable" only means elevated latency; traffic still flows.
             if conn and "unable" not in raw_low and "mitm" not in raw_low:
                 return True, f"Cloudflare WARP endpoint connected to {endpoint} (WireGuard)."
-        return True, f"Cloudflare WARP endpoint set to {endpoint} (handshake establishing...)."
+        detail = (raw or "").strip()
+        return False, (
+            f"Endpoint {endpoint} was set but WARP did not connect"
+            + (f": {detail}" if detail else ".")
+        )
     return False, f"Failed to set endpoint: {msg}"
 
 
@@ -106,7 +111,9 @@ def reset_custom_endpoint() -> tuple[bool, str]:
     if not warp_bin:
         return False, "Cloudflare warp-cli.exe not found."
 
-    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
+    rc, msg = run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
+    if rc != 0:
+        return False, f"Failed to reset the WARP endpoint: {msg}"
     try:
         from ouc_common import ensure_warp_protocol
         ensure_warp_protocol("wireguard", warp_bin=warp_bin)
@@ -114,7 +121,17 @@ def reset_custom_endpoint() -> tuple[bool, str]:
         pass
     run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
     run_warp(["connect"], warp_bin=warp_bin)
-    return True, "Cloudflare WARP endpoint reset to official default (WireGuard protocol)."
+    raw = ""
+    for _ in range(10):
+        time.sleep(0.8)
+        conn, _, raw = warp_status(warp_bin, force=True)
+        if conn:
+            return True, "Cloudflare WARP endpoint reset to the default (WireGuard protocol)."
+    detail = (raw or "").strip()
+    return False, (
+        "Endpoint reset, but WARP did not reconnect"
+        + (f": {detail}" if detail else ".")
+    )
 
 
 def auto_heal_warp_endpoint(timeout: float = 1.0) -> tuple[bool, str]:

@@ -9,8 +9,10 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -128,19 +130,27 @@ def find_warp_cli() -> str | None:
 
 
 def find_opencode_cli() -> str | None:
-    """Locate the real opencode CLI binary, skipping wrapper shims."""
+    """Locate the OpenCode CLI binary, skipping the Desktop GUI executable."""
     env_bin = os.environ.get("OUC_REAL_BIN", "").strip()
     if env_bin and Path(env_bin).is_file():
         return env_bin
 
-    # 1. Check running processes first
+    # The Desktop GUI also runs as OpenCode.exe. Only accept a running
+    # opencode-cli/host CLI process, or an opencode.exe outside the Desktop
+    # installation directory.
     try:
         import psutil
         for p in psutil.process_iter(["name", "exe"]):
             try:
                 name = (p.info["name"] or "").lower()
                 exe = p.info["exe"] or ""
-                if ("opencode-cli" in name or name == "opencode.exe") and BRAND not in exe.lower():
+                low = exe.lower()
+                if not exe or BRAND in low:
+                    continue
+                if "opencode-cli" in name:
+                    if Path(exe).is_file():
+                        return str(exe)
+                elif name == "opencode.exe" and "ai.opencode.desktop" not in low:
                     if Path(exe).is_file():
                         return str(exe)
             except Exception:
@@ -148,41 +158,69 @@ def find_opencode_cli() -> str | None:
     except Exception:
         pass
 
-    # 2. Check standard candidate paths
+    # Desktop-managed CLI versions live under Roaming\ai.opencode.desktop\cli.
+    appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    cli_dir = appdata / "ai.opencode.desktop" / "cli"
+    if cli_dir.is_dir():
+        found: list[Path] = []
+        for p in cli_dir.rglob("opencode-cli.exe"):
+            try:
+                if p.is_file():
+                    found.append(p)
+            except OSError:
+                pass
+        if found:
+            return str(max(found, key=lambda p: p.stat().st_mtime))
+
     for candidate in _OPENCODE_CANDIDATES:
         if candidate.is_file():
             return str(candidate)
 
-    # 3. Check AppData Roaming CLI versions
-    appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-    cli_dir = appdata / "ai.opencode.desktop" / "cli"
-    if cli_dir.is_dir():
-        for p in sorted(cli_dir.rglob("opencode-cli.exe"), reverse=True):
-            if p.is_file():
-                return str(p)
-
-    # 4. PATH lookup
     for name in ("opencode.exe", "opencode"):
         found = shutil.which(name)
         if not found:
             continue
         low = found.lower()
-        if BRAND in low or "opencode-infinite" in low:
+        if BRAND in low or "opencode-infinite" in low or "unlimited" in low:
+            continue
+        if "ai.opencode.desktop" in low and not low.endswith("opencode-cli.exe"):
             continue
         return found
     return None
 
 
+def opencode_command(exe: str, args: list[str]) -> list[str]:
+    """Return an executable argument list that also works for .cmd shims."""
+    if exe.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe, *args]
+    return [exe, *args]
+
+
+def find_opencode_service_port() -> int | None:
+    """Return the port of the running OpenCode background service, if any."""
+    exe = find_opencode_cli()
+    if not exe:
+        return None
+    try:
+        res = run_hidden(opencode_command(exe, ["service", "status"]), timeout=6.0)
+        text = (res.stdout or "") + (res.stderr or "")
+        match = re.search(r"127\.0\.0\.1:(\d{2,5})", text)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def find_opencode_desktop() -> str | None:
-    """Locate OpenCode Desktop GUI executable if installed."""
-    # 1. Check running processes first
+    """Locate the OpenCode Desktop GUI executable if installed."""
     try:
         import psutil
         for p in psutil.process_iter(["name", "exe"]):
             try:
                 name = (p.info["name"] or "").lower()
                 exe = p.info["exe"] or ""
-                if name == "opencode.exe" and BRAND not in exe.lower():
+                if name == "opencode.exe" and "ai.opencode.desktop" in exe.lower():
                     if Path(exe).is_file():
                         return str(exe)
             except Exception:
@@ -203,7 +241,6 @@ def find_opencode_desktop() -> str | None:
         if c.is_file():
             return str(c)
 
-    # 3. Check Desktop and Start Menu shortcuts (.lnk)
     try:
         import win32com.client
         shell = win32com.client.Dispatch("WScript.Shell")
@@ -229,6 +266,21 @@ def find_opencode_desktop() -> str | None:
     return None
 
 
+_WARP_STATUS_CACHE: dict[str, tuple[float, tuple[bool, str, str]]] = {}
+_WARP_STATUS_LOCK = threading.Lock()
+_WARP_MODE_CACHE: dict[str, tuple[float, str]] = {}
+
+_WARP_STATE_ARGS = {
+    "connect",
+    "disconnect",
+    "registration",
+    "mode",
+    "tunnel",
+    "proxy",
+    "settings",
+}
+
+
 def run_warp(
     args: list[str],
     warp_bin: str | None = None,
@@ -239,31 +291,59 @@ def run_warp(
     if not exe:
         return 1, "warp-cli.exe not found"
 
+    out = ""
+    rc = 1
     for attempt in ([exe, "--accept-tos", *args], [exe, *args]):
         try:
             res = run_hidden(attempt, timeout=timeout)
             out = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-            if res.returncode == 0:
-                return 0, out.strip()
+            rc = res.returncode
+            if rc == 0:
+                break
         except Exception as exc:
             out = str(exc)
-    return 1, out.strip()
+            rc = 1
+
+    if rc == 0 and any(a in _WARP_STATE_ARGS for a in args):
+        with _WARP_STATUS_LOCK:
+            _WARP_STATUS_CACHE.clear()
+            _WARP_MODE_CACHE.clear()
+    return rc, out.strip()
 
 
 def warp_mode(warp_bin: str | None = None) -> str:
-    """Return current WARP operation_mode from settings JSON (e.g. 'warp')."""
+    """Return the current WARP operation mode (warp or proxy)."""
+    exe = warp_bin or find_warp_cli() or ""
+    now = time.monotonic()
+    with _WARP_STATUS_LOCK:
+        cached = _WARP_MODE_CACHE.get(exe)
+        if cached and now - cached[0] < 5.0:
+            return cached[1]
+
+    mode = ""
     rc, out = run_warp(["-j", "settings", "list"], warp_bin=warp_bin, timeout=6.0)
-    if rc == 0 and out.startswith("{"):
+    if rc == 0 and "{" in out:
         try:
-            data = json.loads(out)
+            data = json.loads(out[out.find("{"): out.rfind("}") + 1])
             op = data.get("settings", {}).get("operation_mode") or data.get("operation_mode")
             if isinstance(op, str):
-                return op
-            if isinstance(op, dict):
-                return ",".join(op.keys())
+                mode = op
+            elif isinstance(op, dict):
+                mode = ",".join(op.keys())
         except Exception:
             pass
-    return ""
+    if not mode:
+        rc2, out2 = run_warp(["settings"], warp_bin=warp_bin, timeout=5.0)
+        if rc2 == 0:
+            for line in out2.splitlines():
+                if "mode" in line.lower() and ":" in line:
+                    value = line.rsplit(":", 1)[1].strip().lower()
+                    if value in ("warp", "proxy", "dns_only", "tunnel_only"):
+                        mode = value
+                        break
+    with _WARP_STATUS_LOCK:
+        _WARP_MODE_CACHE[exe] = (time.monotonic(), mode)
+    return mode
 
 
 def get_warp_protocol(warp_bin: str | None = None) -> str:
@@ -271,18 +351,15 @@ def get_warp_protocol(warp_bin: str | None = None) -> str:
     rc, out = run_warp(["-j", "settings"], warp_bin=warp_bin, timeout=5.0)
     if rc == 0 and "{" in out:
         try:
-            idx_start = out.find("{")
-            idx_end = out.rfind("}")
-            if idx_start != -1 and idx_end != -1:
-                data = json.loads(out[idx_start : idx_end + 1])
-                proto = (
-                    data.get("settings", {})
-                    .get("warp_tunnel_protocol", "")
-                    .lower()
-                    .strip()
-                )
-                if proto:
-                    return proto
+            data = json.loads(out[out.find("{"): out.rfind("}") + 1])
+            proto = (
+                data.get("settings", {})
+                .get("warp_tunnel_protocol", "")
+                .lower()
+                .strip()
+            )
+            if proto:
+                return proto
         except Exception:
             pass
     rc2, out2 = run_warp(["settings"], warp_bin=warp_bin, timeout=5.0)
@@ -297,58 +374,79 @@ def get_warp_protocol(warp_bin: str | None = None) -> str:
 
 
 def ensure_warp_protocol(desired: str = "wireguard", warp_bin: str | None = None) -> bool:
-    """Ensure WARP tunnel protocol is set to desired without touching it if already set."""
+    """Set the WARP tunnel protocol only when it differs from the requested one."""
+    want = desired.strip().lower()
+    if want not in ("wireguard", "masque"):
+        return False
     current = get_warp_protocol(warp_bin=warp_bin)
-    if current == desired.lower():
+    if current == want:
         return True
-    rc, _ = run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp_bin, timeout=10.0)
+    label = "WireGuard" if want == "wireguard" else "MASQUE"
+    rc, _ = run_warp(["tunnel", "protocol", "set", label], warp_bin=warp_bin, timeout=10.0)
+    if rc == 0:
+        with _WARP_STATUS_LOCK:
+            _WARP_MODE_CACHE.clear()
     return rc == 0
 
 
-def warp_status(warp_bin: str | None = None) -> tuple[bool, str, str]:
-    """Return (is_connected, mode_name, raw_text) for WARP."""
-    rc, out = run_warp(["-j", "status"], warp_bin=warp_bin, timeout=8.0)
+def warp_status(warp_bin: str | None = None, force: bool = False) -> tuple[bool, str, str]:
+    """Return (is_connected, mode_name, status_text) for WARP."""
+    exe = warp_bin or find_warp_cli() or ""
+    now = time.monotonic()
+    if not force:
+        with _WARP_STATUS_LOCK:
+            cached = _WARP_STATUS_CACHE.get(exe)
+            if cached and now - cached[0] < 1.0:
+                return cached[1]
+
+    connected = False
+    mode = ""
+    status_text = "Disconnected"
+    rc, out = run_warp(["-j", "status"], warp_bin=warp_bin, timeout=6.0)
     if rc == 0 and "{" in out:
         try:
-            idx_start = out.find("{")
-            idx_end = out.rfind("}")
-            if idx_start != -1 and idx_end != -1:
-                data = json.loads(out[idx_start : idx_end + 1])
-                status = str(data.get("status", "")).strip()
-                connected = status.lower() == "connected"
-                mode = ""
-                reason = data.get("reason")
-                if isinstance(reason, dict):
-                    cur = (
-                        reason.get("SettingsChanged", {}).get("current", {})
-                        if isinstance(reason.get("SettingsChanged"), dict)
-                        else {}
-                    )
-                    op_mode = cur.get("operation_mode")
+            data = json.loads(out[out.find("{"): out.rfind("}") + 1])
+            status_text = str(data.get("status", "")).strip() or status_text
+            connected = status_text.lower() == "connected"
+            reason = data.get("reason")
+            if isinstance(reason, dict):
+                current = reason.get("SettingsChanged")
+                if isinstance(current, dict) and isinstance(current.get("current"), dict):
+                    op_mode = current["current"].get("operation_mode")
                     if isinstance(op_mode, str):
                         mode = op_mode
                     elif isinstance(op_mode, dict):
                         mode = ",".join(op_mode.keys())
-                if not mode:
-                    mode = warp_mode(warp_bin=warp_bin)
-                return connected, mode, status
+            if not mode:
+                mode = warp_mode(warp_bin=warp_bin)
+            if not connected and reason:
+                detail = reason if isinstance(reason, str) else json.dumps(reason, ensure_ascii=True)
+                status_text = f"{status_text}: {detail}"
         except Exception:
             pass
+    else:
+        rc2, out2 = run_warp(["status"], warp_bin=warp_bin, timeout=6.0)
+        first = ""
+        for line in (out2 or "").splitlines():
+            line_s = line.strip()
+            if not line_s:
+                continue
+            low = line_s.lower()
+            if "status" in low or "connected" in low:
+                if not first:
+                    first = line_s
+                if "connected" in low and "disconnected" not in low:
+                    connected = True
+                    first = line_s
+                    break
+        if first:
+            status_text = first
+        mode = warp_mode(warp_bin=warp_bin)
 
-    rc2, out2 = run_warp(["status"], warp_bin=warp_bin, timeout=8.0)
-    connected = False
-    raw_status = ""
-    for line in (out2 or "").splitlines():
-        line_s = line.strip()
-        if "status" in line_s.lower() or "connected" in line_s.lower():
-            if not raw_status:
-                raw_status = line_s
-            if "connected" in line_s.lower() and "disconnected" not in line_s.lower():
-                connected = True
-                break
-    if not raw_status and out2:
-        raw_status = out2.splitlines()[0].strip()
-    return connected, "", raw_status
+    result = (connected, mode, status_text)
+    with _WARP_STATUS_LOCK:
+        _WARP_STATUS_CACHE[exe] = (time.monotonic(), result)
+    return result
 
 
 def is_cloudflare_v6(addr: str) -> bool:
@@ -364,38 +462,37 @@ def is_cloudflare_v6(addr: str) -> bool:
 
 
 def get_warp_local_v6() -> str | None:
-    """Return the active CloudflareWARP adapter global IPv6 address, or None."""
-    # 1. Try directly querying the CloudflareWARP named interface
+    """Return the active WARP adapter global IPv6 address, or None."""
+    # Adapter names are localized on some Windows installs; match the
+    # interface by its owner (Cloudflare/WARP) instead of a fixed label.
     try:
-        res = run_hidden(
-            ["netsh", "interface", "ipv6", "show", "addresses", "CloudflareWARP"],
-            timeout=5.0,
-        )
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                m = _IPV6_RE.search(line)
-                if not m:
+        import psutil
+        for name, addrs in psutil.net_if_addrs().items():
+            low = name.lower()
+            if "warp" not in low and "cloudflare" not in low:
+                continue
+            for addr in addrs:
+                if addr.family != socket.AF_INET6:
                     continue
-                cand = m.group(1).split("%", 1)[0]
+                cand = str(addr.address).split("%", 1)[0]
                 try:
                     ip = ipaddress.IPv6Address(cand)
                 except ValueError:
                     continue
                 if ip.is_link_local or ip.is_loopback or ip.is_multicast:
                     continue
-                if is_cloudflare_v6(str(ip)) or ip.is_global:
-                    return str(ip)
+                return str(ip)
     except Exception:
         pass
 
-    # 2. Localized Windows fallback: query all IPv6 addresses and look for Cloudflare ranges
+    # Fallback for systems without psutil or with a renamed adapter.
     try:
-        res_all = run_hidden(
+        res = run_hidden(
             ["netsh", "interface", "ipv6", "show", "addresses"],
             timeout=5.0,
         )
-        if res_all.returncode == 0:
-            for line in res_all.stdout.splitlines():
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
                 m = _IPV6_RE.search(line)
                 if not m:
                     continue
@@ -413,100 +510,178 @@ def get_warp_local_v6() -> str | None:
     return None
 
 
-def get_egress_v6(timeout: float = 6.0) -> str:
-    """Query external IPv6 egress via curl.exe or urllib using Cloudflare trace endpoints."""
-    curl = shutil.which("curl.exe") or shutil.which("curl")
-    endpoints = (
-        "https://1.1.1.1/cdn-cgi/trace",
-        "https://cloudflare.com/cdn-cgi/trace",
-        "https://api64.ipify.org",
-    )
+_EGRESS_ENDPOINTS = (
+    "https://api64.ipify.org",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://1.1.1.1/cdn-cgi/trace",
+)
 
-    default_scope = "tun" if sys.platform == "win32" else "isolated"
-    scope = default_scope
+
+def _valid_public_ip(text: str) -> str:
+    """Return a normalized public IP address from text, or an empty string."""
+    cand = text.strip().split("%", 1)[0]
+    if not cand or len(cand) > 64 or any(ch in cand for ch in " <>\"'"):
+        return ""
+    try:
+        ip = ipaddress.ip_address(cand)
+    except ValueError:
+        return ""
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        return ""
+    return str(ip)
+
+
+def _parse_egress_body(text: str) -> str:
+    """Extract an address from ipify output or a Cloudflare trace body."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("ip="):
+            found = _valid_public_ip(line.split("=", 1)[1])
+            if found:
+                return found
+    return _valid_public_ip(text or "")
+
+
+def _curl_egress(curl: str, proxy: str, ipv6: bool, timeout: float) -> str:
+    """Probe a public IP echo service, optionally through a proxy."""
+    for endpoint in _EGRESS_ENDPOINTS:
+        args = [curl, "-sS", "--max-time", str(max(2, int(timeout)))]
+        if ipv6:
+            args.append("-6")
+        if proxy:
+            args.extend(["-x", proxy])
+        args.append(endpoint)
+        try:
+            res = run_hidden(args, timeout=timeout + 1.5)
+        except Exception:
+            continue
+        found = _parse_egress_body(res.stdout)
+        if found:
+            return found
+    return ""
+
+
+def _proxy_url(
+    host: str,
+    port: int,
+    proxy_type: str = "socks5",
+    username: str = "",
+    password: str = "",
+) -> str:
+    """Build a curl proxy URL, including credentials when configured."""
+    from urllib.parse import quote
+
+    scheme = "socks5h" if proxy_type.lower().startswith("socks") else "http"
+    auth = ""
+    if username:
+        auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+    return f"{scheme}://{auth}{host}:{port}"
+
+
+def get_egress_ip(timeout: float = 6.0) -> str:
+    """Return the public egress IP of the active route, or an empty string."""
     mode = "warp"
+    scope = "tun" if sys.platform == "win32" else "isolated"
     try:
         from proxy_chain import get_egress_config
+
         cfg = get_egress_config()
-        scope = cfg.get("warp_scope", default_scope)
-        mode = cfg.get("mode", "warp")
+        mode = str(cfg.get("mode", "warp"))
+        scope = str(cfg.get("warp_scope", scope))
     except Exception:
         pass
 
-    def _extract_ip(text: str) -> str:
-        if "ip=" in text:
-            for line in text.splitlines():
-                if line.startswith("ip="):
-                    cand = line.split("=", 1)[1].strip()
-                    if ":" in cand:
-                        try:
-                            ipaddress.IPv6Address(cand)
-                            return cand
-                        except ValueError:
-                            pass
-        elif ":" in text:
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if curl:
+        if mode == "tor":
+            ports: list[int] = []
             try:
-                ipaddress.IPv6Address(text)
-                return text
-            except ValueError:
+                from tor_manager import get_active_tor_target
+
+                target = get_active_tor_target()
+                if target:
+                    ports.append(int(target[1]))
+            except Exception:
                 pass
+            for port in [*ports, 9050, 9150]:
+                found = _curl_egress(
+                    curl, f"socks5h://127.0.0.1:{port}", False, timeout
+                )
+                if found:
+                    return found
+        elif mode == "custom":
+            proxy = ""
+            try:
+                from proxy_chain import get_current_proxy_spec
+
+                spec = get_current_proxy_spec()
+                proxy = _proxy_url(
+                    spec.get("host", "127.0.0.1"),
+                    int(spec.get("port", 10808)),
+                    str(spec.get("type", "socks5")),
+                    str(spec.get("username", "")),
+                    str(spec.get("password", "")),
+                )
+            except Exception:
+                proxy = ""
+            if proxy:
+                found = _curl_egress(curl, proxy, False, timeout)
+                if found:
+                    return found
+        else:
+            if scope == "isolated":
+                found = _curl_egress(
+                    curl, "socks5h://127.0.0.1:40000", False, timeout
+                )
+                if found:
+                    return found
+            found = _curl_egress(curl, "", True, timeout)
+            if found:
+                return found
+
+    # Direct HTTP fallback is only valid for a native WARP tunnel.
+    if mode in ("warp", "clean") and scope != "isolated":
+        for endpoint in _EGRESS_ENDPOINTS:
+            try:
+                req = urllib.request.Request(
+                    endpoint, headers={"User-Agent": "curl/8.0"}
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    found = _parse_egress_body(
+                        resp.read().decode("utf-8", errors="replace")
+                    )
+                if found:
+                    return found
+            except Exception:
+                pass
+    return ""
+
+
+def get_egress_v6(timeout: float = 6.0) -> str:
+    """Return the public IPv6 egress address for WARP, or an empty string."""
+    mode = "warp"
+    try:
+        from proxy_chain import get_egress_config
+
+        mode = str(get_egress_config().get("mode", "warp"))
+    except Exception:
+        pass
+    if mode not in ("warp", "clean"):
         return ""
 
-    if curl:
-        # 1. Isolated WARP scope: probe via SOCKS5 proxy port 40000
-        if mode == "warp" and scope == "isolated":
-            for ep in endpoints:
-                try:
-                    res = run_hidden(
-                        [curl, "-x", "socks5h://127.0.0.1:40000", "-s", "-m", str(int(timeout)), ep],
-                        timeout=timeout + 1.0,
-                    )
-                    cand = _extract_ip(res.stdout.strip())
-                    if cand:
-                        return cand
-                except Exception:
-                    pass
+    egress = get_egress_ip(timeout=timeout)
+    if ":" in egress:
+        return egress
 
-        # 2. Tor mode: probe via Tor SOCKS5
-        elif mode == "tor":
-            for p in (9050, 9150):
-                for ep in endpoints:
-                    try:
-                        res = run_hidden(
-                            [curl, "-x", f"socks5h://127.0.0.1:{p}", "-s", "-m", str(int(timeout)), ep],
-                            timeout=timeout + 1.0,
-                        )
-                        cand = _extract_ip(res.stdout.strip())
-                        if cand:
-                            return cand
-                    except Exception:
-                        pass
-
-        # 3. TUN scope or fallback: probe native IPv6 (-6)
-        for ep in endpoints:
-            try:
-                res = run_hidden(
-                    [curl, "-6", "-s", "-m", str(int(timeout)), ep],
-                    timeout=timeout + 1.0,
-                )
-                cand = _extract_ip(res.stdout.strip())
-                if cand:
-                    return cand
-            except Exception:
-                pass
-
-    # Direct urllib fallback (for TUN mode)
-    if scope != "isolated":
-        for ep in endpoints:
-            try:
-                req = urllib.request.Request(ep, headers={"User-Agent": "curl/8.0"})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    text = resp.read().decode("utf-8", errors="replace").strip()
-                    cand = _extract_ip(text)
-                    if cand:
-                        return cand
-            except Exception:
-                pass
+    local = get_warp_local_v6()
+    if local and is_cloudflare_v6(local):
+        return local
     return ""
 
 
@@ -618,8 +793,6 @@ def fetch_opencode_aaaa_pool() -> list[str]:
         except Exception:
             pass
 
-    import socket
-
     for host in ("opencode.ai", "api.opencode.ai"):
         try:
             for info in socket.getaddrinfo(host, 443, socket.AF_INET6, socket.SOCK_STREAM):
@@ -633,65 +806,105 @@ def fetch_opencode_aaaa_pool() -> list[str]:
     return sorted(pool)
 
 
-def hop_once(warp_bin: str, max_reg_tries: int = 3) -> str:
-    """Perform one WARP rotation and return the new external IPv6."""
-    # 1. Gentle non-destructive rotation first: rotate cryptographic keys & reset endpoint.
-    # This forces Cloudflare Anycast to negotiate a new peer session WITHOUT wiping the account/device registration!
-    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
-    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
-    run_warp(["disconnect"], warp_bin=warp_bin)
-    time.sleep(1.0)
-    run_warp(["connect"], warp_bin=warp_bin)
-
-    for _ in range(8):
-        time.sleep(1.5)
-        connected, _, _ = warp_status(warp_bin)
-        if connected:
-            v6 = get_egress_v6(timeout=5.0)
-            if v6:
-                return v6
-            local_v6 = get_warp_local_v6()
-            if local_v6 and is_cloudflare_v6(local_v6):
-                return local_v6
-
-    # 2. Only if the client is not connected AND registration is explicitly missing:
-    connected, _, raw_status = warp_status(warp_bin)
-    raw_lower = (raw_status or "").lower()
-    if not connected and ("registration missing" in raw_lower or "not registered" in raw_lower):
-        registered = False
-        for attempt in range(max_reg_tries):
-            rc, _ = run_warp(["registration", "new"], warp_bin=warp_bin)
-            if rc == 0:
-                registered = True
-                break
-            time.sleep(4)
-        if not registered:
-            return ""
-
+def _current_warp_scope() -> str:
     default_scope = "tun" if sys.platform == "win32" else "isolated"
-    scope = default_scope
     try:
         from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", default_scope)
+
+        return str(get_egress_config().get("warp_scope", default_scope))
     except Exception:
-        pass
+        return default_scope
 
-    if scope == "isolated":
-        run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
-        run_warp(["mode", "proxy"], warp_bin=warp_bin)
-    else:
-        run_warp(["mode", "warp"], warp_bin=warp_bin)
-    run_warp(["connect"], warp_bin=warp_bin)
 
-    for idx in range(8):
-        time.sleep(2)
-        connected, _, _ = warp_status(warp_bin)
-        if not connected:
+def ensure_warp_mode(warp_bin: str, scope: str) -> None:
+    """Put warp-cli into the operation mode required by the selected scope."""
+    desired = "proxy" if scope == "isolated" else "warp"
+    if warp_mode(warp_bin=warp_bin) == desired:
+        return
+    if desired == "proxy":
+        run_warp(["proxy", "port", "40000"], warp_bin=warp_bin, timeout=10.0)
+    run_warp(["mode", desired], warp_bin=warp_bin, timeout=10.0)
+
+
+def warp_registration_healthy(warp_bin: str) -> bool:
+    """Return True when warp-cli reports an existing device registration."""
+    rc, _ = run_warp(["registration", "show"], warp_bin=warp_bin, timeout=8.0)
+    return rc == 0
+
+
+def repair_warp_registration(warp_bin: str, max_tries: int = 3) -> bool:
+    """Recreate a broken registration without touching a healthy one."""
+    if warp_registration_healthy(warp_bin):
+        return True
+    for attempt in range(max(1, max_tries)):
+        rc, out = run_warp(["registration", "new"], warp_bin=warp_bin, timeout=30.0)
+        if rc == 0:
+            return True
+        if "old registration" in out.lower():
+            run_warp(["registration", "delete"], warp_bin=warp_bin, timeout=20.0)
             continue
-        v6 = get_egress_v6(timeout=5.0)
-        if v6:
-            return v6
-        local_v6 = get_warp_local_v6()
-        if local_v6 and is_cloudflare_v6(local_v6):
-            return local_v6
+        if attempt + 1 < max_tries:
+            time.sleep(4.0)
+    return False
+
+
+def _rotated_egress(
+    warp_bin: str, avoid: set[str], timeout: float = 2.5
+) -> str:
+    """Return the observed IPv6 egress when it is outside every avoided /64."""
+    connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+    if not connected:
+        return ""
+    candidate = get_egress_v6(timeout=timeout)
+    prefix = normalize_v6_64(candidate)
+    if not candidate or not prefix or prefix in avoid:
+        return ""
+    return candidate
+
+
+def hop_once(
+    warp_bin: str,
+    max_reg_tries: int = 3,
+    avoid_prefixes: set[str] | None = None,
+    previous: str = "",
+) -> str:
+    """Rotate the WARP session until an unused public /64 is observed.
+
+    Returns an address whose /64 differs from the previous egress and from
+    every prefix in ``avoid_prefixes``. Returns an empty string when the
+    tunnel cannot produce a fresh block.
+    """
+    avoid: set[str] = set()
+    for value in avoid_prefixes or ():
+        prefix = normalize_v6_64(value)
+        if prefix:
+            avoid.add(prefix)
+    old_prefix = normalize_v6_64(previous)
+    if old_prefix:
+        avoid.add(old_prefix)
+
+    scope = _current_warp_scope()
+    ensure_warp_mode(warp_bin, scope)
+    ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+
+    for _rotation in range(3):
+        # rotate-keys keeps the device registration and only renews the
+        # WireGuard session, so Cloudflare assigns a new client /64.
+        run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin, timeout=15.0)
+        run_warp(["disconnect"], warp_bin=warp_bin, timeout=10.0)
+        time.sleep(0.8)
+        run_warp(["connect"], warp_bin=warp_bin, timeout=15.0)
+
+        for _ in range(6):
+            time.sleep(1.5)
+            candidate = _rotated_egress(warp_bin, avoid)
+            if candidate:
+                return candidate
+
+        connected, _, _raw = warp_status(warp_bin=warp_bin, force=True)
+        if not connected:
+            if repair_warp_registration(warp_bin, max_reg_tries):
+                ensure_warp_mode(warp_bin, scope)
+                run_warp(["connect"], warp_bin=warp_bin, timeout=15.0)
+
     return ""

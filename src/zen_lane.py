@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import time
 
 from ouc_common import (
+    LANE_DIR,
+    ensure_warp_mode,
+    ensure_warp_protocol,
     find_opencode_cli,
     find_opencode_desktop,
     find_warp_cli,
     get_warp_local_v6,
+    repair_warp_registration,
     run_warp,
+    warp_registration_healthy,
 )
 from zen_proxy import start_proxy_server
 
@@ -45,38 +51,57 @@ def _should_add_standalone(args: list[str]) -> bool:
 
 
 def _ensure_tunnel_up() -> bool:
-    """Ensure upstream network lane (WARP, Tor, or Custom Proxy) is accessible."""
+    """Ensure the selected upstream lane is reachable, repairing WARP once."""
+    mode = "warp"
+    scope = "tun" if sys.platform == "win32" else "isolated"
     try:
         from proxy_chain import get_egress_config
+
         cfg = get_egress_config()
         mode = cfg.get("mode", "warp")
-        if mode in ("tor", "custom"):
-            return True
-        default_scope = "tun" if sys.platform == "win32" else "isolated"
-        scope = cfg.get("warp_scope", default_scope)
-        if scope == "isolated":
-            import socket
-            try:
-                with socket.create_connection(("127.0.0.1", 40000), timeout=0.5):
-                    return True
-            except OSError:
-                pass
+        scope = cfg.get("warp_scope", scope)
     except Exception:
         pass
 
-    v6 = get_warp_local_v6()
-    if v6:
+    if mode in ("tor", "custom"):
+        return True
+
+    def _ready() -> bool:
+        if scope == "isolated":
+            try:
+                with socket.create_connection(("127.0.0.1", 40000), timeout=0.6):
+                    return True
+            except OSError:
+                pass
+        return bool(get_warp_local_v6())
+
+    if _ready():
         return True
 
     warp = find_warp_cli()
     if not warp:
-        return True  # zen-proxy provides seamless dual-stack fallback
+        return True  # zen-proxy provides dual-stack fallback
 
-    from ouc_common import LANE_DIR
-    is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (LANE_DIR / "strict_proxy.flag").is_file()
+    is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (
+        LANE_DIR / "strict_proxy.flag"
+    ).is_file()
     if not is_strict:
-        return True  # zen-proxy auto-routes with resilient direct fallback
+        return True  # zen-proxy keeps requests working via fallback
 
+    # Strict mode would return a 503 if the tunnel is down, so attempt the
+    # same non-destructive repair the keeper uses before giving up.
+    if not warp_registration_healthy(warp):
+        repair_warp_registration(warp, 2)
+    try:
+        ensure_warp_protocol("wireguard", warp_bin=warp)
+    except Exception:
+        pass
+    ensure_warp_mode(warp, scope)
+    run_warp(["connect"], warp_bin=warp)
+    for _ in range(10):
+        time.sleep(1.0)
+        if _ready():
+            return True
     return False
 
 

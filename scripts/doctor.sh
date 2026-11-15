@@ -1,6 +1,6 @@
 #!/bin/bash
-# doctor — tells you what's alive and what needs attention. no fixes, just
-# the truth. run it whenever something feels off.
+# doctor — prints which components are running and which need attention.
+# It does not change anything; use it when diagnosing a problem.
 set -u
 
 BRAND="opencode-unlimited"
@@ -81,7 +81,7 @@ elif [ -n "$V6" ]; then
   FIRST=$(echo "$V6" | cut -d: -f1-4)
   case "$V6" in
     2606:*|2a09:*|104.28.*|8.29.*) ok "egress is cloudflare (warp): $V6" ;;
-    *) bad "egress is NOT warp ($V6) — tunnel is lying, restart keeper" ;;
+    *) bad "egress is not Cloudflare WARP ($V6) — restart the keeper service" ;;
   esac
 else
   bad "no egress through warp — tunnel down, restart keeper"

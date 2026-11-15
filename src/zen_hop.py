@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 
 from ouc_common import (
+    GUARD_STATE_FILE,
     find_warp_cli,
     get_egress_v6,
     get_warp_local_v6,
@@ -24,11 +26,24 @@ def main() -> int:
     print(f"old /64: {old_v6 or '?'}")
     print("-- rotating (keeper paused) --")
 
-    with keeper_pause_ctx("zen-hop", seconds=180):
-        new_v6 = hop_once(warp_bin, max_reg_tries=5)
+    avoid: set[str] = set()
+    if GUARD_STATE_FILE.is_file():
+        try:
+            state = json.loads(GUARD_STATE_FILE.read_text(encoding="utf-8"))
+            avoid = {str(x) for x in state.get("blacklist", []) if x}
+        except Exception:
+            pass
+
+    with keeper_pause_ctx("zen-hop", seconds=300):
+        new_v6 = hop_once(
+            warp_bin,
+            max_reg_tries=4,
+            avoid_prefixes=avoid,
+            previous=old_v6,
+        )
 
     if not new_v6:
-        print("-- registration/tunnel failed — keeper will keep retrying --")
+        print("-- rotation failed; the keeper will keep the tunnel alive and retry --")
         return 1
 
     try:
@@ -41,13 +56,13 @@ def main() -> int:
     old_prefix = normalize_v6_64(old_v6)
     new_prefix = normalize_v6_64(new_v6)
     if new_prefix and new_prefix != old_prefix:
-        print("== FRESH /64 ✓ — re-send your message ==")
+        print("new /64 prefix accepted; re-send your message.")
         return 0
     if new_v6 != old_v6:
-        print("== FRESH /64 ✓ — re-send your message ==")
+        print("new address accepted; re-send your message.")
         return 0
 
-    print("== cloudflare handed back the same block — run me again ==")
+    print("Cloudflare returned the same /64 block; run the command again.")
     return 1
 
 

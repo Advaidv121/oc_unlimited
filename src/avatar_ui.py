@@ -31,7 +31,6 @@ import webview
 
 from ouc_common import (
     BIN_DIR,
-    BRAND,
     CREATE_NO_WINDOW,
     DEST_DIR,
     GUARD_LOG_FILE,
@@ -44,11 +43,12 @@ from ouc_common import (
     TASK_GUARD,
     TASK_KEEPER,
     ensure_dirs,
+    ensure_warp_mode,
     fetch_opencode_aaaa_pool,
     find_opencode_cli,
     find_opencode_desktop,
     find_warp_cli,
-    get_egress_v6,
+    get_egress_ip,
     get_warp_local_v6,
     hop_once,
     is_admin,
@@ -56,8 +56,11 @@ from ouc_common import (
     is_keeper_paused,
     keeper_pause_ctx,
     normalize_v6_64,
+    opencode_command,
+    repair_warp_registration,
     run_hidden,
     run_warp,
+    warp_registration_healthy,
     warp_status,
 )
 from ouc_firewall import install_killswitch, is_killswitch_installed, remove_killswitch
@@ -116,60 +119,14 @@ def _is_mutex_held(name: str) -> bool:
     return False
 
 
-def free_service_port(port: int = 42914) -> int:
-    """Kill any process holding the OpenCode managed service port to prevent IPC EADDRINUSE errors."""
-    killed = 0
-    try:
-        import psutil
-        for conn in psutil.net_connections(kind="tcp"):
-            if conn.laddr and conn.laddr.port == port and conn.pid:
-                try:
-                    p = psutil.Process(conn.pid)
-                    p.kill()
-                    killed += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    if sys.platform == "win32":
-        try:
-            out = subprocess.check_output(f'netstat -ano | findstr ":{port} "', shell=True, text=True, errors="ignore")
-            for line in out.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 5 and "LISTENING" in parts:
-                    pid = parts[-1]
-                    if pid.isdigit() and int(pid) != os.getpid():
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=CREATE_NO_WINDOW)
-                        killed += 1
-        except Exception:
-            pass
-    return killed
-
-
 def clear_opencode_free_limit() -> int:
     """Delete client-side free-limit and go-upsell lockout rows from drafts.sqlite."""
-    candidates = [
-        Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "ai.opencode.desktop" / "drafts.sqlite",
-        Path.home() / ".config" / "ai.opencode.desktop" / "drafts.sqlite",
-    ]
-    deleted = 0
-    import sqlite3
-    for db_path in candidates:
-        if not db_path.is_file():
-            continue
-        try:
-            conn = sqlite3.connect(str(db_path), timeout=3.0)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM state WHERE key IN ('free-limit', 'go-upsell')")
-            deleted += cur.rowcount
-            cur.execute("DELETE FROM state WHERE key LIKE '%free%limit%'")
-            deleted += cur.rowcount
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-    return deleted
+    try:
+        from auto_resume import clear_opencode_free_limit as clear
+
+        return clear()
+    except Exception:
+        return 0
 
 
 def _task_exists(task_name: str) -> bool:
@@ -329,21 +286,9 @@ class AvatarControlApi:
         self._last_local_v6 = ""
         self._edge_pool: list[str] = []
         self._action_lock = threading.Lock()
-        self._ensure_proxy_active()
         self._refresh_egress_async(force=True)
         self._refresh_pool_async()
         self._auto_heal_warp_startup()
-
-    def _ensure_proxy_active(self) -> None:
-        """Guarantee that local HTTP/CONNECT proxy on SERVICE_PROXY_PORT (41987) is always running."""
-        if not _port_open(SERVICE_PROXY_PORT):
-            def _serve() -> None:
-                try:
-                    from zen_proxy import start_proxy_server
-                    start_proxy_server(SERVICE_PROXY_PORT)
-                except Exception:
-                    pass
-            threading.Thread(target=_serve, daemon=True).start()
 
     def _auto_heal_warp_startup(self) -> None:
         def _check_and_heal() -> None:
@@ -354,8 +299,8 @@ class AvatarControlApi:
             try:
                 conn, mode, raw = warp_status(wb)
                 raw_lower = raw.lower()
-                # Only auto-heal if there is an explicit handshake MITM or cryptographic failure.
-                # Never wipe registration on simple startup disconnected state!
+                # Only auto-heal on an explicit handshake MITM or cryptographic failure.
+                # A disconnected startup state alone does not justify deleting the registration.
                 if ("mitm" in raw_lower) or ("cf_happy_eyeballs" in raw_lower):
                     self.repair_warp_connection()
             except Exception:
@@ -381,9 +326,9 @@ class AvatarControlApi:
 
         def _run() -> None:
             try:
-                v6 = get_egress_v6(timeout=6.0)
+                ip = get_egress_ip(timeout=6.0)
                 with self._egress_lock:
-                    self._egress_v6 = v6
+                    self._egress_v6 = ip
                     self._last_egress_ts = time.time()
             finally:
                 with self._egress_lock:
@@ -396,32 +341,31 @@ class AvatarControlApi:
         connected, mode, status_text = warp_status(warp_bin) if warp_bin else (False, "", "Not Installed")
         local_v6 = get_warp_local_v6() or ""
 
-        default_scope = "tun" if sys.platform == "win32" else "isolated"
-        scope = default_scope
+        egress_mode = "warp"
         try:
             from proxy_chain import get_egress_config
-            scope = get_egress_config().get("warp_scope", default_scope)
+            cfg = get_egress_config()
+            egress_mode = cfg.get("mode", "warp")
         except Exception:
             pass
 
-        if scope == "isolated":
-            if connected and not self._egress_v6:
-                self._refresh_egress_async(force=True)
-            elif not connected:
+        if egress_mode in ("warp", "clean"):
+            if not connected:
                 with self._egress_lock:
                     self._egress_v6 = ""
-            elif force_egress:
-                self._refresh_egress_async(force=True)
-        else:
-            if local_v6 != self._last_local_v6:
+            elif local_v6 != self._last_local_v6:
                 self._last_local_v6 = local_v6
                 if local_v6:
                     self._refresh_egress_async(force=True)
                 else:
                     with self._egress_lock:
                         self._egress_v6 = ""
-            elif force_egress:
-                self._refresh_egress_async(force=True)
+            else:
+                self._refresh_egress_async(force=force_egress)
+        else:
+            # Tor and custom routes have their own exit addresses; keep the
+            # display fresh after guard-side circuit/node rotation as well.
+            self._refresh_egress_async(force=force_egress)
 
         with self._egress_lock:
             egress_v6 = self._egress_v6
@@ -467,11 +411,13 @@ class AvatarControlApi:
                 "bin": warp_bin or "",
                 "connected": connected,
                 "mode": mode or "unknown",
+                "egress_mode": egress_mode,
                 "status_text": status_text or ("Connected" if connected else "Disconnected"),
                 "adapter_v6": local_v6,
                 "egress_v6": egress_v6,
+                "egress_ip": egress_v6,
                 "egress_prefix": normalize_v6_64(egress_v6) if egress_v6 else "",
-                "is_cf": is_cloudflare_v6(egress_v6) if egress_v6 else False,
+                "is_cf": is_cloudflare_v6(egress_v6) if ":" in egress_v6 else False,
                 "checking_egress": checking_egress,
                 "rotating": is_keeper_paused(),
             },
@@ -535,38 +481,100 @@ class AvatarControlApi:
                 "clean_endpoints": list(KNOWN_CLEAN_ENDPOINTS),
             }
         except Exception as exc:
-            return {"mode": "warp", "warp_scope": "isolated", "error": str(exc), "clean_endpoints": []}
+            fallback_scope = "tun" if sys.platform == "win32" else "isolated"
+            return {"mode": "warp", "warp_scope": fallback_scope, "error": str(exc), "clean_endpoints": []}
 
     def set_warp_scope(self, scope: str) -> dict:
         from proxy_chain import get_egress_config, set_egress_config
         cfg = get_egress_config()
         clean_scope = "tun" if scope.lower().strip() == "tun" else "isolated"
-        new_cfg = set_egress_config(
+        changed = str(cfg.get("warp_scope", "")) != clean_scope
+        set_egress_config(
             mode=cfg.get("mode", "warp"),
             custom_proxy=cfg.get("custom_proxy", "127.0.0.1:10808"),
             custom_type=cfg.get("custom_type", "socks5"),
             warp_scope=clean_scope,
         )
         warp = find_warp_cli()
-        if warp:
-            if clean_scope == "isolated":
-                run_warp(["proxy", "port", "40000"], warp_bin=warp)
-                run_warp(["mode", "proxy"], warp_bin=warp)
-            else:
-                run_warp(["mode", "warp"], warp_bin=warp)
+        if warp and changed:
+            if not warp_registration_healthy(warp):
+                repair_warp_registration(warp, 3)
+            try:
+                from ouc_common import ensure_warp_protocol
+                ensure_warp_protocol("wireguard", warp_bin=warp)
+            except Exception:
+                pass
+            ensure_warp_mode(warp, clean_scope)
             run_warp(["connect"], warp_bin=warp)
-        self._refresh_egress_async(force=True)
+            connected = False
+            for _ in range(8):
+                time.sleep(0.8)
+                connected, _, raw = warp_status(warp, force=True)
+                if connected:
+                    break
+            self._refresh_egress_async(force=True)
+            if not connected:
+                detail = (raw or "").strip()
+                return {
+                    "ok": False,
+                    "scope": clean_scope,
+                    "message": (
+                        f"Scope saved as {clean_scope}, but WARP did not reconnect"
+                        + (f": {detail}" if detail else ".")
+                    ),
+                }
         label = "App-Only (Isolated Proxy)" if clean_scope == "isolated" else "Full System TUN"
         return {"ok": True, "scope": clean_scope, "message": f"WARP scope set to: {label}"}
 
     def set_egress_mode(self, mode: str, custom_proxy: str = "127.0.0.1:10808", custom_type: str = "socks5") -> dict:
-        from proxy_chain import set_egress_config
-        cfg = set_egress_config(mode, custom_proxy, custom_type)
-        if mode == "tor":
+        from proxy_chain import get_egress_config, set_egress_config
+        chosen = str(mode).lower().strip()
+        if chosen not in ("warp", "tor", "custom", "clean"):
+            return {"ok": False, "message": f"Unknown egress mode: {mode}"}
+        current = get_egress_config()
+        cfg = set_egress_config(
+            chosen,
+            custom_proxy,
+            custom_type,
+            warp_scope=current.get("warp_scope"),
+        )
+        if chosen == "tor":
             from tor_manager import get_active_tor_target, start_portable_tor
             if not get_active_tor_target():
                 threading.Thread(target=start_portable_tor, daemon=True).start()
-        return {"ok": True, "config": cfg, "message": f"Active egress switched to: {mode.upper()}"}
+        elif chosen in ("warp", "clean"):
+            warp = find_warp_cli()
+            if warp:
+                default_scope = "tun" if sys.platform == "win32" else "isolated"
+                scope = current.get("warp_scope", default_scope)
+                if not warp_registration_healthy(warp):
+                    repair_warp_registration(warp, 3)
+                try:
+                    from ouc_common import ensure_warp_protocol
+                    ensure_warp_protocol("wireguard", warp_bin=warp)
+                except Exception:
+                    pass
+                ensure_warp_mode(warp, scope)
+                run_warp(["connect"], warp_bin=warp)
+                connected = False
+                raw = ""
+                for _ in range(8):
+                    time.sleep(0.8)
+                    connected, _, raw = warp_status(warp, force=True)
+                    if connected:
+                        break
+                if not connected:
+                    detail = (raw or "").strip()
+                    return {
+                        "ok": False,
+                        "config": cfg,
+                        "message": (
+                            f"Egress saved as {chosen.upper()}, but WARP did not connect"
+                            + (f": {detail}" if detail else ".")
+                        ),
+                    }
+        self._refresh_egress_async(force=True)
+        return {"ok": True, "config": cfg, "message": f"Active egress switched to: {chosen.upper()}"}
 
     def rotate_tor_circuit(self) -> dict:
         from tor_manager import rotate_tor_circuit
@@ -621,43 +629,47 @@ class AvatarControlApi:
         except Exception:
             pass
 
-        run_warp(["registration", "new"], warp_bin=warp)
-        if scope == "isolated":
-            run_warp(["mode", "proxy"], warp_bin=warp)
-            run_warp(["proxy", "port", "40000"], warp_bin=warp)
-        else:
-            run_warp(["mode", "warp"], warp_bin=warp)
+        if not warp_registration_healthy(warp):
+            if not repair_warp_registration(warp, 3):
+                return {
+                    "ok": False,
+                    "message": "WARP registration could not be created. Check the WARP client and retry.",
+                }
 
-        rc, msg = run_warp(["connect"], warp_bin=warp)
+        ensure_warp_mode(warp, scope)
+        run_warp(["connect"], warp_bin=warp)
+        raw = ""
+        for _ in range(10):
+            time.sleep(1.0)
+            conn, _, raw = warp_status(warp, force=True)
+            if conn:
+                self._refresh_egress_async(force=True)
+                return {
+                    "ok": True,
+                    "message": f"WARP connected ({'App-Only proxy' if scope == 'isolated' else 'Full TUN'}).",
+                }
+
+        # Renew the session keys once; the endpoint and registration stay intact.
+        run_warp(["tunnel", "rotate-keys"], warp_bin=warp)
+        run_warp(["connect"], warp_bin=warp)
         for _ in range(8):
             time.sleep(1.0)
-            conn, _, raw = warp_status(warp)
+            conn, _, raw = warp_status(warp, force=True)
             if conn:
                 self._refresh_egress_async(force=True)
-                return {"ok": True, "message": f"WARP connected ({'App-Only proxy' if scope == 'isolated' else 'Full TUN'})."}
-            if "unable" in raw.lower() or "mitm" in raw.lower():
-                break
+                return {
+                    "ok": True,
+                    "message": f"WARP session renewed and connected ({'App-Only proxy' if scope == 'isolated' else 'Full TUN'}).",
+                }
 
-        # Auto-repair CF_HAPPY_EYEBALLS_MITM_FAILURE or broken endpoint
-        run_warp(["disconnect"], warp_bin=warp)
-        run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp)
-        run_warp(["tunnel", "protocol", "set", "WireGuard"], warp_bin=warp)
-        run_warp(["tunnel", "rotate-keys"], warp_bin=warp)
-        if scope == "isolated":
-            run_warp(["mode", "proxy"], warp_bin=warp)
-            run_warp(["proxy", "port", "40000"], warp_bin=warp)
-        else:
-            run_warp(["mode", "warp"], warp_bin=warp)
-        run_warp(["connect"], warp_bin=warp)
-
-        for _ in range(6):
-            time.sleep(1.0)
-            conn, _, _ = warp_status(warp)
-            if conn:
-                self._refresh_egress_async(force=True)
-                return {"ok": True, "message": f"WARP auto-repaired and connected ({'App-Only proxy' if scope == 'isolated' else 'Full TUN'})."}
-
-        return {"ok": False, "message": "WARP connect in progress; please refresh in a moment."}
+        detail = (raw or "").strip()
+        return {
+            "ok": False,
+            "message": (
+                "WARP could not connect. Restart the Cloudflare WARP client "
+                + (f"({detail})" if detail else "and retry.")
+            ),
+        }
 
     def warp_disconnect(self) -> dict:
         warp = find_warp_cli()
@@ -672,12 +684,40 @@ class AvatarControlApi:
         if not self._action_lock.acquire(blocking=False):
             return {"ok": False, "message": "Another rotation or setup action is already running."}
         try:
+            try:
+                from proxy_chain import get_egress_config
+                mode = get_egress_config().get("mode", "warp")
+            except Exception:
+                mode = "warp"
+            if mode == "tor":
+                from tor_manager import rotate_tor_circuit
+                ok, msg = rotate_tor_circuit()
+                self._refresh_egress_async(force=True)
+                return {"ok": ok, "message": msg}
+            if mode == "custom":
+                from proxy_chain import rotate_custom_proxy
+                ok, msg = rotate_custom_proxy()
+                self._refresh_egress_async(force=True)
+                return {"ok": ok, "message": msg}
+
             warp = find_warp_cli()
             if not warp:
                 return {"ok": False, "message": "warp-cli.exe not found."}
             old_v6 = self._egress_v6 or (get_warp_local_v6() or "")
-            with keeper_pause_ctx("avatar-ui-hop", seconds=180):
-                new_v6 = hop_once(warp, max_reg_tries=5)
+            avoid: set[str] = set()
+            if GUARD_STATE_FILE.is_file():
+                try:
+                    st = json.loads(GUARD_STATE_FILE.read_text(encoding="utf-8"))
+                    avoid = {str(x) for x in st.get("blacklist", []) if x}
+                except Exception:
+                    pass
+            with keeper_pause_ctx("avatar-ui-hop", seconds=300):
+                new_v6 = hop_once(
+                    warp,
+                    max_reg_tries=5,
+                    avoid_prefixes=avoid,
+                    previous=old_v6,
+                )
             if not new_v6:
                 return {"ok": False, "message": "Rotation failed — keeper will retry automatically."}
             with self._egress_lock:
@@ -716,6 +756,12 @@ class AvatarControlApi:
         worker_flag = name
 
         if not enable:
+            # Disable the logon task first so its restart-on-failure policy
+            # cannot bring the worker back after the kill below.
+            if _task_exists(task_name):
+                run_hidden(
+                    ["schtasks", "/Change", "/TN", task_name, "/DISABLE"], timeout=8.0
+                )
             killed = 0
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
@@ -735,6 +781,9 @@ class AvatarControlApi:
 
         _deploy_scripts_and_shims()
         if _task_exists(task_name):
+            run_hidden(
+                ["schtasks", "/Change", "/TN", task_name, "/ENABLE"], timeout=8.0
+            )
             res = run_hidden(["schtasks", "/Run", "/TN", task_name], timeout=8.0)
             if res.returncode == 0:
                 time.sleep(1.0)
@@ -768,16 +817,16 @@ class AvatarControlApi:
         # 1. If enabling, ensure keeper is running to host port 41987
         if enable:
             if not _port_open(SERVICE_PROXY_PORT):
-                self._ensure_proxy_active()
                 self.toggle_worker("keeper", True)
-                for _ in range(12):
+                for _ in range(20):
                     if _port_open(SERVICE_PROXY_PORT):
                         break
                     time.sleep(0.3)
             if not _port_open(SERVICE_PROXY_PORT):
                 return {"ok": False, "message": f"Proxy port {SERVICE_PROXY_PORT} is not listening. Check WARP Keeper."}
 
-        # 2. Update service.json directly in Python (100% reliable, zero CLI dependencies)
+        # 2. Update service.json directly so unrelated keys such as the
+        #    service password are preserved.
         try:
             cfg = {}
             if cfg_file.is_file():
@@ -804,34 +853,42 @@ class AvatarControlApi:
         except Exception as exc:
             return {"ok": False, "message": f"Failed updating service.json: {exc}"}
 
-        # 3. If opencode CLI is present, run official commands as well
+        # 3. Ask the OpenCode CLI to apply the same settings and restart.
         oc = find_opencode_cli()
         if oc:
             try:
                 if enable:
-                    run_hidden([oc, "service", "set", "env", "HTTPS_PROXY", proxy_url], timeout=4.0)
-                    run_hidden([oc, "service", "set", "env", "HTTP_PROXY", proxy_url], timeout=4.0)
-                    run_hidden([oc, "service", "set", "env", "NO_PROXY", "127.0.0.1,localhost,::1"], timeout=4.0)
+                    for key in ("HTTPS_PROXY", "HTTP_PROXY"):
+                        run_hidden(
+                            opencode_command(
+                                oc, ["service", "set", "env", key, proxy_url]
+                            ),
+                            timeout=4.0,
+                        )
+                    run_hidden(
+                        opencode_command(
+                            oc,
+                            [
+                                "service",
+                                "set",
+                                "env",
+                                "NO_PROXY",
+                                "127.0.0.1,localhost,::1",
+                            ],
+                        ),
+                        timeout=4.0,
+                    )
                 else:
-                    for k in _SERVICE_ENV_KEYS:
-                        run_hidden([oc, "service", "unset", "env", k], timeout=4.0)
-                run_hidden([oc, "service", "restart"], timeout=5.0)
+                    for key in _SERVICE_ENV_KEYS:
+                        run_hidden(
+                            opencode_command(oc, ["service", "unset", "env", key]),
+                            timeout=4.0,
+                        )
+                run_hidden(
+                    opencode_command(oc, ["service", "restart"]), timeout=15.0
+                )
             except Exception:
                 pass
-
-        # 4. Kill active opencode-cli background daemons so OpenCode restarts them with fresh settings
-        try:
-            import psutil
-            for p in psutil.process_iter(["name", "exe"]):
-                try:
-                    pname = (p.info["name"] or "").lower()
-                    pexe = p.info["exe"] or ""
-                    if "opencode-cli" in pname and BRAND not in pexe.lower():
-                        p.kill()
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
         return {
             "ok": True,
@@ -917,7 +974,7 @@ class AvatarControlApi:
             return {
                 "ok": True,
                 "message": (
-                    "Auto-resume enabled — OpenCode Unlimited will automatically send 'continue' when limits are bypassed."
+                    "Auto-resume enabled. A 'continue' prompt is sent after a rotation."
                     if enable
                     else "Auto-resume disabled."
                 ),
@@ -930,9 +987,9 @@ class AvatarControlApi:
         flag = LANE_DIR / "strict_proxy.flag"
         if enable:
             flag.write_text("1\n", encoding="utf-8")
-            return {"ok": True, "message": "Strict fail-closed mode enabled (all requests require active WARP tunnel)."}
+            return {"ok": True, "message": "Strict fail-closed mode enabled: requests fail when the configured egress is unavailable."}
         flag.unlink(missing_ok=True)
-        return {"ok": True, "message": "Resilient fallback mode enabled (automatic bypass prevents 503 errors if WARP drops)."}
+        return {"ok": True, "message": "Resilient fallback enabled: when WARP drops, requests fall back to a direct connection instead of returning 503."}
 
     def auto_heal_endpoint(self) -> dict:
         try:
@@ -945,7 +1002,7 @@ class AvatarControlApi:
             return {"ok": False, "message": f"Auto-heal failed: {exc}"}
 
     def repair_warp_connection(self) -> dict:
-        """Purges stale cryptographic keys, resets endpoint overrides, and auto-repairs MITM errors."""
+        """Renew the WARP session without deleting a healthy registration."""
         wb = find_warp_cli()
         if not wb:
             return {"ok": False, "message": "warp-cli.exe not found."}
@@ -958,55 +1015,56 @@ class AvatarControlApi:
             except Exception:
                 pass
 
-            # Phase 1: Rapid key rotation and endpoint reset (preserves active client registration)
-            run_warp(["tunnel", "endpoint", "reset"], warp_bin=wb)
             try:
                 from ouc_common import ensure_warp_protocol
                 ensure_warp_protocol("wireguard", warp_bin=wb)
             except Exception:
                 pass
+
+            if not warp_registration_healthy(wb):
+                if not repair_warp_registration(wb, 3):
+                    return {
+                        "ok": False,
+                        "message": "WARP registration could not be created. Check the WARP client and retry.",
+                    }
+
             run_warp(["tunnel", "rotate-keys"], warp_bin=wb)
-            if scope == "isolated":
-                run_warp(["mode", "proxy"], warp_bin=wb)
-                run_warp(["proxy", "port", "40000"], warp_bin=wb)
-            else:
-                run_warp(["mode", "warp"], warp_bin=wb)
+            ensure_warp_mode(wb, scope)
             run_warp(["connect"], warp_bin=wb)
 
-            for _ in range(5):
+            raw = ""
+            for _ in range(8):
                 time.sleep(1.0)
-                conn, _, raw = warp_status(wb)
-                raw_low = raw.lower()
-                # "unstable" simply means ping latency is elevated; traffic still flows normally!
-                if conn and "mitm" not in raw_low and "unable" not in raw_low:
+                conn, _, raw = warp_status(wb, force=True)
+                if conn:
                     self._refresh_egress_async(force=True)
-                    return {"ok": True, "message": f"WARP encryption keys rotated successfully. Connected ({'App-Only proxy' if scope == 'isolated' else 'TUN'})!"}
+                    return {
+                        "ok": True,
+                        "message": f"WARP session renewed and connected ({'App-Only proxy' if scope == 'isolated' else 'Full TUN'}).",
+                    }
 
-            # Phase 2: Re-register only if registration is actually corrupted, missing, or blocked by MITM
-            if "registration missing" in raw_low or "not registered" in raw_low or "mitm" in raw_low:
-                run_warp(["disconnect"], warp_bin=wb)
-                run_warp(["registration", "delete"], warp_bin=wb)
-                run_warp(["registration", "new"], warp_bin=wb)
-                try:
-                    from ouc_common import ensure_warp_protocol
-                    ensure_warp_protocol("wireguard", warp_bin=wb)
-                except Exception:
-                    pass
-                if scope == "isolated":
-                    run_warp(["mode", "proxy"], warp_bin=wb)
-                    run_warp(["proxy", "port", "40000"], warp_bin=wb)
-                else:
-                    run_warp(["mode", "warp"], warp_bin=wb)
-                run_warp(["connect"], warp_bin=wb)
+            raw_low = (raw or "").lower()
+            if "registration missing" in raw_low or "not registered" in raw_low:
+                if repair_warp_registration(wb, 3):
+                    run_warp(["connect"], warp_bin=wb)
+                    for _ in range(6):
+                        time.sleep(1.0)
+                        conn, _, _ = warp_status(wb, force=True)
+                        if conn:
+                            self._refresh_egress_async(force=True)
+                            return {
+                                "ok": True,
+                                "message": "WARP registration recreated and connected.",
+                            }
 
-                for _ in range(6):
-                    time.sleep(1.0)
-                    conn, _, _ = warp_status(wb)
-                    if conn:
-                        self._refresh_egress_async(force=True)
-                        return {"ok": True, "message": f"WARP keys & endpoints reset successfully. Connected ({'App-Only proxy' if scope == 'isolated' else 'TUN'})!"}
-
-            return {"ok": True, "message": "WARP reset executed. Reconnecting in background..."}
+            detail = (raw or "").strip()
+            return {
+                "ok": False,
+                "message": (
+                    "WARP still cannot connect. Restart the Cloudflare WARP client"
+                    + (f" ({detail})." if detail else " and retry.")
+                ),
+            }
         except Exception as exc:
             return {"ok": False, "message": f"Repair failed: {exc}"}
 
@@ -1041,17 +1099,11 @@ class AvatarControlApi:
         # Clear transient client caches only (never touch opencode.db or user chat sessions!)
         base_dir = Path.home() / ".local" / "share" / "opencode"
         if base_dir.is_dir():
-            for item_name in ("storage", "olliecode-fingerprint.json"):
+            for item_name in ("olliecode-fingerprint.json",):
                 target = base_dir / item_name
                 if target.is_file():
                     try:
                         target.unlink(missing_ok=True)
-                        cleared.append(item_name)
-                    except Exception:
-                        pass
-                elif target.is_dir():
-                    try:
-                        shutil.rmtree(target, ignore_errors=True)
                         cleared.append(item_name)
                     except Exception:
                         pass
@@ -1074,13 +1126,9 @@ class AvatarControlApi:
         if fl_cleared > 0:
             cleared.append(f"{fl_cleared} limit entries")
 
-        # Unblock port 42914
-        free_service_port(42914)
-
         # Clear guard blacklist and reset edge override
         self.clear_blacklist()
         self.set_edge_override("auto")
-        self.repair_warp_connection()
 
         rot_msg = ""
         try:
@@ -1096,8 +1144,13 @@ class AvatarControlApi:
                 from ouc_common import find_warp_cli, hop_once
                 wbin = find_warp_cli()
                 if wbin:
-                    new_ip = hop_once(wbin)
-                    rot_msg = f"Rotated WARP IP: {new_ip}" if new_ip else "WARP reconnected"
+                    with keeper_pause_ctx("avatar-ui-deep-reset", seconds=300):
+                        new_ip = hop_once(wbin, previous=self._egress_v6)
+                    rot_msg = (
+                        f"Rotated WARP IP: {new_ip}"
+                        if new_ip
+                        else "WARP reconnect failed"
+                    )
         except Exception as exc:
             rot_msg = f"Rotation note: {exc}"
 
@@ -1124,9 +1177,6 @@ class AvatarControlApi:
 
         # Clear any client-side rate limit lockouts
         clear_opencode_free_limit()
-
-        # Free port 42914 to ensure OpenCode managed service starts without IPC collision
-        free_service_port(42914)
 
         if not _port_open(SERVICE_PROXY_PORT):
             self.toggle_worker("keeper", True)
@@ -1165,47 +1215,68 @@ class AvatarControlApi:
         return {"ok": True, "message": "Launched OpenCode Desktop through WARP IPv6 lane."}
 
     def fix_opencode_service(self) -> dict:
-        """Terminate orphaned daemons, unblock busy service ports, and restart clean."""
-        killed = 0
+        """Restart the OpenCode background service without killing the Desktop app."""
+        cli = find_opencode_cli()
+        if not cli:
+            return {
+                "ok": False,
+                "message": "OpenCode CLI not found. Install OpenCode or run install.bat first.",
+            }
+
+        fl_cleared = clear_opencode_free_limit()
+
         try:
-            import psutil
-            for p in psutil.process_iter(["pid", "name", "exe"]):
-                if p.pid == os.getpid():
-                    continue
-                name = (p.info.get("name") or "").lower()
-                exe = (p.info.get("exe") or "").lower()
-                if BRAND in exe or BRAND in name:
-                    continue
-                if "opencode-cli" in name or name == "opencode.exe":
-                    try:
-                        p.kill()
-                        killed += 1
-                    except Exception:
-                        pass
+            run_hidden(opencode_command(cli, ["service", "stop"]), timeout=10.0)
+            time.sleep(0.5)
         except Exception:
             pass
 
-        # Aggressively unblock managed service port 42914
-        killed += free_service_port(42914)
+        status = run_hidden(opencode_command(cli, ["service", "status"]), timeout=8.0)
+        status_text = (status.stdout or "") + (status.stderr or "")
+        healthy = status.returncode == 0 and "127.0.0.1:" in status_text
 
-        # Clear client-side rate limit lockouts
-        fl_cleared = clear_opencode_free_limit()
+        if not healthy:
+            result = run_hidden(
+                opencode_command(cli, ["service", "restart"]), timeout=20.0
+            )
+            if result.returncode != 0:
+                result = run_hidden(
+                    opencode_command(cli, ["service", "start"]), timeout=15.0
+                )
+            time.sleep(1.0)
+        else:
+            run_hidden(opencode_command(cli, ["service", "restart"]), timeout=20.0)
+            time.sleep(1.0)
 
-        # Stop service via CLI if installed
-        cli = find_opencode_cli()
-        if cli:
-            try:
-                subprocess.run([cli, "service", "stop"], capture_output=True, timeout=5.0)
-            except Exception:
-                pass
+        status = run_hidden(opencode_command(cli, ["service", "status"]), timeout=8.0)
+        status_text = ((status.stdout or "") + (status.stderr or "")).strip()
+        healthy = status.returncode == 0 and "127.0.0.1:" in status_text
 
-        # Reset service.json proxy env: wire to proxy only if port 41987 is alive, otherwise restore direct
+        if not _port_open(SERVICE_PROXY_PORT):
+            self.toggle_worker("keeper", True)
+            for _ in range(20):
+                if _port_open(SERVICE_PROXY_PORT):
+                    break
+                time.sleep(0.3)
+
         if _port_open(SERVICE_PROXY_PORT):
             self.toggle_desktop_service_proxy(True)
         else:
             self.toggle_desktop_service_proxy(False)
-        extra = f" + cleared {fl_cleared} limit rows" if fl_cleared > 0 else ""
-        return {"ok": True, "message": f"Service ports unblocked (terminated {killed} stale processes{extra}). Ready to launch!"}
+
+        extra = f" Cleared {fl_cleared} limit rows." if fl_cleared > 0 else ""
+        if healthy:
+            return {
+                "ok": True,
+                "message": f"OpenCode service restarted at {status_text}.{extra}",
+            }
+        return {
+            "ok": False,
+            "message": (
+                "OpenCode service did not report a listening address. "
+                f"Close OpenCode, then retry.{extra}"
+            ),
+        }
 
     def launch_cli(self) -> dict:
         _deploy_scripts_and_shims()
@@ -1240,7 +1311,7 @@ class AvatarControlApi:
             self.warp_connect()
             self.toggle_desktop_service_proxy(True)
             self._refresh_egress_async(force=True)
-            return {"ok": True, "message": "Installed/repaired shims, PATH, tasks, WARP TUN, and Desktop service."}
+            return {"ok": True, "message": "Installed/repaired shims, PATH, tasks, WARP in the selected scope, and Desktop service."}
         finally:
             self._action_lock.release()
 
@@ -1415,51 +1486,10 @@ def _log_startup_error(exc: Exception) -> None:
     )
 
 
-def _kill_previous_instances() -> int:
-    """Terminate any lingering previous versions of Opencode Unlimited or orphaned background workers."""
-    current_pid = os.getpid()
-    count = 0
-    try:
-        import psutil
-        for p in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                pid = p.info["pid"]
-                if pid == current_pid:
-                    continue
-                name = (p.info["name"] or "").lower()
-                cmd = " ".join(p.info.get("cmdline") or []).lower()
-                # Terminate any duplicate/old OpencodeUnlimited executable
-                if "opencodeunlimited" in name:
-                    p.kill()
-                    count += 1
-                # Terminate any orphaned python process running old keeper/guard/ui scripts
-                elif "python" in name and any(x in cmd for x in ("warp_keeper.py", "zen_guard.py", "avatar_ui.py")):
-                    p.kill()
-                    count += 1
-            except Exception:
-                pass
-        if count > 0:
-            time.sleep(0.4)
-    except Exception:
-        pass
-    return count
-
-
 def main() -> int:
     cli_rc = _run_cli_mode(sys.argv[1:])
     if cli_rc is not None:
         return cli_rc
-
-    # Auto-kill previous versions or orphaned background tasks so only one clean instance runs
-    _kill_previous_instances()
-
-    # Guarantee local proxy on 41987 is immediately active
-    if not _port_open(SERVICE_PROXY_PORT):
-        try:
-            from zen_proxy import start_proxy_server
-            start_proxy_server(SERVICE_PROXY_PORT)
-        except Exception:
-            pass
 
     existing = ctypes.windll.user32.FindWindowW(None, WINDOW_TITLE)
     if existing:
@@ -1517,6 +1547,14 @@ def main() -> int:
 
     try:
         webview.start(**start_kwargs)
+    except TypeError:
+        # pywebview 5.x does not accept an icon argument.
+        start_kwargs.pop("icon", None)
+        try:
+            webview.start(**start_kwargs)
+        except Exception as exc:
+            _log_startup_error(exc)
+            return 1
     except Exception as exc:
         _log_startup_error(exc)
         return 1

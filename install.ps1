@@ -47,27 +47,30 @@ $PyExe = $null
 foreach ($cmd in @("python.exe", "python")) {
     $found = Get-Command $cmd -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found -and $found.Source -notlike "*\WindowsApps\*") {
-        $ver = & $found.Source -c "import sys; print(sys.version_info[:2] >= (3, 8))" 2>$null
+        $ver = & $found.Source -c "import sys; print(sys.version_info[:2] >= (3, 10))" 2>$null
         if ($ver -eq "True") { $PyExe = $found.Source; break }
     }
 }
 if (-not $PyExe) {
     $pyLauncher = Get-Command "py.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pyLauncher) {
-        $resolved = & $pyLauncher.Source -3 -c "import sys; print(sys.executable)" 2>$null
+        $resolved = & $pyLauncher.Source -3 -c "import sys; print(sys.executable if sys.version_info[:2] >= (3, 10) else '')" 2>$null
         if ($resolved -and (Test-Path $resolved)) { $PyExe = $resolved }
     }
 }
 if (-not $PyExe) {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Say "Python 3.8+ not found — attempting install via winget..."
+        Say "Python 3.10+ not found — attempting install via winget..."
         winget install --id Python.Python.3.12 -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
         $env:PATH = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
         $found = Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found -and $found.Source -notlike "*\WindowsApps\*") { $PyExe = $found.Source }
+        if ($found -and $found.Source -notlike "*\WindowsApps\*") {
+            $ver = & $found.Source -c "import sys; print(sys.version_info[:2] >= (3, 10))" 2>$null
+            if ($ver -eq "True") { $PyExe = $found.Source }
+        }
     }
 }
-if (-not $PyExe) { Die "Python 3.8+ is required. Install from https://www.python.org/downloads/ and re-run." }
+if (-not $PyExe) { Die "Python 3.10+ is required. Install from https://www.python.org/downloads/ and re-run." }
 
 $PyDir = Split-Path $PyExe -Parent
 $PywCandidate = Join-Path $PyDir "pythonw.exe"
@@ -82,6 +85,12 @@ $OcCandidates = @(
     (Join-Path $env:USERPROFILE ".bun\bin\opencode.exe"),
     (Join-Path $env:APPDATA "npm\opencode.cmd")
 )
+$DesktopCliRoot = Join-Path $env:APPDATA "ai.opencode.desktop\cli"
+if (Test-Path $DesktopCliRoot) {
+    $DesktopCli = Get-ChildItem -Path $DesktopCliRoot -Recurse -Filter "opencode-cli.exe" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($DesktopCli) { $OcCandidates = @($DesktopCli.FullName) + $OcCandidates }
+}
 $OcReal = $OcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $OcReal) {
     $onPath = Get-Command opencode -All -ErrorAction SilentlyContinue | Where-Object {
@@ -180,7 +189,7 @@ if (Test-IsAdmin) {
     Warn "not elevated — skipping optional Windows Firewall rule (zen-proxy still fails closed via WARP IPv6 bind)"
 }
 
-# ---------------------------------------------------------------- Connect WARP in TUN mode (before starting keeper so they never race)
+# ---------------------------------------------------------------- Connect WARP in the selected mode (before starting keeper so they never race)
 function Invoke-Warp([string[]]$WarpArgs) {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -195,24 +204,70 @@ function Invoke-Warp([string[]]$WarpArgs) {
 }
 
 if (-not $SkipWarmCheck) {
-    Say "configuring Cloudflare WARP in TUN mode..."
-    Invoke-Warp @("registration", "new") | Out-Null
-    Invoke-Warp @("tunnel", "protocol", "set", "WireGuard") | Out-Null
-    Invoke-Warp @("mode", "warp") | Out-Null
-    Invoke-Warp @("connect") | Out-Null
-    $Connected = $false
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Seconds 2
-        $st = (Invoke-Warp @("status") | Select-Object -First 1)
-        if ($st -match "Connected" -and $st -notmatch "Disconnected") {
-            $Connected = $true
-            break
-        }
+    Say "checking Cloudflare WARP configuration..."
+
+    # Keep a working registration. Creating a new one on every install
+    # invalidates the existing device and drops the tunnel.
+    $regOut = (Invoke-Warp @("registration", "show") | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $regOut -match "registration missing|not registered|no registration") {
+        Say "no WARP registration found — creating one..."
+        Invoke-Warp @("registration", "new") | Out-Null
     }
-    if ($Connected) {
-        Ok "warp tunnel: connected (TUN mode)"
+
+    $settingsRaw = (Invoke-Warp @("-j", "settings") | Out-String)
+    $protocol = ""
+    $opMode = ""
+    try {
+        $settings = $settingsRaw | ConvertFrom-Json
+        $protocol = [string]$settings.settings.warp_tunnel_protocol
+        $opMode = [string]$settings.settings.operation_mode
+    } catch {}
+
+    if ($protocol -and $protocol -ne "wireguard") {
+        Say "switching WARP tunnel protocol to WireGuard..."
+        Invoke-Warp @("tunnel", "protocol", "set", "wireguard") | Out-Null
+    }
+
+    # Keep the scope and egress mode the user selected in the dashboard.
+    # A reinstall must not silently switch an App-Only setup to full TUN.
+    $EgressCfg = Join-Path $env:LOCALAPPDATA "opencode-unlimited\lane\egress_mode.json"
+    $WarpScope = "tun"
+    $EgressMode = "warp"
+    if (Test-Path $EgressCfg) {
+        try {
+            $ec = Get-Content -LiteralPath $EgressCfg -Raw | ConvertFrom-Json
+            if ($ec.warp_scope) { $WarpScope = [string]$ec.warp_scope }
+            if ($ec.mode) { $EgressMode = [string]$ec.mode }
+        } catch {}
+    }
+    $DesiredOpMode = if ($WarpScope -eq "isolated" -or $EgressMode -in @("tor", "custom")) { "proxy" } else { "warp" }
+    if ($DesiredOpMode -eq "proxy") {
+        Invoke-Warp @("proxy", "port", "40000") | Out-Null
+    }
+    if ($opMode -and $opMode -ne $DesiredOpMode) {
+        Say "switching WARP operating mode to $DesiredOpMode..."
+        Invoke-Warp @("mode", $DesiredOpMode) | Out-Null
+    }
+
+    $st = (Invoke-Warp @("status") | Select-Object -First 1 | Out-String)
+    if ($st -match "Connected" -and $st -notmatch "Disconnected") {
+        Ok "warp tunnel: already connected"
     } else {
-        Warn "warp tunnel still connecting — warp-keeper will keep retrying"
+        Invoke-Warp @("connect") | Out-Null
+        $Connected = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 2
+            $st = (Invoke-Warp @("status") | Select-Object -First 1 | Out-String)
+            if ($st -match "Connected" -and $st -notmatch "Disconnected") {
+                $Connected = $true
+                break
+            }
+        }
+        if ($Connected) {
+            Ok "warp tunnel: connected"
+        } else {
+            Warn "warp tunnel still connecting — warp-keeper will keep retrying"
+        }
     }
 }
 
@@ -244,7 +299,7 @@ function Register-BgTask([string]$TaskName, [string]$ScriptFile, [string]$Desc) 
     }
 }
 
-$tk1 = Register-BgTask -TaskName $TaskKeeper -ScriptFile "warp_keeper.py" -Desc "Opencode Unlimited — WARP TUN keeper"
+$tk1 = Register-BgTask -TaskName $TaskKeeper -ScriptFile "warp_keeper.py" -Desc "Opencode Unlimited — WARP keeper"
 $tk2 = Register-BgTask -TaskName $TaskGuard  -ScriptFile "zen_guard.py"  -Desc "Opencode Unlimited — quota wall auto-rotator"
 if ($tk1 -and $tk2) {
     Ok "scheduled background tasks registered & started ($TaskKeeper, $TaskGuard)"
@@ -268,12 +323,35 @@ if ($ProxyReady) {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $OcReal service set env HTTPS_PROXY $ServiceProxyUrl *> $null
-        & $OcReal service set env HTTP_PROXY  $ServiceProxyUrl *> $null
-        & $OcReal service set env https_proxy $ServiceProxyUrl *> $null
-        & $OcReal service set env http_proxy  $ServiceProxyUrl *> $null
-        & $OcReal service set env NO_PROXY    "127.0.0.1,localhost,::1" *> $null
-        & $OcReal service set env no_proxy    "127.0.0.1,localhost,::1" *> $null
+        # Merge proxy variables into service.json so the background service
+        # keeps every other key (password, model, theme, etc.).
+        $ServiceCfg = Join-Path $env:USERPROFILE ".config\opencode\service.json"
+        $cfg = $null
+        if (Test-Path $ServiceCfg) {
+            try { $cfg = Get-Content -Raw -Path $ServiceCfg | ConvertFrom-Json } catch { $cfg = $null }
+        }
+        if (-not $cfg) { $cfg = [pscustomobject]@{} }
+        if (-not $cfg.PSObject.Properties["env"]) {
+            $cfg | Add-Member -NotePropertyName "env" -NotePropertyValue ([pscustomobject]@{})
+        }
+        $EnvValues = @(
+            @("HTTPS_PROXY", $ServiceProxyUrl),
+            @("HTTP_PROXY", $ServiceProxyUrl),
+            @("https_proxy", $ServiceProxyUrl),
+            @("http_proxy", $ServiceProxyUrl),
+            @("NO_PROXY", "127.0.0.1,localhost,::1"),
+            @("no_proxy", "127.0.0.1,localhost,::1")
+        )
+        foreach ($pair in $EnvValues) {
+            $cfg.env | Add-Member -NotePropertyName $pair[0] -NotePropertyValue $pair[1] -Force
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $ServiceCfg) | Out-Null
+        [IO.File]::WriteAllText(
+            $ServiceCfg,
+            ($cfg | ConvertTo-Json -Depth 10),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
         $svcStatus = (& $OcReal service status 2>&1 | Out-String)
         if ($svcStatus -match "http://127\.0\.0\.1") {
             & $OcReal service restart *> $null

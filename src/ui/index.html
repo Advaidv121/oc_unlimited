@@ -662,7 +662,7 @@
   <header class="topbar">
     <div class="brand"
          data-tip-title="Opencode Unlimited — Made by Avatar"
-         data-tip-body="Native Windows controller for Cloudflare WARP IPv6 identity rotation, fail-closed edge pinning, and quota-wall auto-healing across both OpenCode Desktop and OpenCode CLI.">
+         data-tip-body="Windows controller for Cloudflare WARP IPv6 identity rotation, Cloudflare edge pinning, and quota-wall auto-healing across OpenCode Desktop and OpenCode CLI.">
       <div class="logo-box">
         <svg width="21" height="21" viewBox="0 0 24 24" fill="none">
           <path d="M12 3L4.5 20H8.2L12 11.2L15.8 20H19.5L12 3Z" fill="#e0f2fe"/>
@@ -675,20 +675,20 @@
           <span class="avatar-badge">made by Avatar</span>
           <span class="tag ok" style="font-size:10px;font-weight:700;padding:2px 7px;margin-left:6px;">v2.4.2</span>
         </div>
-        <div class="brand-sub">WARP IPv6 /64 Rotator &bull; Cloudflare Edge Pinner &bull; Fail-Closed Windows Lane</div>
+        <div class="brand-sub">WARP IPv6 /64 Rotator &bull; Cloudflare Edge Pinner &bull; Windows Egress Lane</div>
       </div>
     </div>
 
     <div class="top-right">
       <div id="overallPill" class="status-pill"
            data-tip-title="Protection & Tunnel Status"
-           data-tip-body="Live overall state. Green means WARP is connected in TUN mode with a Cloudflare IPv6 /64 and the fail-closed proxy is active so your home IP never leaks.">
+           data-tip-body="Live overall state. Green means WARP is connected and the egress route is verified. Standard mode falls back to the local route if WARP drops; strict mode refuses requests instead.">
         <span id="overallDot" class="dot"></span>
         <span id="overallText">Checking...</span>
       </div>
       <button id="btnRefresh" class="btn btn-sm"
               data-tip-title="Force Live Refresh"
-              data-tip-body="Immediately polls WARP status, queries external IPv6 egress via api64.ipify.org, refreshes opencode.ai edge pool, and updates all logs.">
+              data-tip-body="Immediately polls WARP status, queries the active egress route, refreshes the opencode.ai edge pool, and updates all logs.">
         Refresh
       </button>
     </div>
@@ -704,7 +704,7 @@
           <span style="font-size:11px;font-weight:700;letter-spacing:0.8px;color:var(--dim);">NETWORK EGRESS ROUTING</span>
           <span id="modeActiveBadge" class="tag ok">⚡ WARP IPv6</span>
         </div>
-        <div style="font-size:11px;color:var(--dim);" id="modeDesc">Direct socket-bound Cloudflare WARP /64 subnets</div>
+        <div style="font-size:11px;color:var(--dim);" id="modeDesc">Direct Cloudflare WARP routing with IPv6 /64 rotation</div>
       </div>
       <div class="mode-tabs">
         <button class="mode-tab active" id="tabModeWarp" data-mode="warp"
@@ -714,7 +714,7 @@
         </button>
         <button class="mode-tab" id="tabModeTor" data-mode="tor"
                 data-tip-title="Tor Network Mode"
-                data-tip-body="Routes opencode.ai traffic through Tor SOCKS5 (port 9050/9150). Provides unlimited global exit nodes for users in regions where WARP is blocked (Russia, Iran, etc.).">
+                data-tip-body="Routes opencode.ai traffic through Tor SOCKS5 (port 9050/9150). Uses Tor exit nodes in regions where WARP is blocked (Russia, Iran, etc.).">
           🧅 Tor Network
         </button>
         <button class="mode-tab" id="tabModeCustom" data-mode="custom"
@@ -724,7 +724,7 @@
         </button>
         <button class="mode-tab" id="tabModeClean" data-mode="clean"
                 data-tip-title="Clean WARP Endpoint Selector"
-                data-tip-body="In regions where Cloudflare WARP default IP (162.159.192.1) is blocked by ISPs, switch WARP's WireGuard tunnel endpoint to an unblocked clean IP.">
+                data-tip-body="In regions where Cloudflare's default WARP endpoint is blocked by ISPs, switch WARP's WireGuard tunnel endpoint to an alternate address.">
           🛡️ Clean Endpoint
         </button>
       </div>
@@ -739,7 +739,7 @@
           <div style="display:flex;gap:6px;">
             <button id="btnScopeIsolated" class="btn btn-sm btn-primary"
                     data-tip-title="App-Only Isolated Mode (Recommended)"
-                    data-tip-body="Only OpenCode traffic routes through WARP (port 40000 SOCKS5). Your PC's normal games, Discord, and browsing stay on your direct home internet with zero lag and zero drops during rotation.">
+                    data-tip-body="Only OpenCode traffic routes through WARP (port 40000 SOCKS5). Games, Discord, and browsing stay on the normal network path.">
               🎯 App-Only (Isolated)
             </button>
             <button id="btnScopeTun" class="btn btn-sm"
@@ -815,28 +815,28 @@
         Launch OpenCode CLI
       </button>
       <button id="btnHop" class="btn btn-hop"
-              data-tip-title="Zen Hop — Rotate /64 Identity Now"
-              data-tip-body="Pauses warp-keeper safely, deletes your current Cloudflare WARP registration, registers a fresh device key, reconnects TUN mode, and assigns a brand-new IPv6 /64 + Cloudflare edge (~12s).">
+              data-tip-title="Rotate Active Egress Now"
+              data-tip-body="Rotates the active egress. In WARP mode this pauses the keeper, renews the WireGuard keys, reconnects in the current scope, and waits for a new IPv6 /64. In Tor mode it builds a new circuit; in custom mode it switches to the next proxy node. The WARP device registration is kept.">
         Rotate /64 Now (Hop)
       </button>
       <button id="btnWarpToggle" class="btn"
               data-tip-title="Connect / Disconnect Cloudflare WARP"
-              data-tip-body="Toggles the Cloudflare WARP TUN tunnel directly. Note: while disconnected, OpenCode requests fail closed (503) instead of exposing your home ISP IP.">
+              data-tip-body="Toggles the Cloudflare WARP tunnel directly. Strict mode refuses requests while WARP is down; standard mode keeps OpenCode usable through the local fallback chain.">
         Connect WARP
       </button>
       <button id="btnDeepReset" class="btn" style="border-color:var(--amber);color:var(--amber);"
               data-tip-title="Deep Reset Identity"
-              data-tip-body="Clears transient cache, resets WARP keys, clears blacklist, and immediately rotates your IP. Chat sessions are 100% preserved.">
+              data-tip-body="Clears transient cache, clears the /64 blacklist, and immediately rotates your IP. Chat sessions and Project data are preserved.">
         ⚡ Deep Reset
       </button>
       <button id="btnRepairWarp" class="btn" style="border-color:var(--emerald);color:var(--emerald);"
               data-tip-title="Fix WARP / Clear MITM Block"
-              data-tip-body="Resets endpoint overrides, purges stale cryptographic registration keys, and reconnects cleanly. Resolves CF_HAPPY_EYEBALLS_MITM_FAILURE and 'Unable to reach destination' blocks.">
+              data-tip-body="Renews WARP session keys, reconnects, and recreates the device registration only if it is actually missing. Resolves CF_HAPPY_EYEBALLS_MITM_FAILURE and 'Unable to reach destination' blocks.">
         ⚡ Fix WARP (Reset Keys)
       </button>
       <button id="btnFixService" class="btn" style="border-color:var(--cyan);color:var(--cyan);"
-              data-tip-title="Fix OpenCode Port / Daemon"
-              data-tip-body="Kills orphaned background opencode-cli processes holding dead ports (e.g. 42914 IPC conflict) and cleans up the daemon state.">
+              data-tip-title="Fix OpenCode Service"
+              data-tip-body="Stops and restarts the OpenCode background service through its own CLI, re-wires the local proxy, and verifies that the service reports a listening address.">
         ⚡ Fix Port Conflict
       </button>
     </section>
@@ -844,15 +844,15 @@
     <!-- Live Telemetry Cards -->
     <section class="grid-4">
       <div class="card" id="cardEgress" style="cursor:pointer"
-           data-tip-title="External IPv6 Egress (/64 Bucket)"
-           data-tip-body="Your public IPv6 exit seen by opencode.ai. Free model limits are keyed to your /64 network block + Cloudflare edge. Click to copy full IPv6.">
+           data-tip-title="External Egress Address"
+           data-tip-body="The public address seen by opencode.ai. In WARP mode this is your IPv6 /64 prefix; Tor and custom-proxy modes show the node exit IP. Click to copy the full address.">
         <div class="stat-label">
           <span id="cardEgressLabel">Public WARP /64</span>
           <span id="egressTag" class="tag">...</span>
         </div>
         <div id="egressPrefix" class="stat-value">Checking...</div>
         <div class="stat-sub">
-          <span id="egressFull">Querying api64.ipify.org...</span>
+          <span id="egressFull">Querying public IP services...</span>
         </div>
       </div>
 
@@ -865,13 +865,13 @@
         </div>
         <div id="adapterV6" class="stat-value">---</div>
         <div class="stat-sub">
-          <span id="adapterSub">Socket-bound fail-closed</span>
+          <span id="adapterSub">Tunnel-bound route</span>
         </div>
       </div>
 
       <div class="card"
            data-tip-title="Pinned Cloudflare Edge (AAAA)"
-           data-tip-body="opencode.ai resolves to multiple Cloudflare IPv6 edge nodes. Pinning a random AAAA edge spreads load across buckets; re-roll anytime or pin a specific node.">
+           data-tip-body="opencode.ai resolves to multiple Cloudflare IPv6 edge nodes. Pinning an AAAA edge makes new connections use that node; re-roll anytime or pin a specific node.">
         <div class="stat-label">
           <span>Pinned Edge (AAAA)</span>
           <button id="btnRerollEdge" class="btn btn-sm" style="padding:2px 7px;font-size:10.5px;"
@@ -892,7 +892,7 @@
 
       <div class="card"
            data-tip-title="Auto-Rotation & Existing Data"
-           data-tip-body="Counts automatic & manual /64 rotations, blacklisted /64s (never reused up to 200), and your intact projects/sessions in opencode.db.">
+           data-tip-body="Counts automatic and manual /64 rotations, blacklisted /64s (up to 200), and the projects and sessions stored in opencode.db.">
         <div class="stat-label">
           <span>Stats &amp; Saved Work</span>
           <span id="hopsTag" class="tag ok">0 hops</span>
@@ -916,10 +916,10 @@
         <div class="control-list">
           <div class="ctrl-row"
                data-tip-title="WARP Keeper (Background Watchdog + Desktop Proxy)"
-               data-tip-body="Runs silently every 45s to enforce WARP TUN mode, auto-repair dead tunnels, and host the fail-closed Desktop/service proxy on 127.0.0.1:41987.">
+               data-tip-body="Runs silently every 45s to keep WARP connected in the selected scope, repair dead tunnels, and host the Desktop/service proxy on 127.0.0.1:41987.">
             <div class="ctrl-info">
               <div class="ctrl-title">WARP Keeper <span id="keeperTag" class="tag">...</span></div>
-              <div class="ctrl-desc">Enforces TUN mode &amp; hosts Desktop proxy (127.0.0.1:41987)</div>
+              <div class="ctrl-desc">Keeps WARP healthy &amp; hosts Desktop proxy (127.0.0.1:41987)</div>
             </div>
             <label class="switch">
               <input type="checkbox" id="chkKeeper" />
@@ -929,7 +929,7 @@
 
           <div class="ctrl-row"
                data-tip-title="Zen Guard (Quota Wall Auto-Rotator)"
-               data-tip-body="Tails opencode.log every 10s by byte offset. When 'QuotaExceeded' appears, it blacklists the current /64 and rotates WARP automatically in ~12 seconds.">
+               data-tip-body="Tails opencode.log every 10s by byte offset. When 'QuotaExceeded' appears, it blacklists the current /64 and rotates WARP automatically. A rotation usually completes within a minute.">
             <div class="ctrl-info">
               <div class="ctrl-title">Zen Guard <span id="guardTag" class="tag">...</span></div>
               <div class="ctrl-desc">Auto-detects QuotaExceeded in opencode.log &amp; rotates /64</div>
@@ -955,7 +955,7 @@
 
           <div class="ctrl-row"
                data-tip-title="Windows Firewall Kill-Switch (OUC_LEAKGUARD_CLI)"
-               data-tip-body="Blocks opencode-cli.exe from making direct outbound internet connections, forcing 100% of traffic through localhost zen-proxy -> WARP. Prompts UAC admin approval when toggled.">
+               data-tip-body="Blocks opencode-cli.exe from making direct outbound internet connections, forcing all of its traffic through the localhost proxy and WARP. Prompts for UAC approval when toggled.">
             <div class="ctrl-info">
               <div class="ctrl-title">Firewall Kill-Switch <span id="fwTag" class="tag">...</span></div>
               <div class="ctrl-desc">OS-level rule blocking direct non-WARP CLI egress (UAC)</div>
@@ -968,10 +968,10 @@
 
           <div class="ctrl-row"
                data-tip-title="Strict Fail-Closed Mode"
-               data-tip-body="When ON, proxy enforces strict fail-closed privacy (refuses connections if WARP is down). When OFF (Recommended), resilient fallback prevents 503 tunnel errors and keeps OpenCode responsive even if WARP drops.">
+               data-tip-body="When ON, the proxy refuses connections if WARP is down. When OFF (Recommended), it falls back to a direct connection instead of returning a 503 error.">
             <div class="ctrl-info">
               <div class="ctrl-title">Strict Fail-Closed Mode <span id="strictTag" class="tag">...</span></div>
-              <div class="ctrl-desc">Off = resilient auto-fallback (no 503 crashes); On = strict leak protection</div>
+              <div class="ctrl-desc">Off = direct fallback when WARP drops; On = strict leak protection</div>
             </div>
             <label class="switch">
               <input type="checkbox" id="chkStrict" />
@@ -980,11 +980,11 @@
           </div>
 
           <div class="ctrl-row"
-               data-tip-title="Auto-Resume on Bypass (Walk-Away Mode)"
-               data-tip-body="Automatically detects when the rate limit wall is bypassed, and dispatches a 'continue' prompt to your active OpenCode chat (via CLI and keystroke) so the model keeps generating without you needing to sit at your PC.">
+               data-tip-title="Auto-Resume on Bypass"
+               data-tip-body="After a successful rotation, reloads the OpenCode window and sends a 'continue' prompt through the CLI or keystrokes.">
             <div class="ctrl-info">
               <div class="ctrl-title">Auto-Resume on Bypass <span id="autoResumeTag" class="tag ok">Active</span></div>
-              <div class="ctrl-desc">Automatically sends 'continue' when limits rotate (walk-away mode)</div>
+              <div class="ctrl-desc">Sends 'continue' after a rotation when the window can be focused</div>
             </div>
             <label class="switch">
               <input type="checkbox" id="chkAutoResume" checked />
@@ -1022,12 +1022,12 @@
                     data-tip-body="Live tail of C:\Users\<you>\.local\share\opencode\log\opencode.log — the file Zen Guard watches for QuotaExceeded.">OpenCode Log</button>
             <button class="tab" data-tab="blacklist"
                     data-tip-title="Blacklisted /64 Prefixes"
-                    data-tip-body="IPv6 /64 blocks that hit the daily quota limit and will be skipped automatically during future rotations (capped at 200).">Blacklist</button>
+                    data-tip-body="Clears the saved list of burned /64 prefixes so they can be assigned again during future rotations (capped at 200).">Blacklist</button>
           </div>
           <div class="btn-group">
             <button id="btnClearBlacklist" class="btn btn-sm" style="display:none"
                     data-tip-title="Clear /64 Blacklist"
-                    data-tip-body="Wipes the saved burned /64 list (useful after daily quota resets at midnight UTC).">Clear</button>
+                    data-tip-body="Clears the saved burned /64 list so those prefixes can be tried again after a quota reset.">Clear</button>
             <button id="btnCopyLog" class="btn btn-sm"
                     data-tip-title="Copy Current View"
                     data-tip-body="Copies the currently displayed log or blacklist text to your clipboard.">Copy</button>
@@ -1042,7 +1042,7 @@
       <div class="btn-group">
         <button id="btnInstallRepair" class="btn btn-sm btn-primary"
                 data-tip-title="Install / Repair Everything"
-                data-tip-body="Deploys scripts & .cmd shims to %LOCALAPPDATA%\opencode-unlimited, updates User PATH, registers logon tasks, connects WARP in TUN mode, and wires OpenCode Desktop.">
+                data-tip-body="Deploys scripts & .cmd shims to %LOCALAPPDATA%\opencode-unlimited, updates User PATH, registers logon tasks, connects WARP in the selected scope, and wires OpenCode Desktop.">
           Install / Repair System
         </button>
         <button id="btnOpenFolder" class="btn btn-sm"
@@ -1159,25 +1159,38 @@
     const pillTxt = $("overallText");
     const egressMode = (state.egress && state.egress.mode) ? state.egress.mode : "warp";
     const isProxyMode = (w.mode || "").toLowerCase().includes("proxy") || (state.egress && state.egress.warp_scope === "isolated");
+    const strict = !!(ln && ln.strict_mode);
+    const egressIp = w.egress_ip || w.egress_v6 || "";
+    const isV6 = egressIp.includes(":");
 
     if (w.rotating) {
       pillDot.className = "dot spin";
-      pillTxt.textContent = "ROTATING /64...";
+      pillTxt.textContent =
+        egressMode === "tor" ? "ROTATING TOR CIRCUIT..."
+        : egressMode === "custom" ? "ROTATING PROXY..."
+        : "ROTATING /64...";
     } else if (egressMode === "custom") {
       pillDot.className = "dot ok";
       pillTxt.textContent = `PROTECTED • CUSTOM PROXY (${(state.egress.custom_type || "SOCKS5").toUpperCase()})`;
     } else if (egressMode === "tor") {
       pillDot.className = "dot ok";
       pillTxt.textContent = "PROTECTED • TOR NETWORK (3-HOP)";
-    } else if (w.connected && (w.is_cf || (w.adapter_v6 && !w.egress_v6))) {
+    } else if (w.connected && (w.is_cf || (w.adapter_v6 && !egressIp))) {
       pillDot.className = "dot ok";
-      pillTxt.textContent = isProxyMode ? "PROTECTED • WARP (APP-ONLY)" : "PROTECTED • WARP IPv6";
+      if (egressMode === "clean") {
+        pillTxt.textContent = "PROTECTED • WARP CLEAN ENDPOINT";
+      } else {
+        pillTxt.textContent = isProxyMode ? "PROTECTED • WARP (APP-ONLY)" : "PROTECTED • WARP IPv6";
+      }
     } else if (w.connected) {
       pillDot.className = "dot";
-      pillTxt.textContent = "WARP CONNECTED (VERIFYING IPv6)";
-    } else {
+      pillTxt.textContent = "WARP CONNECTED • CHECKING EGRESS";
+    } else if (strict) {
       pillDot.className = "dot bad";
       pillTxt.textContent = "DISCONNECTED (FAIL-CLOSED)";
+    } else {
+      pillDot.className = "dot warn";
+      pillTxt.textContent = "WARP DISCONNECTED • FALLBACK ACTIVE";
     }
 
     // WARP connect button
@@ -1188,28 +1201,38 @@
     if (egressMode === "custom") {
       if (card1Label) card1Label.textContent = "Custom Proxy Egress";
       $("egressPrefix").textContent = state.egress.custom_current_node || state.egress.custom_proxy || "127.0.0.1:10808";
-      $("egressFull").textContent = w.egress_v6 ? `Exit IP: ${w.egress_v6}` : "Routing through local proxy pool";
+      $("egressFull").textContent = egressIp ? `Exit IP: ${egressIp}` : "Routing through local proxy pool";
       setTag($("egressTag"), "Proxy Active", "ok");
     } else if (egressMode === "tor") {
       if (card1Label) card1Label.textContent = "Tor Network Egress";
       $("egressPrefix").textContent = state.egress.tor_target || "127.0.0.1:9050";
-      $("egressFull").textContent = w.egress_v6 ? `Exit IP: ${w.egress_v6}` : "Tor 3-Hop Circuit Active";
+      $("egressFull").textContent = egressIp ? `Exit IP: ${egressIp}` : "Tor 3-Hop Circuit Active";
       setTag($("egressTag"), "Tor Active", "ok");
-    } else if (w.egress_v6) {
-      if (card1Label) card1Label.textContent = "Public WARP /64";
-      $("egressPrefix").textContent = (w.egress_prefix || w.egress_v6) + "/64";
-      $("egressFull").textContent = w.egress_v6;
-      setTag($("egressTag"), w.is_cf ? "CF Verified" : "Non-WARP!", w.is_cf ? "ok" : "bad");
+    } else if (egressIp) {
+      if (card1Label) card1Label.textContent = isV6 ? "Public WARP /64" : "Public WARP Exit IP";
+      $("egressPrefix").textContent = isV6
+        ? (w.egress_prefix || egressIp) + "/64"
+        : egressIp;
+      $("egressFull").textContent = isV6 ? egressIp : `IPv4 exit: ${egressIp}`;
+      if (w.is_cf) {
+        setTag($("egressTag"), "CF Verified", "ok");
+      } else if (w.connected) {
+        setTag($("egressTag"), "WARP Active", "ok");
+      } else {
+        setTag($("egressTag"), "Unverified", "warn");
+      }
     } else if (w.checking_egress) {
-      if (card1Label) card1Label.textContent = "Public WARP /64";
+      if (card1Label) card1Label.textContent = "Public WARP Egress";
       $("egressPrefix").textContent = "Checking...";
-      $("egressFull").textContent = "Querying api64.ipify.org...";
+      $("egressFull").textContent = "Querying public IP services...";
       setTag($("egressTag"), "Probing", "warn");
     } else {
-      if (card1Label) card1Label.textContent = "Public WARP /64";
-      $("egressPrefix").textContent = w.connected ? "No IPv6 response" : "Offline (Blocked)";
-      $("egressFull").textContent = w.connected ? "Click Refresh to re-probe" : "Fail-closed active";
-      setTag($("egressTag"), w.connected ? "Pending" : "Closed", w.connected ? "warn" : "bad");
+      if (card1Label) card1Label.textContent = "Public WARP Egress";
+      $("egressPrefix").textContent = w.connected ? "No egress response" : (strict ? "Offline (Blocked)" : "WARP offline");
+      $("egressFull").textContent = w.connected
+        ? "Click Refresh to re-probe"
+        : (strict ? "Fail-closed active" : "Local fallback keeps OpenCode usable");
+      setTag($("egressTag"), w.connected ? "Pending" : (strict ? "Closed" : "Fallback"), w.connected ? "warn" : (strict ? "bad" : "warn"));
     }
 
     // Card 2: Adapter / Node Details
@@ -1224,11 +1247,20 @@
       $("adapterV6").textContent = state.egress.tor_target || "127.0.0.1:9050";
       setTag($("warpModeTag"), "TOR SOCKS5", "ok");
       $("adapterSub").textContent = "Control Port 9051 • Auto NEWNYM on Rate Limits";
+    } else if (egressMode === "clean") {
+      if (card2Label) card2Label.textContent = "WARP Clean Endpoint";
+      $("adapterV6").textContent = w.adapter_v6 || (isProxyMode ? "Proxy (Port 40000)" : "Not active");
+      setTag($("warpModeTag"), "CLEAN WG", w.connected ? "ok" : "warn");
+      $("adapterSub").textContent = w.adapter_v6
+        ? "Custom WireGuard endpoint active"
+        : (isProxyMode ? "App-only proxy through the selected endpoint" : "Waiting for CloudflareWARP NIC");
     } else {
       if (card2Label) card2Label.textContent = "WARP Adapter IP";
       $("adapterV6").textContent = w.adapter_v6 || (isProxyMode ? "Proxy (Port 40000)" : "Not active");
-      setTag($("warpModeTag"), (w.mode || "?").toUpperCase(), w.mode.toLowerCase().includes("warp") ? "ok" : "warn");
-      $("adapterSub").textContent = w.adapter_v6 ? "Socket-bound fail-closed" : (isProxyMode ? "App-Only Isolated Proxy (No NIC Needed)" : "Waiting for CloudflareWARP NIC");
+      setTag($("warpModeTag"), (w.mode || "?").toUpperCase(), (w.mode || "").toLowerCase().includes("warp") ? "ok" : "warn");
+      $("adapterSub").textContent = w.adapter_v6
+        ? "Tunnel-bound route active"
+        : (isProxyMode ? "App-Only Isolated Proxy (No NIC Needed)" : "Waiting for CloudflareWARP NIC");
     }
 
     // Card 3: Pinned Edge & dropdown
@@ -1295,12 +1327,20 @@
       if (tab) tab.classList.toggle("active", m === activeModeTab);
     });
 
+    const hopBtn = $("btnHop");
+    if (hopBtn) {
+      hopBtn.textContent =
+        curMode === "tor" ? "Rotate Circuit (Hop)"
+        : curMode === "custom" ? "Rotate Proxy (Hop)"
+        : "Rotate /64 Now (Hop)";
+    }
+
     const badge = $("modeActiveBadge");
     const desc = $("modeDesc");
     if (curMode === "warp") {
       badge.textContent = "⚡ WARP IPv6";
       badge.className = "tag ok";
-      desc.textContent = "Direct socket-bound Cloudflare WARP /64 subnets";
+      desc.textContent = "Direct Cloudflare WARP routing with IPv6 /64 rotation";
     } else if (curMode === "tor") {
       badge.textContent = "🧅 Tor Network";
       badge.className = "tag " + (eg.tor_active ? "ok" : "warn");
@@ -1516,6 +1556,7 @@
     $("panelClean").style.display = "block";
     document.querySelectorAll(".mode-tab").forEach(t => t.classList.remove("active"));
     $("tabModeClean").classList.add("active");
+    runAction("tabModeClean", () => window.pywebview.api.set_egress_mode("clean"), "Switching to Clean Endpoint...");
   };
 
   $("btnTorRotate").onclick = () => runAction("btnTorRotate", () => window.pywebview.api.rotate_tor_circuit(), "Rotating Tor Circuit...");
@@ -1553,7 +1594,7 @@
   };
   $("btnLaunchDesktop").onclick = () => runAction("btnLaunchDesktop", () => window.pywebview.api.launch_desktop(), "Launching...");
   $("btnLaunchCli").onclick = () => runAction("btnLaunchCli", () => window.pywebview.api.launch_cli(), "Opening...");
-  $("btnHop").onclick = () => runAction("btnHop", () => window.pywebview.api.hop_now(), "Rotating /64...");
+  $("btnHop").onclick = () => runAction("btnHop", () => window.pywebview.api.hop_now(), "Rotating egress...");
   $("btnWarpToggle").onclick = () => {
     const conn = state && state.warp && state.warp.connected;
     runAction("btnWarpToggle", () => conn ? window.pywebview.api.warp_disconnect() : window.pywebview.api.warp_connect(), conn ? "Disconnecting..." : "Connecting...");
@@ -1580,7 +1621,10 @@
   $("chkAutoResume").onchange = (e) => runAction("chkAutoResume", () => window.pywebview.api.toggle_auto_resume(e.target.checked));
   $("chkAutostart").onchange = (e) => runAction("chkAutostart", () => window.pywebview.api.toggle_autostart(e.target.checked));
 
-  $("cardEgress").onclick = () => state && state.warp.egress_v6 && window.pywebview.api.copy_text(state.warp.egress_v6).then((r) => showToast(r.message));
+  $("cardEgress").onclick = () => {
+    const ip = state && state.warp && (state.warp.egress_ip || state.warp.egress_v6);
+    if (ip) window.pywebview.api.copy_text(ip).then((r) => showToast(r.message));
+  };
   $("cardAdapter").onclick = () => state && state.warp.adapter_v6 && window.pywebview.api.copy_text(state.warp.adapter_v6).then((r) => showToast(r.message));
 
   document.querySelectorAll(".tab").forEach((tab) => {

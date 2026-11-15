@@ -7,9 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
-import sys
 import tarfile
-import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -17,7 +15,6 @@ from pathlib import Path
 from ouc_common import (
     CREATE_NO_WINDOW,
     DEST_DIR,
-    append_log,
     ensure_dirs,
     run_hidden,
 )
@@ -252,11 +249,28 @@ def stop_portable_tor() -> tuple[bool, str]:
         return True, f"Tor process cleanup: {exc}"
 
 
+def _tor_auth_cookie() -> Path | None:
+    candidates = (
+        TOR_DATA_DIR / "control_auth_cookie",
+        Path(os.environ.get("APPDATA", "")) / "Tor Browser" / "Browser" / "TorBrowser" / "Data" / "Tor" / "control_auth_cookie",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tor Browser" / "Browser" / "TorBrowser" / "Data" / "Tor" / "control_auth_cookie",
+    )
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+        except OSError:
+            pass
+    return None
+
+
 def signal_tor_newnym(control_port: int = 9051) -> bool:
     """Send SIGNAL NEWNYM to Tor control port to build a fresh circuit and exit node."""
+    cookie = _tor_auth_cookie()
+    auth = f'AUTHENTICATE "{cookie.read_bytes().hex()}"\r\n' if cookie else 'AUTHENTICATE ""\r\n'
     try:
         with socket.create_connection(("127.0.0.1", control_port), timeout=1.2) as s:
-            s.sendall(b'AUTHENTICATE ""\r\n')
+            s.sendall(auth.encode("ascii"))
             resp = s.recv(512)
             if b"250" in resp:
                 s.sendall(b"SIGNAL NEWNYM\r\n")
@@ -267,24 +281,85 @@ def signal_tor_newnym(control_port: int = 9051) -> bool:
     return False
 
 
-def rotate_tor_circuit() -> tuple[bool, str]:
-    """Rotate Tor circuit for a fresh exit node IP and reset quota."""
-    # 1. Try Tor control port SIGNAL NEWNYM first (Tor Browser: 9151, System Tor: 9051)
-    for port in (9051, 9151):
-        if signal_tor_newnym(port):
-            time.sleep(1.2)
-            return True, f"Tor circuit rotated via control port {port} (new exit identity assigned)."
+def _tor_egress_ip() -> str:
+    try:
+        from ouc_common import get_egress_ip
 
-    # 2. If control port not active, cycle portable Tor daemon if running
+        return get_egress_ip(timeout=6.0)
+    except Exception:
+        return ""
+
+
+def rotate_tor_circuit() -> tuple[bool, str]:
+    """Rotate Tor circuit and confirm that the exit address changed."""
+    before = _tor_egress_ip()
+
+    for port in (9051, 9151):
+        if not signal_tor_newnym(port):
+            continue
+        after = before
+        for _ in range(3):
+            time.sleep(2.0)
+            after = _tor_egress_ip()
+            if after and not before:
+                return True, (
+                    f"Tor circuit rotated via control port {port}; "
+                    f"new exit confirmed at {after}"
+                )
+            if after and after != before:
+                return True, (
+                    f"Tor circuit rotated via control port {port} "
+                    f"({before} -> {after})"
+                )
+            signal_tor_newnym(port)
+        if not after:
+            return False, (
+                f"Control port {port} accepted the circuit request, "
+                "but the new exit IP could not be verified."
+            )
+        return False, (
+            f"Tor accepted the circuit request but the exit IP stayed at {after}"
+        )
+
+    # No control port: restart the portable daemon to force a new circuit.
     if is_portable_tor_running():
         stop_portable_tor()
         time.sleep(1.0)
-        return start_portable_tor()
+        ok, msg = start_portable_tor()
+        if ok:
+            after = _tor_egress_ip()
+            if after and not before:
+                return True, f"Portable Tor restarted; exit confirmed at {after}"
+            if after and after != before:
+                return True, f"Portable Tor restarted ({before} -> {after})"
+            return False, (
+                "Portable Tor restarted, but the new exit IP could not be verified."
+            )
+        return False, msg
 
     active = get_active_tor_target()
     if active:
-        return True, f"External Tor active on {active[0]}:{active[1]} (circuit cycle requested)."
-    return start_portable_tor()
+        return False, (
+            f"External Tor on {active[0]}:{active[1]} has no usable control port"
+        )
+    ok, msg = start_portable_tor()
+    if not ok:
+        return False, msg
+    after = _tor_egress_ip()
+    if after:
+        return True, f"Tor started; exit confirmed at {after}"
+    return False, "Tor started, but the exit IP could not be verified."
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    """Read exactly ``size`` bytes or return what is available on close."""
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
 
 
 def open_socks5_tunnel(
@@ -293,48 +368,81 @@ def open_socks5_tunnel(
     socks_host: str = "127.0.0.1",
     socks_port: int = 9050,
     timeout: float = 12.0,
+    username: str = "",
+    password: str = "",
 ) -> socket.socket:
     """Establish an upstream TCP tunnel through a SOCKS5 proxy server."""
     sock = socket.create_connection((socks_host, socks_port), timeout=timeout)
-    # SOCKS5 greeting
-    sock.sendall(b"\x05\x01\x00")
-    resp = sock.recv(2)
-    if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
-        sock.close()
-        raise ConnectionError("SOCKS5 proxy authentication failed or invalid protocol")
-
-    # Connect command: support IPv4 (ATYP=1), IPv6 (ATYP=4), and Domain (ATYP=3)
-    port_bytes = dest_port.to_bytes(2, "big")
     try:
-        ip_v4 = socket.inet_aton(dest_host)
-        req = b"\x05\x01\x00\x01" + ip_v4 + port_bytes
-    except OSError:
+        # Offer no-auth and username/password; the server picks one.
+        sock.sendall(b"\x05\x02\x00\x02")
+        resp = _recv_exact(sock, 2)
+        if len(resp) < 2 or resp[0] != 5:
+            raise ConnectionError("SOCKS5 proxy returned an invalid greeting")
+        method = resp[1]
+        if method == 0x02:
+            if not username:
+                raise ConnectionError("SOCKS5 proxy requires credentials")
+            user_b = username.encode("utf-8")
+            pass_b = password.encode("utf-8")
+            if len(user_b) > 255 or len(pass_b) > 255:
+                raise ConnectionError("SOCKS5 credentials are too long")
+            sock.sendall(
+                b"\x01"
+                + bytes([len(user_b)])
+                + user_b
+                + bytes([len(pass_b)])
+                + pass_b
+            )
+            auth = _recv_exact(sock, 2)
+            if len(auth) < 2 or auth[1] != 0:
+                raise ConnectionError("SOCKS5 proxy rejected the credentials")
+        elif method != 0x00:
+            raise ConnectionError(
+                f"SOCKS5 proxy does not offer a supported auth method ({method})"
+            )
+
+        # Connect command: support IPv4 (ATYP=1), IPv6 (ATYP=4), and Domain (ATYP=3)
+        port_bytes = dest_port.to_bytes(2, "big")
         try:
-            ip_v6 = socket.inet_pton(socket.AF_INET6, dest_host)
-            req = b"\x05\x01\x00\x04" + ip_v6 + port_bytes
-        except (OSError, AttributeError):
-            host_bytes = dest_host.encode("idna")
-            req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + port_bytes
-    sock.sendall(req)
+            ip_v4 = socket.inet_aton(dest_host)
+            req = b"\x05\x01\x00\x01" + ip_v4 + port_bytes
+        except OSError:
+            try:
+                ip_v6 = socket.inet_pton(socket.AF_INET6, dest_host)
+                req = b"\x05\x01\x00\x04" + ip_v6 + port_bytes
+            except (OSError, AttributeError):
+                host_bytes = dest_host.encode("idna")
+                req = (
+                    b"\x05\x01\x00\x03"
+                    + bytes([len(host_bytes)])
+                    + host_bytes
+                    + port_bytes
+                )
+        sock.sendall(req)
 
-    reply = sock.recv(4)
-    if len(reply) < 4 or reply[1] != 0:
+        reply = _recv_exact(sock, 4)
+        if len(reply) < 4 or reply[1] != 0:
+            code = reply[1] if len(reply) >= 2 else -1
+            raise ConnectionError(
+                f"SOCKS5 proxy connection failed (error code {code})"
+            )
+
+        atyp = reply[3]
+        if atyp == 1:
+            to_read = 6
+        elif atyp == 4:
+            to_read = 18
+        elif atyp == 3:
+            raw_len = _recv_exact(sock, 1)
+            to_read = (raw_len[0] + 2) if raw_len else 0
+        else:
+            raise ConnectionError(f"SOCKS5 proxy returned unknown address type {atyp}")
+        if to_read and len(_recv_exact(sock, to_read)) < to_read:
+            raise ConnectionError("SOCKS5 proxy closed the reply early")
+
+        sock.settimeout(None)
+        return sock
+    except Exception:
         sock.close()
-        code = reply[1] if len(reply) >= 2 else -1
-        raise ConnectionError(f"SOCKS5 proxy connection failed (error code {code})")
-
-    atyp = reply[3]
-    to_read = 6 if atyp == 1 else (18 if atyp == 4 else 0)
-    if atyp == 3:
-        raw_len = sock.recv(1)
-        if raw_len:
-            to_read = raw_len[0] + 2
-    read_so_far = 0
-    while read_so_far < to_read:
-        chunk = sock.recv(min(512, to_read - read_so_far))
-        if not chunk:
-            break
-        read_so_far += len(chunk)
-
-    sock.settimeout(None)
-    return sock
+        raise

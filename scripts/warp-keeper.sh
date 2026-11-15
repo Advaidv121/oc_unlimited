@@ -30,6 +30,8 @@ if [ -f /etc/opencode-unlimited-vps.flag ] || [ -n "${SSH_CLIENT:-}" ] || [ -n "
 fi
 
 MODE="${OUC_WARP_MODE:-proxy}"
+REPAIR_COOLDOWN=120
+LAST_REPAIR=0
 
 ensure_connected(){
   # 1. Already connected: do not touch anything
@@ -58,8 +60,14 @@ ensure_connected(){
     wo status | head -1 | grep -q Connected && return 0
   done
 
-  # 4. Gentle recovery: rotate keys & reset endpoint (preserves registration)
-  w tunnel endpoint reset
+  # 4. Gentle recovery: renew the session keys (registration is preserved).
+  #    Rate-limit repairs so a flapping network is not churned every tick.
+  NOW=$(date +%s)
+  if [ $((NOW - LAST_REPAIR)) -lt "$REPAIR_COOLDOWN" ]; then
+    return 1
+  fi
+  LAST_REPAIR=$NOW
+
   STATUS="$(wo status 2>/dev/null)"
   if echo "$STATUS" | grep -qiE "mitm|happy_eyeball|unable"; then
     w tunnel protocol set WireGuard
@@ -99,7 +107,7 @@ ensure_connected(){
 ensure_guard(){
   # Only install iptables leakguard in TUN mode when NOT on a remote VPS
   if [ "$MODE" != "warp" ] || [ "$IS_VPS" = "1" ]; then
-    # In proxy mode or VPS, remove old leakguard rule if present to ensure SSH is never blocked
+    # Remove any old leakguard rule in proxy mode or on a VPS so SSH stays reachable.
     iptables  -D OUTPUT -j OUC_LEAKGUARD 2>/dev/null || true
     ip6tables -D OUTPUT -j OUC_LEAKGUARD 2>/dev/null || true
     return 0

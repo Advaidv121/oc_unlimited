@@ -1,9 +1,9 @@
 #!/bin/bash
 # Opencode Unlimited Usage — installer
 #
-# ONE SHOT: opencode + cloudflare warp (apt/dnf/pacman, whatever your distro
-# speaks) + TUN mode + keeper + guard + lane shim + auto-resume router +
-# self-verify. you run one line, you get a working system.
+# Installs OpenCode + Cloudflare WARP (via apt, dnf, pacman, nix, or zypper)
+# in isolated proxy mode, then sets up the keeper, guard, lane shim,
+# auto-resume router, and verification steps.
 set -u
 
 BRAND="opencode-unlimited"
@@ -78,7 +78,7 @@ if [ -z "$OC_REAL" ]; then
   if curl -fsSL https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then
     [ -x "$HOME/.opencode/bin/opencode" ] && OC_REAL="$HOME/.opencode/bin/opencode"
   fi
-  [ -n "$OC_REAL" ] || die "opencode install failed — do it yourself: https://opencode.ai/install"
+  [ -n "$OC_REAL" ] || die "opencode install failed — install it manually from https://opencode.ai/install"
   ok "opencode installed"
 else
   ok "opencode found: $OC_REAL"
@@ -181,14 +181,18 @@ if [ "$SUDOERS_NOW" != "$SUDOERS_NEED" ]; then
   say "sudoers: passwordless warp-cli + read-only kill-switch verify"
   printf '%s\n' "$SUDOERS_NEED" | sudo tee "$SUDOERS_FILE" >/dev/null
   sudo chmod 440 "$SUDOERS_FILE"
-  sudo visudo -c >/dev/null 2>&1 || { sudo rm -f "$SUDOERS_FILE"; die "sudoers rejected — this should never happen"; }
+  sudo visudo -c >/dev/null 2>&1 || { sudo rm -f "$SUDOERS_FILE"; die "sudoers validation failed — rerun the installer"; }
 fi
 sw status || die "passwordless warp-cli did not work — check $SUDOERS_FILE"
 ok "passwordless warp-cli works"
 
 # ---------------------------------------------------------------- warp: register + isolated proxy mode + connect
-say "registering warp + isolated proxy up"
-sw registration new >/dev/null 2>&1   # already-registered boxes just error, fine
+say "starting WARP in isolated proxy mode"
+# Keep an existing device registration; only create one when missing.
+if ! swo registration show >/dev/null 2>&1; then
+  say "no WARP registration found — creating one"
+  sw registration new >/dev/null 2>&1 || say "registration is not ready yet; the keeper will retry"
+fi
 
 # Detect VPS or SSH session to protect remote connectivity
 IS_VPS=0
@@ -198,6 +202,9 @@ if [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ] || [ -n "${SSH_CONNECTION:-
   sudo touch /etc/opencode-unlimited-vps.flag 2>/dev/null || true
   say "VPS / SSH environment detected: enforcing isolated proxy mode (port 40000) to protect SSH access"
 fi
+
+# Use WireGuard so ISPs that throttle MASQUE/UDP 443 do not break the tunnel.
+sw tunnel protocol set WireGuard >/dev/null 2>&1 || true
 
 sw mode proxy
 sw proxy port 40000
@@ -288,10 +295,10 @@ elif [ -n "$V6" ]; then
   FIRST=$(echo "$V6" | cut -d: -f1-4)
   case "$V6" in
     2606:*|2a09:*|104.28.*|8.29.*) ok "egress is cloudflare (warp): $V6" ;;
-    *) bad "egress is not warp yet — keeper is still setting up, give it a minute then run ${BRAND}-doctor" ;;
+    *) bad "egress is not Cloudflare WARP yet — the keeper will retry; run ${BRAND}-doctor if it persists" ;;
   esac
 else
-  bad "egress is not warp yet — keeper is still setting up, give it a minute then run ${BRAND}-doctor"
+  bad "egress is not Cloudflare WARP yet — the keeper will retry; run ${BRAND}-doctor if it persists"
 fi
 
 case ":$PATH:" in
@@ -301,9 +308,9 @@ case ":$PATH:" in
 esac
 
 echo ""
-ok "DONE. close & reopen your terminal, then just run:  opencode"
-say "first launch: opencode sets up its device identity — if it asks to login, do it once (free)"
+ok "DONE. close & reopen your terminal, then run:  opencode"
+say "first launch: opencode sets up its device identity — if it asks you to log in, complete it once (free)"
 echo ""
-say "wall hits while you work? zen-guard rotates in ~10s — just re-send your message."
+say "wall hits while you work? zen-guard rotates automatically — re-send your message if the automatic resume did not fire."
 say "health check any time:  ${BRAND}-doctor   ·   fresh identity now:  ${BRAND}-hop"
 echo ""

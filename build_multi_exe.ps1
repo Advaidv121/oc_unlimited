@@ -2,7 +2,7 @@
 .SYNOPSIS
     Builds OpencodeUnlimited-Multi.exe v2.4.2 (standalone multi-egress Windows GUI executable).
     Supports Cloudflare WARP /64, Tor Network (SOCKS5), Custom Proxies, and Clean Endpoints.
-    Keeps OpencodeUnlimited-Avatar.exe completely untouched!
+    Keeps OpencodeUnlimited-Avatar.exe unchanged.
 #>
 [CmdletBinding()]
 param()
@@ -21,10 +21,12 @@ if (-not (Test-Path (Join-Path $SrcDir "avatar_ui.py"))) {
     $SrcDir = Join-Path $Root "windows"
 }
 $SpecWork = Join-Path $env:TEMP "ouc-multi-build"
-$DistDir = $Root
+$StageDir = Join-Path $SpecWork "dist"
+
+. (Join-Path $Root "scripts\build_common.ps1")
 
 if (Test-Path $SpecWork) { Remove-Item $SpecWork -Recurse -Force -ErrorAction SilentlyContinue }
-New-Item -ItemType Directory -Force -Path $SpecWork | Out-Null
+New-Item -ItemType Directory -Force -Path $SpecWork, $StageDir | Out-Null
 
 $PyInstaller = Get-Command pyinstaller.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
 if (-not $PyInstaller) {
@@ -52,14 +54,20 @@ if (-not (Test-Path $IconPath)) {
     $IconPath = Join-Path $Root "windows\assets\avatar.ico"
 }
 
+$VersionFile = Join-Path $SpecWork "version_multi.txt"
+New-OucVersionFile -Path $VersionFile -ExeName "OpencodeUnlimited-Multi.exe" `
+    -Description "Opencode Unlimited Multi-Egress Control Center"
+
 $ArgsList = @(
     "--noconfirm",
     "--clean",
     "--onefile",
     "--windowed",
+    "--noupx",
     "--name", "OpencodeUnlimited-Multi",
     "--icon", $IconPath,
-    "--distpath", $DistDir,
+    "--version-file", $VersionFile,
+    "--distpath", $StageDir,
     "--workpath", (Join-Path $SpecWork "work"),
     "--specpath", $SpecWork,
     "--paths", $SrcDir,
@@ -121,10 +129,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller exited with code $LASTEXITCODE"
 }
 
-$OutExe = Join-Path $DistDir "OpencodeUnlimited-Multi.exe"
-if (-not (Test-Path $OutExe)) {
-    throw "Expected output executable missing: $OutExe"
+$BuiltExe = Join-Path $StageDir "OpencodeUnlimited-Multi.exe"
+if (-not (Test-Path $BuiltExe)) {
+    throw "Expected output executable missing: $BuiltExe"
 }
+
+Invoke-OucCodeSign -Path $BuiltExe | Out-Null
+
+$OutExe = Join-Path $Root "OpencodeUnlimited-Multi.exe"
+Publish-OucExe -BuiltExe $BuiltExe -TargetExe $OutExe
 
 Remove-Item $SpecWork -Recurse -Force -ErrorAction SilentlyContinue
 $SizeMB = [math]::Round((Get-Item $OutExe).Length / 1MB, 2)

@@ -1,8 +1,8 @@
 """Auto-Resume module for OpenCode Unlimited.
 
 Automatically detects when a rate limit is bypassed, clears client-side database
-lockouts (free-limit / go-upsell), reloads the OpenCode interface, and dispatches
-a 'continue' action to the active OpenCode session so the model keeps generating autonomously.
+lockouts (free-limit / go-upsell), reloads the OpenCode interface, and sends
+a 'continue' action to the active OpenCode session.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from ouc_common import LANE_DIR, find_opencode_cli
+from ouc_common import LANE_DIR, find_opencode_cli, opencode_command
 
 AUTO_RESUME_FLAG = LANE_DIR / "auto_resume.flag"
 
@@ -55,12 +55,23 @@ def clear_opencode_free_limit() -> int:
         if not db_path.is_file():
             continue
         try:
-            conn = sqlite3.connect(str(db_path), timeout=3.0)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM state WHERE key IN ('free-limit', 'go-upsell') OR key LIKE '%free%limit%' OR key LIKE '%quota%exceeded%' OR key LIKE '%upsell%'")
-            deleted += cur.rowcount
-            conn.commit()
-            conn.close()
+            conn = sqlite3.connect(
+                f"file:{db_path.as_posix()}?mode=rw",
+                uri=True,
+                timeout=5.0,
+            )
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM state WHERE key IN "
+                    "('free-limit', 'go-upsell', 'free_usage_limit', "
+                    "'usage_limit', 'quota_exceeded')"
+                )
+                deleted += cur.rowcount
+                conn.commit()
+            finally:
+                conn.close()
         except Exception:
             pass
     return deleted
@@ -113,6 +124,19 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
         target_hwnds = []
 
         def _enum_cb(hwnd, _):
@@ -123,26 +147,46 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
                 title = buf.value.lower()
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == os.getpid():
+                    return True
                 pname = ""
                 try:
                     import psutil
                     pname = psutil.Process(pid.value).name().lower()
                 except Exception:
                     pass
-                if "opencode" in pname or "opencode" in title:
+                if "unlimited" in pname:
+                    return True
+                if pname in ("opencode.exe", "opencode-cli.exe"):
+                    target_hwnds.append((hwnd, buf.value, pname))
+                elif pname in (
+                    "windowsterminal.exe",
+                    "cmd.exe",
+                    "powershell.exe",
+                    "pwsh.exe",
+                    "conhost.exe",
+                    "mintty.exe",
+                    "wezterm-gui.exe",
+                    "alacritty.exe",
+                ) and "opencode" in title:
                     target_hwnds.append((hwnd, buf.value, pname))
             return True
 
-        CB_TYPE = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        CB_TYPE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [CB_TYPE, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
         user32.EnumWindows(CB_TYPE(_enum_cb), 0)
 
         for hwnd, title, pname in target_hwnds:
             # SW_RESTORE = 9
             user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
-            time.sleep(0.3)
+            time.sleep(0.4)
+            if user32.GetForegroundWindow() != hwnd:
+                # Windows refused the focus change; never type into another app.
+                continue
             # If requested, send Ctrl+R to reload UI (reloading drops the free-limit block screen)
-            if reload_first and ("desktop" in pname or "opencode.exe" in pname):
+            if reload_first and pname == "opencode.exe":
                 ps_reload = """
                 Add-Type -AssemblyName System.Windows.Forms
                 [System.Windows.Forms.SendKeys]::SendWait("^r")
@@ -154,6 +198,12 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
                     timeout=3.0,
                 )
                 time.sleep(1.2)
+                if user32.GetForegroundWindow() != hwnd:
+                    user32.ShowWindow(hwnd, 9)
+                    user32.SetForegroundWindow(hwnd)
+                    time.sleep(0.4)
+                    if user32.GetForegroundWindow() != hwnd:
+                        continue
 
             ps_send = """
             Add-Type -AssemblyName System.Windows.Forms
@@ -169,33 +219,27 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
     except Exception:
         pass
 
-    # 2. PowerShell WScript.Shell AppActivate fallback
-    ps = """
-    $ws = New-Object -ComObject WScript.Shell
-    $targets = @("OpenCode", "opencode", "ai.opencode")
-    $sent = $false
-    foreach ($t in $targets) {
-        if ($ws.AppActivate($t)) {
-            Start-Sleep -Milliseconds 300
-            $ws.SendKeys("^r")
-            Start-Sleep -Milliseconds 1200
-            $ws.SendKeys("continue{ENTER}")
-            $sent = $true
-            break
-        }
-    }
-    if ($sent) { Write-Output "SENT" } else { Write-Output "NOT_FOUND" }
-    """
+    return False
+
+
+def _dispatch_cli_resume(oc: str, sess: tuple[str, str, str] | None) -> bool:
+    """Start one CLI run that continues the newest session."""
+    if sess:
+        sess_id, directory, _title = sess
+        cmd = opencode_command(oc, ["run", "--session", sess_id, "continue"])
+        cwd = directory if (directory and os.path.isdir(directory)) else None
+    else:
+        cmd = opencode_command(oc, ["run", "--continue", "continue"])
+        cwd = None
+
     try:
-        CREATE_NO_WINDOW = 0x08000000
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        return "SENT" in res.stdout
+        kwargs: dict = {"cwd": cwd, "close_fds": True}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000 | 0x00000008
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+        return True
     except Exception:
         return False
 
@@ -205,50 +249,28 @@ def resume_active_session() -> tuple[bool, str]:
     if not is_auto_resume_enabled():
         return False, "Auto-resume is disabled."
 
-    # Step 1: Wipe client-side rate limit lockouts from drafts.sqlite
     cleared = clear_opencode_free_limit()
     details = []
     if cleared > 0:
         details.append(f"cleared {cleared} rate limit entries from database")
 
+    # Prefer the open Desktop window so the user sees the resumed session.
+    # Only fall back to a detached CLI run when no window is available; running
+    # both at once creates duplicate turns in the same session.
+    if send_continue_keystroke(reload_first=True):
+        details.append("sent reload and 'continue' to the OpenCode window")
+        return True, " | ".join(details)
+
     oc = find_opencode_cli()
-    sess = get_latest_session_info()
-    cli_dispatched = False
+    if oc:
+        sess = get_latest_session_info()
+        if _dispatch_cli_resume(oc, sess):
+            target = f"session {sess[0][:8]}..." if sess else "last session"
+            details.append(f"dispatched CLI continue to {target}")
+            return True, " | ".join(details)
 
-    # Step 2: Attempt CLI session resume if a session exists
-    if oc and sess:
-        sess_id, directory, title = sess
-        cmd = [oc, "run", "--session", sess_id, "continue"]
-        cwd = directory if (directory and os.path.isdir(directory)) else None
-        try:
-            kwargs = {"cwd": cwd, "close_fds": True}
-            if sys.platform == "win32":
-                kwargs["creationflags"] = 0x08000000 | 0x00000008
-            else:
-                kwargs["start_new_session"] = True
-            subprocess.Popen(cmd, **kwargs)
-            cli_dispatched = True
-            details.append(f"dispatched CLI resume to session {sess_id[:8]}... ({title or 'active'})")
-        except Exception as exc:
-            details.append(f"CLI resume attempt failed: {exc}")
-    elif oc:
-        try:
-            kwargs = {"close_fds": True}
-            if sys.platform == "win32":
-                kwargs["creationflags"] = 0x08000000 | 0x00000008
-            else:
-                kwargs["start_new_session"] = True
-            subprocess.Popen([oc, "run", "--continue", "continue"], **kwargs)
-            cli_dispatched = True
-            details.append("dispatched generic CLI continue")
-        except Exception:
-            pass
-
-    # Step 3: Also send keystroke to any interactive OpenCode GUI or terminal window
-    win_sent = send_continue_keystroke(reload_first=True)
-    if win_sent:
-        details.append("sent reload & keystroke 'continue' to active OpenCode window")
-
-    if cli_dispatched or win_sent or cleared > 0:
-        return True, " ✓ ".join(details)
+    if cleared > 0:
+        return False, (
+            " | ".join(details) + " but no OpenCode window or session was available"
+        )
     return False, "No active session or window found to resume."

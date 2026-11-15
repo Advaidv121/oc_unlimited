@@ -19,10 +19,12 @@ if (-not (Test-Path (Join-Path $SrcDir "avatar_ui.py"))) {
     $SrcDir = Join-Path $Root "windows"
 }
 $SpecWork = Join-Path $env:TEMP "ouc-avatar-build"
-$DistDir = $Root
+$StageDir = Join-Path $SpecWork "dist"
+
+. (Join-Path $Root "scripts\build_common.ps1")
 
 if (Test-Path $SpecWork) { Remove-Item $SpecWork -Recurse -Force -ErrorAction SilentlyContinue }
-New-Item -ItemType Directory -Force -Path $SpecWork | Out-Null
+New-Item -ItemType Directory -Force -Path $SpecWork, $StageDir | Out-Null
 
 $PyInstaller = Get-Command pyinstaller.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
 if (-not $PyInstaller) {
@@ -50,14 +52,20 @@ if (-not (Test-Path $IconPath)) {
     $IconPath = Join-Path $Root "windows\assets\avatar.ico"
 }
 
+$VersionFile = Join-Path $SpecWork "version_avatar.txt"
+New-OucVersionFile -Path $VersionFile -ExeName "OpencodeUnlimited-Avatar.exe" `
+    -Description "Opencode Unlimited Control Center"
+
 $ArgsList = @(
     "--noconfirm",
     "--clean",
     "--onefile",
     "--windowed",
+    "--noupx",
     "--name", "OpencodeUnlimited-Avatar",
     "--icon", $IconPath,
-    "--distpath", $DistDir,
+    "--version-file", $VersionFile,
+    "--distpath", $StageDir,
     "--workpath", (Join-Path $SpecWork "work"),
     "--specpath", $SpecWork,
     "--paths", $SrcDir,
@@ -119,15 +127,20 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller exited with code $LASTEXITCODE"
 }
 
-$OutExe = Join-Path $DistDir "OpencodeUnlimited-Avatar.exe"
-if (-not (Test-Path $OutExe)) {
-    throw "Expected output executable missing: $OutExe"
+$BuiltExe = Join-Path $StageDir "OpencodeUnlimited-Avatar.exe"
+if (-not (Test-Path $BuiltExe)) {
+    throw "Expected output executable missing: $BuiltExe"
 }
 
-# Copy executable into %LOCALAPPDATA%\opencode-unlimited\ and Desktop shortcut if installed
+Invoke-OucCodeSign -Path $BuiltExe | Out-Null
+
+$OutExe = Join-Path $Root "OpencodeUnlimited-Avatar.exe"
+Publish-OucExe -BuiltExe $BuiltExe -TargetExe $OutExe
+
+# Replace the installed copy atomically when the app is closed.
 $DestDir = Join-Path $env:LOCALAPPDATA "opencode-unlimited"
 if (Test-Path $DestDir) {
-    Copy-Item $OutExe (Join-Path $DestDir "OpencodeUnlimited-Avatar.exe") -Force
+    Publish-OucExe -BuiltExe $OutExe -TargetExe (Join-Path $DestDir "OpencodeUnlimited-Avatar.exe")
 }
 
 Remove-Item $SpecWork -Recurse -Force -ErrorAction SilentlyContinue

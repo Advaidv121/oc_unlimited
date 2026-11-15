@@ -1,4 +1,4 @@
-"""Zen Guard for Windows: watches OpenCode's log for quota walls and rotates /64."""
+"""Watches OpenCode's log for quota walls and rotates the active egress."""
 
 from __future__ import annotations
 
@@ -33,9 +33,9 @@ from ouc_common import (
 
 POLL_SECONDS = 10
 COOLDOWN_SECONDS = 75
-MAX_HOP_TRIES = 8
+MAX_HOP_TRIES = 4
 BLACKLIST_MAX = 200
-MAX_READ_BYTES = 50_000_000
+MAX_READ_BYTES = 4_000_000
 
 
 def _default_state(offset: int = 0) -> dict:
@@ -45,6 +45,10 @@ def _default_state(offset: int = 0) -> dict:
         "last_hop": 0,
         "hops": 0,
         "current": "",
+        "wall_pending": False,
+        "wall_seen": 0,
+        "last_ok_hop": 0,
+        "last_wait_log": 0,
     }
 
 
@@ -103,7 +107,7 @@ def _is_burnt(state: dict, addr: str) -> bool:
 
 
 def _read_new_log_bytes(state: dict) -> bool:
-    """Return True if a QuotaExceeded wall error appeared since the last offset."""
+    """Return True if a quota wall appeared since the last offset."""
     if not OPENCODE_LOG_FILE.is_file():
         return False
     try:
@@ -115,12 +119,13 @@ def _read_new_log_bytes(state: dict) -> bool:
     if size < offset:
         offset = 0
 
-    delta = size - offset
+    start = max(offset, size - MAX_READ_BYTES)
+    delta = size - start
     wall = False
-    if 0 < delta < MAX_READ_BYTES:
+    if delta > 0:
         try:
             with OPENCODE_LOG_FILE.open("rb") as fh:
-                fh.seek(offset)
+                fh.seek(start)
                 chunk = fh.read(delta).decode("utf-8", errors="replace")
             chunk_lower = chunk.lower()
             wall_patterns = (
@@ -129,20 +134,20 @@ def _read_new_log_bytes(state: dict) -> bool:
                 "quota_exceeded",
                 "free usage limit",
                 "free usage exceeded",
+                "free-tier usage limit",
+                "usage limit reached",
+                "exceeded your current quota",
+                "credits exhausted",
                 "rate limit exceeded",
                 "rate_limit_exceeded",
+                "rate limited",
+                "ratelimited",
+                "resource_exhausted",
                 "429 too many requests",
-                "free-tier usage limit",
-                "too many requests",
-                "exceeded your current quota",
-                "usage limit reached",
-                "credits exhausted",
                 "status=429",
                 "status: 429",
                 "status 429",
                 "code=429",
-                "resource_exhausted",
-                "ratelimit",
             )
             if any(p in chunk_lower for p in wall_patterns):
                 wall = True
@@ -150,11 +155,14 @@ def _read_new_log_bytes(state: dict) -> bool:
             pass
 
     state["offset"] = size
+    if wall:
+        state["wall_pending"] = True
+        state["wall_seen"] = int(time.time())
     _save_state(state)
     return wall
 
 
-def _rotate(state: dict, warp_bin: str | None) -> None:
+def _rotate(state: dict, warp_bin: str | None) -> bool:
     now = int(time.time())
 
     # Detect active egress mode
@@ -173,13 +181,16 @@ def _rotate(state: dict, warp_bin: str | None) -> None:
             ok, msg = rotate_tor_circuit()
             state["last_hop"] = now
             state["hops"] = int(state.get("hops", 0) or 0) + 1
+            if ok:
+                state["last_ok_hop"] = now
             _save_state(state)
             append_log(GUARD_LOG_FILE, f"Tor rotated #{state['hops']}: {msg}")
-            _dispatch_auto_resume()
-            return
+            if ok:
+                _dispatch_auto_resume()
+            return ok
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"Tor rotation error: {exc}")
-            return
+            return False
 
     # 2. Custom Proxy mode: cycle proxy node in pool
     if mode == "custom":
@@ -189,33 +200,45 @@ def _rotate(state: dict, warp_bin: str | None) -> None:
             ok, msg = rotate_custom_proxy()
             state["last_hop"] = now
             state["hops"] = int(state.get("hops", 0) or 0) + 1
+            if ok:
+                state["last_ok_hop"] = now
             _save_state(state)
             append_log(GUARD_LOG_FILE, f"Custom proxy rotated #{state['hops']}: {msg}")
-            _dispatch_auto_resume()
-            return
+            if ok:
+                _dispatch_auto_resume()
+            return ok
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"Custom proxy rotation error: {exc}")
             state["last_hop"] = now
             state["hops"] = int(state.get("hops", 0) or 0) + 1
             _save_state(state)
-            return
+            return False
 
     # 3. WARP / Clean Endpoint mode: rotate IPv6 /64 subnet
     if not warp_bin:
         append_log(GUARD_LOG_FILE, "wall detected but warp-cli is not installed for WARP rotation")
-        return
+        return False
 
-    old_v6 = get_egress_v6(timeout=8.0) or (get_warp_local_v6() or "")
+    old_v6 = (
+        get_egress_v6(timeout=8.0)
+        or (get_warp_local_v6() or "")
+        or str(state.get("current", ""))
+    )
     append_log(GUARD_LOG_FILE, f"wall detected — rotating WARP /64 (was: {old_v6 or '?'})")
     _blacklist_add(state, old_v6)
     _save_state(state)
 
     new_v6 = ""
-    with keeper_pause_ctx("zen-guard", seconds=300):
+    with keeper_pause_ctx("zen-guard", seconds=600):
+        avoid = {str(x) for x in state.get("blacklist", []) if x}
         for attempt in range(1, MAX_HOP_TRIES + 1):
-            cand = hop_once(warp_bin)
+            cand = hop_once(
+                warp_bin,
+                avoid_prefixes=avoid,
+                previous=old_v6,
+            )
             if not cand:
-                append_log(GUARD_LOG_FILE, f"try {attempt}: tunnel repair failed")
+                append_log(GUARD_LOG_FILE, f"try {attempt}: rotation produced no fresh /64")
                 continue
             if _is_burnt(state, cand):
                 append_log(
@@ -228,7 +251,11 @@ def _rotate(state: dict, warp_bin: str | None) -> None:
 
         if not new_v6:
             append_log(GUARD_LOG_FILE, "everything blacklisted — recycling oldest block")
-            cand = hop_once(warp_bin)
+            cand = hop_once(
+                warp_bin,
+                avoid_prefixes=set(),
+                previous=old_v6,
+            )
             if cand:
                 new_v6 = cand
 
@@ -236,20 +263,23 @@ def _rotate(state: dict, warp_bin: str | None) -> None:
     if new_v6:
         state["current"] = new_v6
         state["hops"] = int(state.get("hops", 0) or 0) + 1
+        state["last_ok_hop"] = now
         _save_state(state)
-        append_log(GUARD_LOG_FILE, f"rotated #{state['hops']}: {old_v6} -> {new_v6} ✓")
+        append_log(GUARD_LOG_FILE, f"rotated #{state['hops']}: {old_v6} -> {new_v6}")
         try:
             from ouc_common import LANE_DIR
             (LANE_DIR / "edge_reroll").write_text(str(time.time()), encoding="utf-8")
         except Exception:
             pass
         _dispatch_auto_resume()
-    else:
-        _save_state(state)
-        append_log(
-            GUARD_LOG_FILE,
-            "rotation failed — keeper will keep the tunnel alive, retrying next wall",
-        )
+        return True
+
+    _save_state(state)
+    append_log(
+        GUARD_LOG_FILE,
+        "rotation failed — keeper keeps the tunnel alive; retrying after cooldown",
+    )
+    return False
 
 
 def main() -> int:
@@ -268,19 +298,37 @@ def main() -> int:
     while True:
         time.sleep(POLL_SECONDS)
         try:
+            state = _load_state()
             wall = _read_new_log_bytes(state)
-            if not wall:
+            if not wall and not state.get("wall_pending"):
                 continue
+
             now = int(time.time())
             last_hop = int(state.get("last_hop", 0) or 0)
+            last_ok = int(state.get("last_ok_hop", 0) or 0)
+            seen = int(state.get("wall_seen", 0) or 0)
+            if seen and seen <= last_ok:
+                # The wall came from the session that was already rotated.
+                state["wall_pending"] = False
+                _save_state(state)
+                continue
+
             age = now - last_hop
             if age >= COOLDOWN_SECONDS:
-                _rotate(state, warp_bin)
+                state["wall_pending"] = False
+                _save_state(state)
+                if not _rotate(state, warp_bin):
+                    state["wall_pending"] = True
+                    _save_state(state)
             else:
-                append_log(
-                    GUARD_LOG_FILE,
-                    f"wall seen but in cooldown ({age}s < {COOLDOWN_SECONDS}s) — waiting",
-                )
+                last_log = int(state.get("last_wait_log", 0) or 0)
+                if now - last_log >= 60:
+                    append_log(
+                        GUARD_LOG_FILE,
+                        f"wall queued — waiting out cooldown ({age}s < {COOLDOWN_SECONDS}s)",
+                    )
+                    state["last_wait_log"] = now
+                    _save_state(state)
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"guard error: {exc}")
 

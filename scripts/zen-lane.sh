@@ -1,18 +1,15 @@
 #!/bin/bash
-# zen lane — the actual trick.
+# zen lane — launches OpenCode with a pinned IPv6 egress.
 #
-# opencode's free wall is keyed on what their server sees:
-#   (your IPv6 /64 block) x (which cloudflare edge you land on)
-# warp gives you a fresh /64 on every registration, and opencode.ai has
-# several IPv6 edges. so:
-#   - pin opencode.ai to ONE random edge from the live AAAA pool (per launch)
-#   - force the request out over IPv6 (AAAA-only bind inside a namespace)
-#   - fresh random machine-id for good measure
-# every launch = fresh combo = fresh quota bucket.
+# OpenCode's free-tier limit is applied to the public IP address the server
+# sees. WARP provides an IPv6 /64, and opencode.ai has several IPv6 edges.
+# This launcher:
+#   - pins opencode.ai to one edge from the live AAAA pool per launch
+#   - forces the request over IPv6
+#   - uses a temporary machine-id inside a mount namespace
 #
-# all of this happens inside a mount namespace (unshare). your real
-# /etc/hosts and /etc/machine-id are never touched. process dies →
-# namespace evaporates → no trace.
+# The namespace is removed when the process exits. The real /etc/hosts and
+# /etc/machine-id are not modified.
 set -u
 
 REAL="${OUC_REAL_BIN:-$HOME/.opencode/bin/opencode}"

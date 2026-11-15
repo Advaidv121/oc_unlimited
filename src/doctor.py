@@ -17,7 +17,7 @@ from ouc_common import (
     TASK_KEEPER,
     find_opencode_cli,
     find_warp_cli,
-    get_egress_v6,
+    get_egress_ip,
     get_warp_local_v6,
     is_cloudflare_v6,
     normalize_v6_64,
@@ -113,7 +113,7 @@ def main() -> int:
 
     elif mode == "custom":
         try:
-            from proxy_chain import get_current_custom_proxy, parse_proxy_list
+            from proxy_chain import get_current_custom_proxy
             phost, pport, idx, total = get_current_custom_proxy()
             _ok(f"custom proxy pool active: node #{idx+1}/{total} ({phost}:{pport})")
         except Exception as exc:
@@ -130,17 +130,15 @@ def main() -> int:
                 mode_tag = f" (mode: {warp_m})" if warp_m else ""
                 _ok(f"warp tunnel: connected{mode_tag}")
             else:
-                _bad(f"warp not connected ({raw or 'unknown'}) — run: opencode-unlimited-hop or click Auto-Heal in app")
+                _bad(f"warp not connected ({raw or 'unknown'}) — run opencode-unlimited-hop, or reconnect WARP from the dashboard")
 
         if warp_scope == "isolated":
             try:
                 from tor_manager import test_socks5_alive
                 if test_socks5_alive(40000, host="127.0.0.1"):
                     _ok("WARP isolated SOCKS5 proxy: active on 127.0.0.1:40000 (app-only mode)")
-                elif connected:
-                    _ok("WARP running in Full TUN mode (adapter-bound IPv6 active) — port 40000 proxy bypassed")
                 else:
-                    _warn("WARP isolated port 40000 not responding — click Auto-Heal or Rotate in app")
+                    _warn("WARP isolated port 40000 not responding — reconnect WARP or switch the scope to Full TUN")
             except Exception:
                 pass
         else:
@@ -151,15 +149,18 @@ def main() -> int:
                 _warn("CloudflareWARP adapter IPv6 missing — switch to App-Only (Isolated) mode or check WARP TUN adapter")
 
     # 4. External egress check
-    egress = get_egress_v6(timeout=8.0)
+    egress = get_egress_ip(timeout=8.0)
     if egress:
-        prefix = normalize_v6_64(egress)
-        if is_cloudflare_v6(egress):
-            _ok(f"egress is cloudflare (warp): {prefix}/64")
+        if ":" in egress:
+            prefix = normalize_v6_64(egress)
+            if is_cloudflare_v6(egress):
+                _ok(f"egress is cloudflare (warp): {prefix}/64")
+            else:
+                _ok(f"egress IPv6 verified: {egress}")
         else:
-            _ok(f"egress IP verified: {egress}")
+            _ok(f"egress IPv4 verified: {egress} ({mode.upper()})")
     else:
-        _warn("no external egress check response (offline, tunnel still connecting, or IPv4 only)")
+        _warn("no external egress check response (offline, tunnel still connecting, or proxy unavailable)")
 
     # 5. Guard status
     if _is_mutex_held("OpencodeUnlimitedGuard"):

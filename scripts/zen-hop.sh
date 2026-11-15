@@ -1,11 +1,10 @@
 #!/bin/bash
-# zen hop — manual identity rotation. deletes the current warp registration,
-# registers fresh, reconnects. you land on a new IPv6 /64 (= new quota bucket).
+# zen hop — manual identity rotation. renews the WireGuard session keys and
+# reconnects to obtain a new IPv6 /64. the device registration is kept.
 #
-# the keeper is paused during the hop — otherwise its 45s tick races us and
-# "helpfully" repairs the tunnel mid-surgery. the kill-switch chain stays
-# installed the whole time (keeper owns it but doesn't remove it on stop),
-# so there is no leak window. keeper resumes on exit no matter what.
+# the keeper is paused during the hop so its tick cannot reconnect the tunnel
+# in the middle of the rotation. The kill-switch chain stays installed the
+# whole time, and the keeper resumes when the hop exits.
 set -u
 
 # warp binary: env → PATH → common fallbacks. probe with/without --accept-tos
@@ -32,12 +31,24 @@ if [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ] || [ -n "${SSH_CONNECTION:-
 fi
 
 cur_v6(){
+  local v ep
   if [ "$IS_VPS" = "1" ]; then
-    timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 https://api64.ipify.org 2>/dev/null || timeout 10 curl -x http://127.0.0.1:41987 -s -m 8 https://api64.ipify.org 2>/dev/null
+    for ep in https://api6.ipify.org https://api64.ipify.org; do
+      v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 "$ep" 2>/dev/null)
+      case "$v" in *:*) echo "$v"; return;; esac
+    done
+    v=$(timeout 10 curl -x http://127.0.0.1:41987 -s -m 8 https://api6.ipify.org 2>/dev/null)
+    case "$v" in *:*) echo "$v"; return;; esac
   else
-    timeout 10 curl -s -m 8 https://api64.ipify.org 2>/dev/null
+    for ep in https://api6.ipify.org https://api64.ipify.org; do
+      v=$(timeout 10 curl -6 -s -m 8 "$ep" 2>/dev/null)
+      case "$v" in *:*) echo "$v"; return;; esac
+    done
   fi
+  echo ""
 }
+
+m64(){ echo "$1" | cut -d: -f1-4; }
 
 OLD_V6=$(cur_v6)
 echo "old /64: ${OLD_V6:-?}"
@@ -45,13 +56,16 @@ echo "old /64: ${OLD_V6:-?}"
 sudo systemctl stop "$KEEPER" >/dev/null 2>&1
 echo "-- rotating (keeper paused) --"
 w disconnect
-w registration delete
-NEW=0
-for i in 1 2 3 4 5; do
-  w registration new && { NEW=1; break; }
-  echo "  attempt $i failed"; sleep 8
-done
-[ "$NEW" = 1 ] || { echo "-- registration failed — keeper will keep retrying --"; exit 1; }
+
+# Recreate a registration only when it is actually missing.
+if ! wo registration show >/dev/null 2>&1; then
+  for i in 1 2 3; do
+    w registration new && break
+    echo "  registration attempt $i failed"; sleep 6
+  done
+fi
+
+w tunnel rotate-keys
 if [ "$IS_VPS" = "1" ]; then
   w mode proxy
   w proxy port 40000
@@ -60,20 +74,29 @@ else
 fi
 w connect
 
+NEW_V6=""
 for i in $(seq 1 20); do
   sleep 3
-  wo status | head -1 | grep -q Connected && break
+  wo status | head -1 | grep -q Connected || continue
+  V=$(cur_v6)
+  case "$V" in
+    *:*)
+      if [ -z "$OLD_V6" ] || [ "$(m64 "$V")" != "$(m64 "$OLD_V6")" ]; then
+        NEW_V6="$V"
+        break
+      fi
+      ;;
+  esac
 done
 
-NEW_V6=$(cur_v6)
 echo "new /64: ${NEW_V6:-?}"
-if [ "$NEW_V6" != "$OLD_V6" ] && [ -n "$NEW_V6" ]; then
+if [ -n "$NEW_V6" ]; then
   # Clear client-side rate limit lockouts from drafts.sqlite
   for db in "$HOME/.config/ai.opencode.desktop/drafts.sqlite" "$HOME/.local/share/opencode/drafts.sqlite"; do
-    [ -f "$db" ] && sqlite3 "$db" "DELETE FROM state WHERE key IN ('free-limit', 'go-upsell') OR key LIKE '%free%limit%' OR key LIKE '%quota%exceeded%' OR key LIKE '%upsell%';" >/dev/null 2>&1 || true
+    [ -f "$db" ] && sqlite3 "$db" "DELETE FROM state WHERE key IN ('free-limit', 'go-upsell', 'free_usage_limit', 'usage_limit', 'quota_exceeded');" >/dev/null 2>&1 || true
   done
-  echo "== FRESH /64 ✓ — re-send your message =="
+  echo "new /64 prefix accepted; re-send your message."
   exit 0
 fi
-echo "== cloudflare handed back the same block — run me again =="
+echo "Cloudflare returned the same /64 block; run the command again."
 exit 1

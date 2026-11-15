@@ -847,7 +847,7 @@
            data-tip-title="External IPv6 Egress (/64 Bucket)"
            data-tip-body="Your public IPv6 exit seen by opencode.ai. Free model limits are keyed to your /64 network block + Cloudflare edge. Click to copy full IPv6.">
         <div class="stat-label">
-          <span>Public WARP /64</span>
+          <span id="cardEgressLabel">Public WARP /64</span>
           <span id="egressTag" class="tag">...</span>
         </div>
         <div id="egressPrefix" class="stat-value">Checking...</div>
@@ -857,10 +857,10 @@
       </div>
 
       <div class="card" id="cardAdapter" style="cursor:pointer"
-           data-tip-title="CloudflareWARP Adapter IPv6"
-           data-tip-body="Local IPv6 address on the Windows CloudflareWARP WinTun interface. zen-proxy explicitly binds every socket to this IP so traffic physically cannot exit via Wi-Fi/Ethernet ISP.">
+           data-tip-title="Active Egress Interface / Proxy Node"
+           data-tip-body="Egress tunnel interface or local proxy node. zen-proxy explicitly routes sockets through this interface to prevent ISP tracking.">
         <div class="stat-label">
-          <span>WARP Adapter IP</span>
+          <span id="cardAdapterLabel">WARP Adapter IP</span>
           <span id="warpModeTag" class="tag">...</span>
         </div>
         <div id="adapterV6" class="stat-value">---</div>
@@ -1154,13 +1154,21 @@
     const ln = s.lane;
     const st = s.stats;
 
-    // Header pill
+    // Header pill & Egress Mode
     const pillDot = $("overallDot");
     const pillTxt = $("overallText");
+    const egressMode = (state.egress && state.egress.mode) ? state.egress.mode : "warp";
     const isProxyMode = (w.mode || "").toLowerCase().includes("proxy") || (state.egress && state.egress.warp_scope === "isolated");
+
     if (w.rotating) {
       pillDot.className = "dot spin";
       pillTxt.textContent = "ROTATING /64...";
+    } else if (egressMode === "custom") {
+      pillDot.className = "dot ok";
+      pillTxt.textContent = `PROTECTED • CUSTOM PROXY (${(state.egress.custom_type || "SOCKS5").toUpperCase()})`;
+    } else if (egressMode === "tor") {
+      pillDot.className = "dot ok";
+      pillTxt.textContent = "PROTECTED • TOR NETWORK (3-HOP)";
     } else if (w.connected && (w.is_cf || (w.adapter_v6 && !w.egress_v6))) {
       pillDot.className = "dot ok";
       pillTxt.textContent = isProxyMode ? "PROTECTED • WARP (APP-ONLY)" : "PROTECTED • WARP IPv6";
@@ -1176,24 +1184,52 @@
     $("btnWarpToggle").textContent = w.connected ? "Disconnect WARP" : "Connect WARP";
 
     // Card 1: Egress
-    if (w.egress_v6) {
+    const card1Label = $("cardEgressLabel");
+    if (egressMode === "custom") {
+      if (card1Label) card1Label.textContent = "Custom Proxy Egress";
+      $("egressPrefix").textContent = state.egress.custom_current_node || state.egress.custom_proxy || "127.0.0.1:10808";
+      $("egressFull").textContent = w.egress_v6 ? `Exit IP: ${w.egress_v6}` : "Routing through local proxy pool";
+      setTag($("egressTag"), "Proxy Active", "ok");
+    } else if (egressMode === "tor") {
+      if (card1Label) card1Label.textContent = "Tor Network Egress";
+      $("egressPrefix").textContent = state.egress.tor_target || "127.0.0.1:9050";
+      $("egressFull").textContent = w.egress_v6 ? `Exit IP: ${w.egress_v6}` : "Tor 3-Hop Circuit Active";
+      setTag($("egressTag"), "Tor Active", "ok");
+    } else if (w.egress_v6) {
+      if (card1Label) card1Label.textContent = "Public WARP /64";
       $("egressPrefix").textContent = (w.egress_prefix || w.egress_v6) + "/64";
       $("egressFull").textContent = w.egress_v6;
       setTag($("egressTag"), w.is_cf ? "CF Verified" : "Non-WARP!", w.is_cf ? "ok" : "bad");
     } else if (w.checking_egress) {
+      if (card1Label) card1Label.textContent = "Public WARP /64";
       $("egressPrefix").textContent = "Checking...";
       $("egressFull").textContent = "Querying api64.ipify.org...";
       setTag($("egressTag"), "Probing", "warn");
     } else {
+      if (card1Label) card1Label.textContent = "Public WARP /64";
       $("egressPrefix").textContent = w.connected ? "No IPv6 response" : "Offline (Blocked)";
       $("egressFull").textContent = w.connected ? "Click Refresh to re-probe" : "Fail-closed active";
       setTag($("egressTag"), w.connected ? "Pending" : "Closed", w.connected ? "warn" : "bad");
     }
 
-    // Card 2: Adapter IPv6
-    $("adapterV6").textContent = w.adapter_v6 || (isProxyMode ? "Proxy (Port 40000)" : "Not active");
-    setTag($("warpModeTag"), (w.mode || "?").toUpperCase(), w.mode.toLowerCase().includes("warp") ? "ok" : "warn");
-    $("adapterSub").textContent = w.adapter_v6 ? "Socket-bound fail-closed" : (isProxyMode ? "App-Only Isolated Proxy (No NIC Needed)" : "Waiting for CloudflareWARP NIC");
+    // Card 2: Adapter / Node Details
+    const card2Label = $("cardAdapterLabel");
+    if (egressMode === "custom") {
+      if (card2Label) card2Label.textContent = "Proxy Node Details";
+      $("adapterV6").textContent = state.egress.custom_proxy || "127.0.0.1:10808";
+      setTag($("warpModeTag"), (state.egress.custom_type || "SOCKS5").toUpperCase(), "ok");
+      $("adapterSub").textContent = `Pool: ${state.egress.custom_pool_count || 1} node(s) • Auto-cycle on rate limit`;
+    } else if (egressMode === "tor") {
+      if (card2Label) card2Label.textContent = "Tor Daemon Status";
+      $("adapterV6").textContent = state.egress.tor_target || "127.0.0.1:9050";
+      setTag($("warpModeTag"), "TOR SOCKS5", "ok");
+      $("adapterSub").textContent = "Control Port 9051 • Auto NEWNYM on Rate Limits";
+    } else {
+      if (card2Label) card2Label.textContent = "WARP Adapter IP";
+      $("adapterV6").textContent = w.adapter_v6 || (isProxyMode ? "Proxy (Port 40000)" : "Not active");
+      setTag($("warpModeTag"), (w.mode || "?").toUpperCase(), w.mode.toLowerCase().includes("warp") ? "ok" : "warn");
+      $("adapterSub").textContent = w.adapter_v6 ? "Socket-bound fail-closed" : (isProxyMode ? "App-Only Isolated Proxy (No NIC Needed)" : "Waiting for CloudflareWARP NIC");
+    }
 
     // Card 3: Pinned Edge & dropdown
     $("pinnedEdge").textContent = ln.pinned_edge || (ln.edge_override !== "auto" ? ln.edge_override : "Auto (next request)");

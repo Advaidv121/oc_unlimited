@@ -634,23 +634,39 @@ def fetch_opencode_aaaa_pool() -> list[str]:
 
 
 def hop_once(warp_bin: str, max_reg_tries: int = 3) -> str:
-    """Perform one WARP registration rotation and return the new external IPv6."""
+    """Perform one WARP rotation and return the new external IPv6."""
+    # 1. Gentle non-destructive rotation first: rotate cryptographic keys & reset endpoint.
+    # This forces Cloudflare Anycast to negotiate a new peer session WITHOUT wiping the account/device registration!
+    run_warp(["tunnel", "rotate-keys"], warp_bin=warp_bin)
+    run_warp(["tunnel", "endpoint", "reset"], warp_bin=warp_bin)
     run_warp(["disconnect"], warp_bin=warp_bin)
-    time.sleep(0.8)
-    run_warp(["registration", "delete"], warp_bin=warp_bin)
-    time.sleep(0.8)
+    time.sleep(1.0)
+    run_warp(["connect"], warp_bin=warp_bin)
 
-    registered = False
-    for attempt in range(max_reg_tries):
-        rc, _ = run_warp(["registration", "new"], warp_bin=warp_bin)
-        if rc == 0:
-            registered = True
-            break
-        if attempt + 1 < max_reg_tries:
-            time.sleep(6)
+    for _ in range(8):
+        time.sleep(1.5)
+        connected, _, _ = warp_status(warp_bin)
+        if connected:
+            v6 = get_egress_v6(timeout=5.0)
+            if v6:
+                return v6
+            local_v6 = get_warp_local_v6()
+            if local_v6 and is_cloudflare_v6(local_v6):
+                return local_v6
 
-    if not registered:
-        return ""
+    # 2. Only if the client is not connected AND registration is explicitly missing:
+    connected, _, raw_status = warp_status(warp_bin)
+    raw_lower = (raw_status or "").lower()
+    if not connected and ("registration missing" in raw_lower or "not registered" in raw_lower):
+        registered = False
+        for attempt in range(max_reg_tries):
+            rc, _ = run_warp(["registration", "new"], warp_bin=warp_bin)
+            if rc == 0:
+                registered = True
+                break
+            time.sleep(4)
+        if not registered:
+            return ""
 
     default_scope = "tun" if sys.platform == "win32" else "isolated"
     scope = default_scope
@@ -660,21 +676,17 @@ def hop_once(warp_bin: str, max_reg_tries: int = 3) -> str:
     except Exception:
         pass
 
-    time.sleep(1.2)
     if scope == "isolated":
         run_warp(["proxy", "port", "40000"], warp_bin=warp_bin)
         run_warp(["mode", "proxy"], warp_bin=warp_bin)
     else:
         run_warp(["mode", "warp"], warp_bin=warp_bin)
-    time.sleep(0.5)
     run_warp(["connect"], warp_bin=warp_bin)
 
-    for idx in range(12):
-        time.sleep(3)
+    for idx in range(8):
+        time.sleep(2)
         connected, _, _ = warp_status(warp_bin)
         if not connected:
-            if idx in (2, 5):
-                run_warp(["connect"], warp_bin=warp_bin)
             continue
         v6 = get_egress_v6(timeout=5.0)
         if v6:

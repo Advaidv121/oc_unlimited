@@ -70,7 +70,7 @@ from ouc_common import (
 )
 from ouc_firewall import install_killswitch, is_killswitch_installed, remove_killswitch
 
-WINDOW_TITLE = "Opencode Unlimited v2.4.2 — Made by Avatar"
+WINDOW_TITLE = "Opencode Unlimited v3.0 — Made by Avatar"
 DETACHED_PROCESS = 0x00000008
 _WORKER_FILES = (
     "ouc_common.py",
@@ -212,7 +212,7 @@ def _probe_http(url: str, proxy: str | None, timeout: float = PROBE_TIMEOUT) -> 
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "opencode-unlimited-probe/2.4.2",
+            "User-Agent": "opencode-unlimited-probe/3.0",
             "Cache-Control": "no-cache",
             "Accept": "*/*",
         },
@@ -1016,6 +1016,21 @@ class AvatarControlApi:
                     "start_tor" if mode == "tor" else "hop" if mode == "custom" else "repair_warp",
                     "Try" if mode in ("tor", "custom") else "Repair",
                 )
+
+        stream_resets = int(proxy.get("stream_resets_5m", 0) or 0)
+        if proxy_listening and stream_resets >= 2 and not fallback_active:
+            fix = "start_tor" if mode == "tor" else "hop"
+            label = "Restart Tor" if mode == "tor" else "Rotate route"
+            add(
+                "warn",
+                "Response streams keep dropping",
+                f"{stream_resets} live response stream{'s' if stream_resets != 1 else ''} "
+                "were cut in the last five minutes. A flaky edge or a provider-side idle "
+                "timeout can do this; the route itself is still up. Rotate to move to a "
+                "fresh exit, or switch to Tor if it keeps happening.",
+                fix,
+                label,
+            )
 
         if net_errors and proxy_listening and not fallback_active and code not in (
             "upstream",

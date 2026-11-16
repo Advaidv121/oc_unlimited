@@ -7,10 +7,11 @@
 set -u
 
 BRAND="opencode-unlimited"
-DEST="$HOME/.local/share/$BRAND"
+DEST="${XDG_DATA_HOME:-$HOME/.local/share}/$BRAND"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 UNIT_KEEPER="/etc/systemd/system/${BRAND}-keeper.service"
 UNIT_GUARD="$HOME/.config/systemd/user/${BRAND}-guard.service"
-SHIM="$HOME/.local/bin/opencode"
+SHIM="$BIN_DIR/opencode"
 SUDOERS_FILE="/etc/sudoers.d/$BRAND"
 REPO="https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-"
 RAW="https://raw.githubusercontent.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-/main"
@@ -25,7 +26,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
 
 echo ""
 echo "  ==================================================="
-echo "  Opencode Unlimited Usage (Linux v2.4.2)"
+echo "  Opencode Unlimited Usage (Linux v3.0)"
 echo "  Created & Maintained by Avatar (ShadowySphinX)"
 echo "  ==================================================="
 echo ""
@@ -68,10 +69,16 @@ fi
 
 # ---------------------------------------------------------------- opencode CLI
 OC_REAL=""
-if [ -x "$HOME/.opencode/bin/opencode" ]; then
+if [ -x "$DEST/real-opencode" ]; then
+  OC_REAL="$DEST/real-opencode"
+elif [ -x "$HOME/.opencode/bin/opencode" ]; then
   OC_REAL="$HOME/.opencode/bin/opencode"
 elif command -v opencode >/dev/null 2>&1; then
-  OC_REAL="$(command -v opencode)"
+  CANDIDATE="$(command -v opencode)"
+  # A reinstall must never copy our shim onto itself.
+  if ! { [ "$(readlink -f "$CANDIDATE" 2>/dev/null)" = "$(readlink -f "$SHIM" 2>/dev/null)" ] && grep -qs "zen-lane" "$CANDIDATE"; }; then
+    OC_REAL="$CANDIDATE"
+  fi
 fi
 if [ -z "$OC_REAL" ]; then
   say "opencode CLI not found — installing (official installer)"
@@ -153,7 +160,7 @@ sw(){  sudo -n "$WARP" --accept-tos "$@" >/dev/null 2>&1 && return 0; sudo -n "$
 swo(){ sudo -n "$WARP" --accept-tos "$@" 2>/dev/null && return 0; sudo -n "$WARP" "$@" 2>/dev/null; }
 
 # ---------------------------------------------------------------- scripts
-mkdir -p "$DEST/scripts" "$HOME/.local/bin"
+mkdir -p "$DEST/scripts" "$DEST/python" "$BIN_DIR"
 if [ -n "$SRC" ]; then
   cp "$SRC/scripts/"*.sh "$DEST/scripts/"
 else
@@ -164,21 +171,41 @@ else
 fi
 chmod +x "$DEST/scripts/"*.sh
 
+# The Linux lane runs the same hardened HTTP CONNECT proxy as Windows. Bun
+# ignores socks5:// proxy variables, so this proxy is what actually carries
+# OpenCode traffic through WARP's local SOCKS listener.
+PY_MODULES="ouc_common.py zen_proxy.py proxy_chain.py tor_manager.py"
+if [ -n "$SRC" ]; then
+  for f in $PY_MODULES; do
+    cp "$SRC/src/$f" "$DEST/python/$f" || die "could not install $f"
+  done
+else
+  for f in $PY_MODULES; do
+    curl -fsSL "$RAW/src/$f" -o "$DEST/python/$f" || die "could not fetch $f"
+  done
+fi
+chmod 644 "$DEST/python/"*.py
+
 # scripts pick the warp binary themselves (OUC_WARP_BIN env if the service
 # provides one, else standard paths). no baking — sed-editing scripts after
 # download is how you ship a broken script.
 # hop + doctor on PATH
-ln -sf "$DEST/scripts/zen-hop.sh" "$HOME/.local/bin/${BRAND}-hop"
-ln -sf "$DEST/scripts/doctor.sh"  "$HOME/.local/bin/${BRAND}-doctor"
-ok "scripts in $DEST"
+ln -sf "$DEST/scripts/zen-hop.sh" "$BIN_DIR/${BRAND}-hop"
+ln -sf "$DEST/scripts/doctor.sh"  "$BIN_DIR/${BRAND}-doctor"
+ok "scripts and lane proxy in $DEST"
 
-# ---------------------------------------------------------------- sudoers (warp-cli for the unattended guard, read-only iptables
-# verification for the doctor). the iptables entries are exact-args matches —
-# list-only, sudoers will not accept anything else from that rule.
-SUDOERS_NEED="$USER ALL=(root) NOPASSWD: $WARP, /usr/sbin/iptables -nL OUC_LEAKGUARD, /usr/sbin/ip6tables -nL OUC_LEAKGUARD"
+# ---------------------------------------------------------------- sudoers (warp-cli for the unattended guard, exact keeper
+# stop/start for rotation, read-only iptables verification for the doctor).
+# Each entry is an exact-args match; sudoers will not accept anything else.
+IPTABLES="$(command -v iptables 2>/dev/null || true)"
+IP6TABLES="$(command -v ip6tables 2>/dev/null || true)"
+SYSTEMCTL="$(command -v systemctl 2>/dev/null || echo /usr/bin/systemctl)"
+SUDOERS_NEED="$USER ALL=(root) NOPASSWD: $WARP, $SYSTEMCTL stop $BRAND-keeper, $SYSTEMCTL start $BRAND-keeper"
+[ -n "$IPTABLES" ]  && SUDOERS_NEED="$SUDOERS_NEED, $IPTABLES -nL OUC_LEAKGUARD"
+[ -n "$IP6TABLES" ] && SUDOERS_NEED="$SUDOERS_NEED, $IP6TABLES -nL OUC_LEAKGUARD"
 SUDOERS_NOW="$(sudo -n cat "$SUDOERS_FILE" 2>/dev/null || echo '')"
 if [ "$SUDOERS_NOW" != "$SUDOERS_NEED" ]; then
-  say "sudoers: passwordless warp-cli + read-only kill-switch verify"
+  say "sudoers: passwordless warp-cli, keeper rotation, kill-switch verify"
   printf '%s\n' "$SUDOERS_NEED" | sudo tee "$SUDOERS_FILE" >/dev/null
   sudo chmod 440 "$SUDOERS_FILE"
   sudo visudo -c >/dev/null 2>&1 || { sudo rm -f "$SUDOERS_FILE"; die "sudoers validation failed — rerun the installer"; }
@@ -226,6 +253,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=OUC_DEST=$DEST
+Environment=OUC_WARP_MODE=proxy
+Environment=OUC_PAUSE_FILE=$DEST/keeper.pause
 ExecStart=/bin/bash $DEST/scripts/warp-keeper.sh
 Restart=always
 RestartSec=10
@@ -242,6 +272,13 @@ systemctl is-active ${BRAND}-keeper 2>/dev/null | grep -q active \
   || die "keeper did not start — check: systemctl status ${BRAND}-keeper"
 
 # ---------------------------------------------------------------- guard (user service)
+# Keep the user guard alive after SSH logs out; otherwise rotation stops on a
+# headless VPS while the root keeper keeps running.
+if command -v loginctl >/dev/null 2>&1; then
+  sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1 \
+    || say "could not enable lingering — run: sudo loginctl enable-linger $USER"
+fi
+
 mkdir -p "$HOME/.config/systemd/user"
 cat > "$UNIT_GUARD" <<EOF
 [Unit]
@@ -249,6 +286,9 @@ Description=Opencode Unlimited — zen guard (wall watcher, auto /64 rotation)
 After=network-online.target
 
 [Service]
+Environment=OUC_DEST=$DEST
+Environment=OUC_WARP_MODE=proxy
+Environment=OUC_PAUSE_FILE=$DEST/keeper.pause
 Environment=OUC_KEEPER_UNIT=${BRAND}-keeper
 Environment=OUC_WARP_BIN=$WARP
 ExecStart=/bin/bash $DEST/scripts/zen-guard.sh
@@ -265,28 +305,30 @@ systemctl --user is-active ${BRAND}-guard 2>/dev/null | grep -q active \
   || die "guard did not start — check: systemctl --user status ${BRAND}-guard"
 
 # ---------------------------------------------------------------- TUI shim (the lane)
-if [ "$OC_REAL" = "$SHIM" ]; then
-  cp "$SHIM" "$DEST/real-opencode" && OC_REAL="$DEST/real-opencode"
+if [ "$OC_REAL" = "$SHIM" ] || [ "$(readlink -f "$OC_REAL" 2>/dev/null)" = "$(readlink -f "$SHIM" 2>/dev/null)" ]; then
+  if grep -qs "zen-lane" "$SHIM"; then
+    [ -x "$DEST/real-opencode" ] \
+      || die "opencode entry is already our shim but no real binary was found — set OUC_REAL_BIN or reinstall OpenCode"
+    OC_REAL="$DEST/real-opencode"
+  else
+    cp "$SHIM" "$DEST/real-opencode" && chmod +x "$DEST/real-opencode"
+    OC_REAL="$DEST/real-opencode"
+  fi
 fi
-printf '#!/usr/bin/env bash\nexport OUC_REAL_BIN="%s"\nexec bash "%s/scripts/zen-lane.sh" "$@"\n' "$OC_REAL" "$DEST" > "$SHIM"
+[ -n "$OC_REAL" ] || die "OpenCode CLI was not found — install it from https://opencode.ai/install"
+printf '#!/usr/bin/env bash\nexport OUC_DEST="%s"\nexport OUC_REAL_BIN="%s"\nexec bash "%s/scripts/zen-lane.sh" "$@"\n' "$DEST" "$OC_REAL" "$DEST" > "$SHIM"
 chmod +x "$SHIM"
-ok "opencode entry → lane (fresh edge + /64 per launch)"
+ok "opencode entry → local proxy lane (WARP egress per launch)"
 
 # ---------------------------------------------------------------- verify end to end (the installer doesn't lie)
 say "verifying the lane end to end (this hits opencode once)…"
-if [ "$IS_VPS" = "1" ]; then
-  CF_TRACE=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || timeout 12 curl -x http://127.0.0.1:41987 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-else
-  CF_TRACE=$(timeout 12 curl -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-fi
+# The installer always leaves WARP in isolated proxy mode. Verify through that
+# listener, not through the host's normal route (which would hide a dead WARP).
+CF_TRACE=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
 V6=$(echo "$CF_TRACE" | grep "^ip=" | cut -d= -f2)
 WARP_STATUS=$(echo "$CF_TRACE" | grep "^warp=" | cut -d= -f2)
 if [ -z "$V6" ]; then
-  if [ "$IS_VPS" = "1" ]; then
-    V6=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://api64.ipify.org 2>/dev/null || true)
-  else
-    V6=$(timeout 12 curl -s -m 10 https://api64.ipify.org 2>/dev/null || true)
-  fi
+  V6=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://api64.ipify.org 2>/dev/null || true)
 fi
 
 if [ "$WARP_STATUS" = "on" ] || [ "$WARP_STATUS" = "plus" ]; then
@@ -302,9 +344,9 @@ else
 fi
 
 case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ok "PATH has ~/.local/bin" ;;
+  *":$BIN_DIR:"*) ok "PATH has $BIN_DIR" ;;
   *) say "add this to your ~/.bashrc, then reopen the terminal:"
-     say "    export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+     say "    export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
 echo ""

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 from ouc_common import (
     LANE_DIR,
@@ -46,9 +47,21 @@ STATUS_LOCK = threading.Lock()
 _LAST_FALLBACK_NOTE = 0.0
 _RESET_LOCK = threading.Lock()
 _LAST_RESET_NOTE = 0.0
+_STREAM_RESET_LOCK = threading.Lock()
+_LAST_STREAM_RESET_NOTE = 0.0
+_TUNNEL_LOCK = threading.Lock()
+_ACTIVE_TUNNELS = 0
 
 # Kinds that describe a failed route rather than a lifecycle note.
-ERROR_KINDS = {"error", "reset", "connect_fail", "edge_fail", "fallback", "bind_fail"}
+ERROR_KINDS = {
+    "error",
+    "reset",
+    "stream_reset",
+    "connect_fail",
+    "edge_fail",
+    "fallback",
+    "bind_fail",
+}
 LOG_KINDS = ERROR_KINDS | {"repair", "start"}
 
 
@@ -131,6 +144,34 @@ def _record_reset(host: str, detail: str) -> None:
     _record_event("reset", detail, host)
 
 
+def _record_stream_reset(host: str, detail: str, edge: str = "") -> None:
+    """Record a reset after response bytes started; those are visible to the user."""
+    global _LAST_STREAM_RESET_NOTE
+    now = time.monotonic()
+    with _STREAM_RESET_LOCK:
+        if now - _LAST_STREAM_RESET_NOTE < 5.0:
+            return
+        _LAST_STREAM_RESET_NOTE = now
+    _record_event("stream_reset", detail, host, edge)
+
+
+def _active_tunnels() -> int:
+    with _TUNNEL_LOCK:
+        return _ACTIVE_TUNNELS
+
+
+def _enter_tunnel() -> None:
+    global _ACTIVE_TUNNELS
+    with _TUNNEL_LOCK:
+        _ACTIVE_TUNNELS += 1
+
+
+def _leave_tunnel() -> None:
+    global _ACTIVE_TUNNELS
+    with _TUNNEL_LOCK:
+        _ACTIVE_TUNNELS = max(0, _ACTIVE_TUNNELS - 1)
+
+
 def _clear_fallback() -> None:
     try:
         if FALLBACK_FLAG.is_file():
@@ -147,8 +188,12 @@ def proxy_status() -> dict:
     recent = [e for e in data.get("recent", []) if now - float(e.get("ts", 0)) <= 300]
     data["recent"] = recent
     data["errors_5m"] = sum(
-        1 for e in recent if e.get("kind") in ("error", "reset", "connect_fail", "edge_fail")
+        1
+        for e in recent
+        if e.get("kind")
+        in ("error", "reset", "stream_reset", "connect_fail", "edge_fail")
     )
+    data["stream_resets_5m"] = sum(1 for e in recent if e.get("kind") == "stream_reset")
     data["fallbacks_5m"] = sum(1 for e in recent if e.get("kind") == "fallback")
     fallback_ts = float(data.get("fallback_ts", 0) or 0)
     data["fallback_age"] = max(0, int(now - fallback_ts)) if fallback_ts else None
@@ -168,6 +213,7 @@ class _WarpState:
         self._edge = initial_edge
         self._reroll_mtime = 0.0
         self._bad_edges: dict[str, float] = {}
+        self._stream_fails: dict[str, list[float]] = {}
 
     def _apply_edge_controls(self) -> None:
         override_file = LANE_DIR / "edge_override.txt"
@@ -255,6 +301,40 @@ class _WarpState:
                 except Exception:
                     pass
 
+    def current_edge(self) -> str:
+        with self._lock:
+            return self._edge
+
+    def note_stream_reset(self, edge: str) -> str:
+        """Move away from an edge that keeps cutting live response streams.
+
+        A single reset can be the provider closing a finished stream, so the
+        edge is only retired after a second reset inside five minutes.
+        """
+        if not edge:
+            return ""
+        now = time.monotonic()
+        with self._lock:
+            stamps = [
+                t for t in self._stream_fails.get(edge, []) if now - t < 300.0
+            ]
+            stamps.append(now)
+            self._stream_fails[edge] = stamps
+            if len(stamps) < 2 or edge != self._edge:
+                return ""
+            replacement = self._pick_edge_locked(exclude=edge)
+            if not replacement or replacement == edge:
+                return ""
+            self._edge = replacement
+            self._bad_edges[edge] = now
+            try:
+                (LANE_DIR / "last_edge.txt").write_text(
+                    replacement + "\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
+            return replacement
+
     def get(self, wait_if_rotating: bool = True) -> tuple[str | None, str]:
         deadline = time.monotonic() + (18.0 if wait_if_rotating else 0.0)
         while True:
@@ -296,7 +376,56 @@ class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
+def _note_stream_reset(
+    host: str,
+    detail: str,
+    warp_state: _WarpState | None,
+    edge: str,
+) -> None:
+    """Report a mid-stream reset and retire a repeatedly failing pinned edge."""
+    replacement = ""
+    if warp_state is not None:
+        replacement = warp_state.note_stream_reset(edge)
+    if replacement:
+        detail = f"{detail}; moved to {replacement}"
+    _record_stream_reset(host, detail, edge)
+
+
+def _read_exact(stream, size: int) -> bytes:
+    """Read exactly ``size`` bytes from an unbuffered socket stream."""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _drain_client(sock: socket.socket, seconds: float = 0.25) -> None:
+    """Consume trailing client bytes so Windows closes with FIN instead of RST."""
+    try:
+        sock.setblocking(False)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([sock], [], [], 0.05)
+            if not readable:
+                continue
+            if not sock.recv(65536):
+                break
+    except OSError:
+        pass
+
+
+def _relay(
+    a: socket.socket,
+    b: socket.socket,
+    host: str = "",
+    warp_state: _WarpState | None = None,
+    edge: str = "",
+) -> None:
     """Bidirectionally forward bytes between two sockets with TCP keepalive and resilient streaming."""
     sockets = [a, b]
     closed = set()
@@ -304,6 +433,8 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
     for s in (a, b):
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_NODELAY"):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             # Windows TCP keepalive parameters: idle 15s, interval 5s
             if hasattr(socket, "SIO_KEEPALIVE_VALS"):
                 s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15000, 5000))
@@ -324,7 +455,7 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
             if exceptional:
                 break
             if not readable:
-                # Generous 15-minute idle ceiling for long-thinking models (DeepSeek V4.1 reasoning)
+                # Generous 15-minute idle ceiling for long-thinking models.
                 if time.monotonic() - last_active > 900.0:
                     break
                 continue
@@ -336,20 +467,29 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
                     data = src.recv(65536)
                 except (ConnectionResetError, ConnectionAbortedError) as exc:
                     # Many servers end a completed response with a reset instead
-                    # of a clean FIN. Only a reset before that side sent any
-                    # bytes is evidence of a route failure; mid-response drops
-                    # are reported by OpenCode's own log and health check.
-                    if not closed and src not in seen_data:
+                    # of a clean FIN. A reset before the upstream sent anything
+                    # is a route failure; one after data started is a cut stream.
+                    if src is b and src in seen_data:
+                        _note_stream_reset(
+                            host, f"{type(exc).__name__} after response", warp_state, edge
+                        )
+                    elif not closed and src not in seen_data:
                         _record_reset(host, f"{type(exc).__name__} before response")
                     data = b""
                 except OSError as exc:
                     # Windows reports a peer reset as plain OSError/WSAECONNRESET.
-                    if (
-                        not closed
-                        and src not in seen_data
-                        and getattr(exc, "winerror", None) in (10053, 10054)
-                    ):
-                        _record_reset(host, f"winsock {exc.winerror} before response")
+                    winerror = getattr(exc, "winerror", None)
+                    if src is b and src in seen_data:
+                        _note_stream_reset(
+                            host,
+                            f"winsock {winerror} after response"
+                            if winerror
+                            else f"{type(exc).__name__} after response",
+                            warp_state,
+                            edge,
+                        )
+                    elif not closed and src not in seen_data and winerror in (10053, 10054):
+                        _record_reset(host, f"winsock {winerror} before response")
                     data = b""
 
                 if data:
@@ -358,12 +498,21 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
                         dst.sendall(data)
                     except (OSError, ConnectionResetError) as exc:
                         # A failed write toward the client means the client went
-                        # away; only a failed write toward the upstream host
-                        # says anything about the WARP route.
-                        if not closed and dst is b and b not in seen_data:
-                            _record_reset(
-                                host, f"send to upstream failed: {type(exc).__name__}"
-                            )
+                        # away; only a write toward the upstream host says
+                        # anything about the route.
+                        if not closed and dst is b:
+                            if b in seen_data:
+                                _note_stream_reset(
+                                    host,
+                                    f"send failed after response: {type(exc).__name__}",
+                                    warp_state,
+                                    edge,
+                                )
+                            else:
+                                _record_reset(
+                                    host,
+                                    f"send to upstream failed: {type(exc).__name__}",
+                                )
                         return
                 else:
                     # EOF from src -> send TCP FIN to dst (half-close)
@@ -374,6 +523,11 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
                         dst.shutdown(socket.SHUT_WR)
                     except OSError:
                         pass
+                    if src is b:
+                        # The upstream cannot send anything else on this tunnel.
+                        # Drain the client briefly so Windows emits FIN, not RST.
+                        _drain_client(a)
+                        return
                     if len(closed) >= 2:
                         return
     except Exception:
@@ -419,18 +573,23 @@ def _open_pinned_any(
     raise ConnectionRefusedError(f"No Cloudflare edge answered ({last})") from last
 
 
+def _active_warp_scope() -> str:
+    """Return the configured WARP scope, defaulting to the platform's safe mode."""
+    default_scope = "tun" if sys.platform == "win32" else "isolated"
+    try:
+        from proxy_chain import get_egress_config
+
+        return str(get_egress_config().get("warp_scope", default_scope))
+    except Exception:
+        return default_scope
+
+
 def _open_warp_direct(
     clean_host: str,
     port: int,
     warp_state: _WarpState,
 ) -> socket.socket:
-    default_scope = "tun" if sys.platform == "win32" else "isolated"
-    scope = default_scope
-    try:
-        from proxy_chain import get_egress_config
-        scope = get_egress_config().get("warp_scope", default_scope)
-    except Exception:
-        pass
+    scope = _active_warp_scope()
 
     is_strict = os.environ.get("OUC_STRICT_PROXY") == "1" or (LANE_DIR / "strict_proxy.flag").is_file()
     is_opencode_host = (
@@ -638,24 +797,35 @@ def _connect_upstream(
     port: int,
     warp_state: _WarpState,
 ) -> socket.socket:
-    """Open the configured route, repairing a dropped WARP tunnel once."""
+    """Open the configured route, retrying once before repairing WARP.
+
+    Reconnecting the tunnel is destructive to every live response stream, so
+    it is deferred while another tunnel is active. The failed connection still
+    gets one quick retry, which covers brief edge hiccups.
+    """
     try:
         return _open_upstream(host, port, warp_state)
     except Exception as first:
-        if _repair_warp_tunnel(warp_state):
-            # Give the reconnected tunnel a moment to install routes, then retry once.
-            time.sleep(0.5)
-            try:
-                return _open_upstream(host, port, warp_state)
-            except Exception as second:
-                _record_event("connect_fail", f"{type(second).__name__}: {second}", host)
-                raise second from first
-        _record_event("connect_fail", f"{type(first).__name__}: {first}", host)
-        raise
+        repaired = False
+        if _active_tunnels() == 0:
+            repaired = _repair_warp_tunnel(warp_state)
+        time.sleep(0.5 if repaired else 0.25)
+        try:
+            return _open_upstream(host, port, warp_state)
+        except Exception as second:
+            _record_event("connect_fail", f"{type(second).__name__}: {second}", host)
+            raise second from first
 
 
 def _make_handler(warp_state: _WarpState):
     class ProxyHandler(socketserver.StreamRequestHandler):
+        # StreamRequestHandler defaults to a buffered rfile. That can swallow
+        # the first TLS bytes after CONNECT headers and leaves the tunnel
+        # waiting forever. Header reads are tiny, so unbuffered is safer.
+        rbufsize = 0
+        wbufsize = 0
+        disable_nagle_algorithm = True
+
         def handle(self) -> None:
             try:
                 raw_line = self.rfile.readline(65536)
@@ -713,13 +883,16 @@ def _make_handler(warp_state: _WarpState):
                         self._send_err(503, "Service Unavailable", f"Opencode Unlimited could not reach {host}:{port}. {exc2}")
                         return
 
+                edge = warp_state.current_edge()
+                _enter_tunnel()
                 try:
                     self.wfile.write(f"{proto} 200 Connection Established\r\n\r\n".encode("ascii"))
                     self.wfile.flush()
-                    _relay(self.connection, upstream, host)
+                    _relay(self.connection, upstream, host, warp_state, edge)
                 except OSError:
                     _record_reset(host, "client closed before tunnel reply")
                 finally:
+                    _leave_tunnel()
                     upstream.close()
                 return
 
@@ -750,6 +923,8 @@ def _make_handler(warp_state: _WarpState):
                     self._send_err(503, "Service Unavailable", f"Opencode Unlimited could not reach {host}:{port}. {exc2}")
                     return
 
+            edge = warp_state.current_edge()
+            _enter_tunnel()
             try:
                 req_head = f"{method} {path} {proto}\r\n".encode("latin-1")
                 upstream.sendall(req_head)
@@ -757,11 +932,12 @@ def _make_handler(warp_state: _WarpState):
                     upstream.sendall(h)
                 upstream.sendall(b"\r\n")
                 if content_len > 0:
-                    body = self.rfile.read(content_len)
+                    body = _read_exact(self.rfile, content_len)
                     if body:
                         upstream.sendall(body)
-                _relay(self.connection, upstream, host)
+                _relay(self.connection, upstream, host, warp_state, edge)
             finally:
+                _leave_tunnel()
                 upstream.close()
 
         def _send_err(self, code: int, reason: str, detail: str = "") -> None:
@@ -788,11 +964,23 @@ def _make_handler(warp_state: _WarpState):
 
 def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
     """Start the local CONNECT proxy in a background thread and return (server, port, edge)."""
-    pool = fetch_opencode_aaaa_pool()
-    chosen_edge = os.environ.get("OUC_PIN_EDGE", "").strip() or random.choice(pool)
+    pinned_edge = os.environ.get("OUC_PIN_EDGE", "").strip()
+    scope = _active_warp_scope()
+
+    # Isolated mode forwards through WARP's local SOCKS proxy; pinned IPv6 edge
+    # discovery is only needed for a direct TUN route. Skipping it removes
+    # several DNS timeouts from every Linux launch.
+    if scope == "isolated" and not pinned_edge:
+        pool: list[str] = []
+        chosen_edge = ""
+    else:
+        pool = fetch_opencode_aaaa_pool()
+        chosen_edge = pinned_edge or random.choice(pool)
+
     try:
         ensure_dirs()
-        (LANE_DIR / "last_edge.txt").write_text(chosen_edge + "\n", encoding="utf-8")
+        if chosen_edge:
+            (LANE_DIR / "last_edge.txt").write_text(chosen_edge + "\n", encoding="utf-8")
     except Exception:
         pass
 
@@ -805,7 +993,10 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
         raise
     actual_port = srv.server_address[1]
     _clear_fallback()
-    _record_event("start", f"listening on 127.0.0.1:{actual_port} (edge={chosen_edge})")
+    _record_event(
+        "start",
+        f"listening on 127.0.0.1:{actual_port} (edge={chosen_edge or 'isolated'})",
+    )
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
 
@@ -821,10 +1012,32 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
     return srv, actual_port, chosen_edge
 
 
+def _write_port_file(path: str, port: int) -> None:
+    """Publish the bound port so a launcher can attach without guessing."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(str(port), encoding="utf-8")
+    tmp.replace(target)
+
+
 if __name__ == "__main__":
-    bind_port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    cli = sys.argv[1:]
+    port_file = ""
+    if "--port-file" in cli:
+        idx = cli.index("--port-file")
+        if idx + 1 < len(cli):
+            port_file = cli[idx + 1]
+            del cli[idx : idx + 2]
+    bind_port = int(cli[0]) if cli else 0
     server, listening_port, edge = start_proxy_server(bind_port)
-    print(f"zen-proxy listening on 127.0.0.1:{listening_port} (edge={edge})", flush=True)
+    if port_file:
+        _write_port_file(port_file, listening_port)
+    print(
+        f"zen-proxy listening on 127.0.0.1:{listening_port} "
+        f"(edge={edge or 'isolated'})",
+        flush=True,
+    )
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

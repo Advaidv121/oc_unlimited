@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -15,8 +16,67 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import avatar_ui
+import ouc_common
 import proxy_chain
 import zen_proxy
+
+
+class DataRootTests(unittest.TestCase):
+    def test_windows_uses_local_appdata(self) -> None:
+        with mock.patch.object(ouc_common.sys, "platform", "win32"), mock.patch.dict(
+            os.environ, {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}, clear=False
+        ):
+            self.assertEqual(
+                ouc_common._default_data_root(),
+                Path(r"C:\Users\tester\AppData\Local"),
+            )
+
+    def test_linux_uses_xdg_data_home(self) -> None:
+        with mock.patch.object(ouc_common.sys, "platform", "linux"), mock.patch.dict(
+            os.environ, {"XDG_DATA_HOME": "/srv/tester/.local/share"}, clear=False
+        ):
+            self.assertEqual(
+                ouc_common._default_data_root(), Path("/srv/tester/.local/share")
+            )
+
+    def test_linux_falls_back_to_local_share(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "XDG_DATA_HOME"}
+        with mock.patch.object(ouc_common.sys, "platform", "linux"), mock.patch.dict(
+            os.environ, env, clear=True
+        ), mock.patch.object(
+            ouc_common.Path, "home", return_value=Path("/home/tester")
+        ):
+            self.assertEqual(
+                ouc_common._default_data_root(), Path("/home/tester/.local/share")
+            )
+
+
+class RunHiddenTests(unittest.TestCase):
+    def test_windows_suppresses_the_console_window(self) -> None:
+        completed = mock.Mock()
+        with mock.patch.object(
+            ouc_common.sys, "platform", "win32"
+        ), mock.patch.object(
+            ouc_common.subprocess, "run", return_value=completed
+        ) as run:
+            result = ouc_common.run_hidden(["warp-cli", "status"], timeout=3.0)
+
+        self.assertIs(result, completed)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["warp-cli", "status"])
+        self.assertEqual(kwargs["creationflags"], ouc_common.CREATE_NO_WINDOW)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertEqual(kwargs["timeout"], 3.0)
+
+    def test_linux_does_not_pass_windows_creation_flags(self) -> None:
+        with mock.patch.object(
+            ouc_common.sys, "platform", "linux"
+        ), mock.patch.object(ouc_common.subprocess, "run") as run:
+            ouc_common.run_hidden(["warp-cli", "status"])
+
+        _, kwargs = run.call_args
+        self.assertNotIn("creationflags", kwargs)
 
 
 class RecentNetworkErrorTests(unittest.TestCase):
@@ -67,6 +127,7 @@ class EdgeFailoverTests(unittest.TestCase):
         zen_proxy.PROXY_STATUS_FILE = self.dir / "proxy_status.json"
         zen_proxy.FALLBACK_FLAG = self.dir / "fallback.flag"
         zen_proxy.PROXY_LOG_FILE = self.dir / "proxy.log"
+        zen_proxy._LAST_STREAM_RESET_NOTE = 0.0
 
     def tearDown(self) -> None:
         (
@@ -113,6 +174,73 @@ class EdgeFailoverTests(unittest.TestCase):
         log = (self.dir / "proxy.log").read_text(encoding="utf-8")
         self.assertIn("reset:", log)
         self.assertIn("fallback:", log)
+
+    def test_mid_stream_reset_retires_edge_only_after_a_second_cut(self) -> None:
+        state = zen_proxy._WarpState(["edge-a", "edge-b"], "edge-a")
+
+        zen_proxy._note_stream_reset(
+            "opencode.ai", "ConnectionResetError after response", state, "edge-a"
+        )
+        self.assertEqual(state.current_edge(), "edge-a")
+        self.assertEqual(zen_proxy.proxy_status()["stream_resets_5m"], 1)
+
+        zen_proxy._LAST_STREAM_RESET_NOTE = 0.0
+        zen_proxy._note_stream_reset(
+            "opencode.ai", "ConnectionResetError after response", state, "edge-a"
+        )
+        self.assertEqual(state.current_edge(), "edge-b")
+        self.assertEqual(zen_proxy.proxy_status()["stream_resets_5m"], 2)
+        log = (self.dir / "proxy.log").read_text(encoding="utf-8")
+        self.assertIn("stream_reset:", log)
+        self.assertIn("moved to edge-b", log)
+
+    def test_isolated_start_skips_the_pinned_edge_pool_fetch(self) -> None:
+        with mock.patch.object(
+            zen_proxy, "_active_warp_scope", return_value="isolated"
+        ), mock.patch.object(
+            zen_proxy,
+            "fetch_opencode_aaaa_pool",
+            side_effect=AssertionError("isolated startup must not resolve edges"),
+        ), mock.patch.object(
+            zen_proxy, "ensure_dirs", lambda: None
+        ):
+            server, port, edge = zen_proxy.start_proxy_server(0)
+
+        try:
+            self.assertGreater(port, 0)
+            self.assertEqual(edge, "")
+            self.assertEqual(zen_proxy.proxy_status()["last_event"]["kind"], "start")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class BodyReadTests(unittest.TestCase):
+    def test_unbuffered_short_reads_are_reassembled(self) -> None:
+        class ShortReadStream:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+
+            def read(self, size: int) -> bytes:
+                chunk = self.data[: min(size, 3)]
+                self.data = self.data[len(chunk) :]
+                return chunk
+
+        payload = b'{"model":"deepseek-v4.1","stream":true}'
+        self.assertEqual(
+            zen_proxy._read_exact(ShortReadStream(payload), len(payload)), payload
+        )
+
+    def test_eof_before_the_declared_length_returns_what_arrived(self) -> None:
+        class TruncatedStream:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def read(self, size: int) -> bytes:
+                self.calls += 1
+                return b"abc" if self.calls == 1 else b""
+
+        self.assertEqual(zen_proxy._read_exact(TruncatedStream(), 10), b"abc")
 
 
 class TaskEnabledParseTests(unittest.TestCase):
@@ -247,6 +375,25 @@ class HealthTests(unittest.TestCase):
         duplicate_titles = [i["title"] for i in duplicate["issues"]]
         self.assertIn("Using a direct connection", duplicate_titles)
         self.assertNotIn("OpenCode hit a network error", duplicate_titles)
+
+    def test_repeated_stream_resets_are_surfaced_with_a_rotation_action(self) -> None:
+        health = self._health(
+            proxy={"fallback_active": False, "stream_resets_5m": 2}, net_errors=[]
+        )
+        issue = next(
+            i for i in health["issues"] if i["title"] == "Response streams keep dropping"
+        )
+
+        self.assertEqual(issue["level"], "warn")
+        self.assertEqual(issue["fix"], "hop")
+
+        single = self._health(
+            proxy={"fallback_active": False, "stream_resets_5m": 1}, net_errors=[]
+        )
+        self.assertNotIn(
+            "Response streams keep dropping",
+            [i["title"] for i in single["issues"]],
+        )
 
 
 class CustomProxyFailoverTests(unittest.TestCase):

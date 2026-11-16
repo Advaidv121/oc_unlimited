@@ -1,8 +1,8 @@
 # PLEASE GIVE PROPER CREDITS. JUST DONT REBRAND AND LAUNCH IT AS YOURS.
-# NEW VERSION-2.4.2 - ALL ISSUES FIXED
+# NEW VERSION-3.0 (Fixed:503,ECONNRESET, keeper flapping, quota resets, drafts.sqlite unlock, WireGuard enforcement, auto-resume and some other BUGS)
 # Opencode-Unlimited-Limit-Bypass
 
-[![Version](https://img.shields.io/badge/Version-v2.4.2-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
+[![Version](https://img.shields.io/badge/Version-v3.0-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
 [![Author](https://img.shields.io/badge/Author-Avatar%20%28ShadowySphinX%29-22d3ee?style=for-the-badge&logo=github)](https://github.com/ShadowySphinX)
 [![Repository](https://img.shields.io/badge/GitHub-Opencode--Unlimited-blue?style=for-the-badge&logo=github)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
@@ -18,7 +18,7 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 ---
 
 ## Table of Contents
-1. [What's New in v2.4.2](#whats-new-in-v242)
+1. [What's New in v3.0](#whats-new-in-v30)
 2. [Prerequisites & Downloads](#prerequisites--downloads-what-you-need)
 3. [Quick Start (Windows)](#quick-start-windows)
 4. [Recommended Settings for Every Method](#recommended-settings-for-every-method)
@@ -31,25 +31,35 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 
 ---
 
-## What's New in v2.4.2
+## What's New in v3.0
 
-* **Connection Recovery & Diagnostics (current build):**
-  * The local proxy now fails over to another Cloudflare edge in seconds instead of stalling on one dead address.
+* **Long responses survive flaky edges (Windows):**
+  * Fixed a relay bug where the proxy's buffered header reader could swallow the first TLS bytes after `CONNECT`, leaving the tunnel waiting for a response that had already arrived.
+  * The relay is now unbuffered, enables `TCP_NODELAY` and TCP keepalive on both sockets, and drains the client briefly when the upstream sends FIN. Windows closes with FIN instead of turning a completed response into an `ECONNRESET`.
+  * Mid-stream resets are recorded as `stream_reset` and counted separately from connection failures. The Proxy tab and health panel now distinguish "the route never came up" from "a live stream was cut".
+  * A pinned Cloudflare edge that cuts two live streams within five minutes is retired for new connections. Existing streams are left alone.
+  * WARP tunnel repair is deferred while another proxy tunnel is active, so a repair cannot kill a response that is still generating. The failed request gets one quick retry first.
+* **Connection Recovery & Diagnostics:**
+  * The local proxy fails over to another Cloudflare edge instead of stalling on one dead address.
   * A dropped WARP tunnel or proxy route is recorded, repaired, and surfaced in the dashboard instead of returning an empty `503`.
-  * **Auto-Repair** is on by default: it restarts a stopped proxy, reconnects WARP, or changes edge without changing your selected mode, clearing chats, or restarting OpenCode. It respects workers you deliberately turned off.
-  * A new **Proxy** log tab shows edge failover, dropped streams, direct fallbacks, and tunnel repairs for real troubleshooting.
-  * A direct fallback is still allowed in Standard mode so OpenCode stays usable, but the health panel now says **Using a direct connection** and offers a one-click repair.
+  * **Auto-Repair** is on by default and only performs safe actions: start or restart a stopped proxy, reconnect WARP, repair the tunnel, or re-roll the edge. It never changes the selected mode, clears chats, restarts OpenCode, or deletes the WARP registration, and it respects workers you deliberately disabled.
+  * The **Proxy** log tab shows edge failover, `stream_reset`, direct fallback, and tunnel repair events.
+  * Standard mode still permits a direct fallback so OpenCode stays usable; the health panel labels it **Using a direct connection** and offers a one-click repair.
 * **WARP Keeper Stability:**
   * A connected tunnel is left alone unless the selected WARP scope changed; the keeper repairs disconnected or error states.
   * Routine repairs renew the WireGuard session keys instead of deleting the device registration.
   * In-flight `Connecting` / `Reconnecting` states get a longer grace period before a repair starts.
   * Non-destructive key rotation (`tunnel rotate-keys`) is used for quota rotation.
+* **Linux Lane Fixed:**
+  * Linux now runs the same hardened Python HTTP CONNECT proxy as Windows, on an ephemeral loopback port. Bun/OpenCode ignores `socks5://` proxy variables, so pointing `HTTPS_PROXY` at WARP's SOCKS listener was never enough.
+  * The installer deploys `ouc_common.py`, `zen_proxy.py`, `proxy_chain.py`, and `tor_manager.py` to `$DEST/python`, and `zen-lane.sh` wires the launched OpenCode process to that proxy. There is no dead `41987` fallback on Linux.
+  * Isolated proxy mode remains the installer default. `OUC_WARP_MODE=warp` is the explicit opt-in for full TUN.
+  * Rotation pauses the keeper with a pause file plus a service stop/start, so a keeper tick cannot reconnect WARP underneath a rotation.
+  * `opencode-unlimited-doctor` now checks the Python proxy modules, WARP port `40000`, resolved iptables paths, both services, the shim, and stale pause files.
 * **Existing Chat Auto-Unlock & History Preservation:**
   * Removes client-side rate limit lockouts (`free-limit`, `go-upsell`) from `%APPDATA%\ai.opencode.desktop\drafts.sqlite` after a successful rotation.
   * Leaves the chat history and session tables untouched.
   * Reloads the Desktop window and sends `continue` when the window can be focused safely; otherwise it falls back to a CLI resume.
-* **Streaming Proxy:**
-  * TCP keepalive (`SIO_KEEPALIVE_VALS` on Windows, `TCP_KEEPIDLE` on Linux) and a 15-minute idle ceiling keep long model responses from stalling.
 * **Detached Desktop Launching:**
   * OpenCode Desktop now launches as an independent detached process (`os.startfile`), so it stays open even if the launcher or terminal is closed.
 
@@ -135,18 +145,18 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 
 ```
 [ User Active Chat / Session ]
-          │
-          ▼
-┌──────────────────────────────┐
-│  Layer 1: Client SQLite Lock │  ──> Stored locally in %APPDATA%\ai.opencode.desktop\drafts.sqlite
-│       ('free-limit' key)     │      Disables the UI prompt bar & displays the red upsell banner.
-└──────────────┬───────────────┘
-               │ (Automatically purged by Zen Guard / Deep Reset)
-               ▼
-┌──────────────────────────────┐
-│  Layer 2: Upstream Cloudflare│  ──> Evaluated per egress IP (CF-Connecting-IP).
-│       Server Rate Limit      │      Applied to the egress IP, not to the conversation ID.
-└──────────────────────────────┘
+           |
+           v
++------------------------------------+
+| Layer 1: Client SQLite Lock        |  -> %APPDATA%\ai.opencode.desktop\drafts.sqlite
+|        ('free-limit' key)          |     disables the input bar and shows the upsell banner
++------------------+-----------------+
+                   | purged by Zen Guard / Deep Reset
+                   v
++------------------------------------+
+| Layer 2: Upstream Cloudflare       |  -> evaluated per egress IP (CF-Connecting-IP)
+|        Server Rate Limit           |     applies to the egress IP, not the conversation ID
++------------------------------------+
 ```
 
 1. **Server-Side Quota (IP-Based):** OpenCode's backend applies free-tier limits to the incoming public IP address. Rotating the IPv6 `/64` presents a different address, which is the behavior the rotator relies on.
@@ -167,12 +177,20 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 * **Fix:** Click **Deep Reset** on the dashboard, or press `Ctrl+R` in OpenCode Desktop. This usually clears the banner and unlocks the input bar.
 
 ### 3. What to do if you get `Connection lost while reading the response: ECONNRESET`
-* **Cause:** Earlier 2.4.x keepers could change the WARP protocol on every 45-second tick, which tore down the virtual network adapter mid-stream while reasoning models were generating.
-* **Fix in v2.4.2:** 
-  1. Update to **v2.4.2** (the keeper no longer changes protocol or mode on every tick; it leaves a connected tunnel alone unless the selected scope changed).
-  2. Ensure you are not running third-party VPNs (NordVPN, ExpressVPN) alongside WARP, as they compete for the Windows Wintun driver.
-  3. Ensure **Desktop App Proxy** is on (15-minute idle ceiling with TCP keepalive).
-  4. If it still happens, open the **Proxy** log tab. Repeated `reset` or `edge_fail` lines mean the pinned edge is unhealthy; press **Re-roll** or let Auto-Repair change it.
+* **What it means:** OpenCode had already received part of a response when the TCP stream ended abruptly. Common causes are a Cloudflare edge recycling a long-lived connection, an ISP or WARP path reset, or the provider closing an idle stream. It is not automatically a quota error, and it does not prove that WARP is down.
+* **What v3.0 changed:**
+  1. The proxy no longer buffers bytes past the `CONNECT` header. That bug could leave the TLS tunnel half-open until the client timed out or reset.
+  2. Both sockets use TCP keepalive and `TCP_NODELAY`, and the proxy drains the client briefly when the upstream sends FIN. This makes Windows close with FIN instead of RST.
+  3. A reset after response bytes started is logged as `stream_reset` (not `reset`) and counted in `stream_resets_5m`.
+  4. If the same pinned edge cuts two live streams within five minutes, new connections move to another edge. The current stream is not force-killed.
+  5. Tunnel repair waits while another proxy tunnel is active, so a repair cannot tear down a response that is still generating.
+* **If it keeps happening:**
+  1. Open the **Proxy** tab. `stream_reset` lines on different edges point at the provider or the local network; repeated lines on one edge are what the reroll handles.
+  2. Press **Rotate route** (or **Re-roll**) to move to a fresh exit. In Tor mode, restart the circuit instead.
+  3. Keep **Auto-Repair** on. It retires a repeatedly failing edge without changing your selected mode.
+  4. Do not delete the WARP registration for this error. If WARP itself is disconnected, use **Fix WARP (Reset Keys)**.
+  5. If you use Full TUN, make sure no third-party VPN is bound to the same Wintun adapter. If you use App-Only mode, confirm `127.0.0.1:40000` is listening.
+* **Honest limit:** a single reset can still come from the provider side. v3.0 makes it visible and recovers the route; it cannot make a remote server keep a stream open indefinitely.
 
 ### 3.1 What to do if OpenCode returns `503 Service Unavailable`
 * **Cause:** The selected Cloudflare edge or WARP tunnel stopped answering. A stale edge, ISP UDP drop, or a proxy that is not running can all produce a 503.
@@ -190,7 +208,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 
 ### 5. What to do if WARP shows "Network: unstable"
 * **Notice:** Cloudflare WARP can report `Network: unstable` when latency is high or during initial packet bursts. It does not necessarily mean your internet is down.
-* In v2.4.2, the app treats "unstable" as healthy traffic. Do not disconnect or delete your registration.
+* In v3.0, the app treats "unstable" as healthy traffic. Do not disconnect or delete your registration.
 
 ### 6. What to do if you get `CF_HAPPY_EYEBALLS_MITM_FAILURE`
 * **Cause:** MASQUE protocol (UDP 443) blocked by ISP or stale Anycast routing.
@@ -211,19 +229,22 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 
 ```
 [ OpenCode Desktop / CLI ]
-            │
-            ▼ (HTTP / HTTPS via service.json)
-   [ 127.0.0.1:41987 (Zen Proxy with TCP KeepAlive) ]
-            │
-    ────────┴───────────────────────────────────────────────────────
-    │ Active Egress Mode Selection                                  │
-    ─────────────────────────────────────────────────────────────────
-    ├── [1] WARP (Full TUN Mode)    ──> Virtual Adapter (Wintun)    ──> System-wide Cloudflare VPN
-    ├── [2] WARP (Isolated Mode)    ──> 127.0.0.1:40000 (SOCKS5)    ──> Cloudflare Edge [Fresh /64 IPv6]
-    ├── [3] Clean Endpoint          ──> Clean WireGuard IP:2408     ──> Selected Anycast Edge
-    ├── [4] Tor Network             ──> 127.0.0.1:9050 / 9150       ──> Tor 3-Hop Circuit [Fresh IPv4]
-    └── [5] Custom Proxy Pool       ──> Node #1 -> Node #2 -> ...   ──> Verified Upstream Nodes
+            |
+            v  HTTP / HTTPS via service.json
+[ 127.0.0.1:41987  Zen Proxy (TCP keepalive, edge failover) ]
+            |
+   +--------+------------------------------------------------------+
+   | Active egress mode                                            |
+   +--------+------------------------------------------------------+
+            |
+            +-- [1] WARP Full TUN      -> Wintun adapter -> system-wide Cloudflare VPN
+            +-- [2] WARP Isolated      -> 127.0.0.1:40000 SOCKS5 -> Cloudflare edge / fresh /64
+            +-- [3] Clean Endpoint     -> clean WireGuard IP:2408 -> selected Anycast edge
+            +-- [4] Tor Network        -> 127.0.0.1:9050 / 9150 -> 3-hop circuit / fresh IPv4
+            +-- [5] Custom Proxy Pool  -> node #1 -> node #2 -> ... -> verified upstream
 ```
+
+On Linux the lane starts this same proxy on an ephemeral loopback port and exports it only to the launched OpenCode process. Port `41987` is the Windows service proxy.
 
 ---
 
@@ -235,9 +256,21 @@ bash install.sh
 ```
 
 * **Compatibility:** Debian, Ubuntu, Fedora, Arch Linux, NixOS, and openSUSE.
-* **Systemd Daemons:** Installs `opencode-unlimited-keeper.service` (root) and `opencode-unlimited-guard.service` (user).
+* **Where things go:** state and workers live in `${XDG_DATA_HOME:-$HOME/.local/share}/opencode-unlimited`; the `opencode` shim goes to `${XDG_BIN_HOME:-$HOME/.local/bin}`. The installer deploys the lane proxy modules to `$DEST/python`.
+* **Lane proxy:** `zen-lane.sh` starts `zen_proxy.py` on an ephemeral loopback port and exports `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` to it for the launched OpenCode process. This is required because Bun/OpenCode ignores `socks5://` proxy variables. The lane fails closed if the proxy cannot start; it does not fall back to a dead `41987`.
+* **WARP mode:** the installer pins both units to `OUC_WARP_MODE=proxy`, WARP's isolated SOCKS listener on `127.0.0.1:40000`. This keeps SSH and normal host routing intact. Full TUN is an explicit opt-in: set `OUC_WARP_MODE=warp` in the keeper and guard units, then restart them.
+* **Systemd Daemons:** Installs `opencode-unlimited-keeper.service` (root) and `opencode-unlimited-guard.service` (user). The installer enables lingering where possible so the user guard survives logout on a headless VPS.
 * **Cloud VPS Safe:** Adds firewall rules that allow SSH (port 22 and custom ports) and keeps WARP in isolated proxy mode so the system's normal routing stays in place.
+* **Sudoers:** only the exact commands used by the workers are passwordless: `warp-cli`, `systemctl stop/start opencode-unlimited-keeper`, and the resolved `iptables` / `ip6tables` list checks. The guard never falls back to interactive `sudo`, which would hang without a TTY.
+* **Rotation:** the guard writes `$DEST/keeper.pause`, stops the keeper, rotates, then removes the pause file and starts the keeper. A keeper tick cannot reconnect WARP in the middle of a rotation.
 * **Existing Chat Unlock:** Clears the lockout keys from `~/.config/ai.opencode.desktop/drafts.sqlite` and runs `nohup opencode run --continue "continue" &` after a successful rotation.
+
+### If something fails on Linux
+* Run `opencode-unlimited-doctor`. It checks the lane proxy import from `$DEST/python`, WARP port `40000`, the kill-switch (TUN only), both services, the shim, and stale pause files.
+* `WARP proxy port 40000 is not listening` → restart the keeper: `sudo systemctl restart opencode-unlimited-keeper`.
+* `Linux lane proxy missing` → rerun `bash install.sh`; the Python modules were not deployed.
+* A stuck `$DEST/keeper.pause` after a killed rotation → remove it, then restart the keeper. The doctor warns about this file.
+* Do not point OpenCode directly at `socks5://127.0.0.1:40000`. Use the `opencode` shim; it starts the HTTP CONNECT proxy that Bun actually honors.
 
 ---
 

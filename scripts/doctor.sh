@@ -4,7 +4,8 @@
 set -u
 
 BRAND="opencode-unlimited"
-DEST="$HOME/.local/share/$BRAND"
+DEST="${OUC_DEST:-${XDG_DATA_HOME:-$HOME/.local/share}/$BRAND}"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 
 WARP="${OUC_WARP_BIN:-}"
 if [ -z "$WARP" ]; then
@@ -18,6 +19,10 @@ wo(){ sudo -n "$WARP" --accept-tos "$@" 2>/dev/null && return 0; sudo -n "$WARP"
 ok(){ echo -e "  \e[32m✓\e[0m $*"; }
 warn(){ echo -e "  \e[33m!\e[0m $*"; }
 bad(){ echo -e "  \e[31m✗\e[0m $*"; }
+
+port_open(){ (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
+IPT="$(command -v iptables 2>/dev/null || true)"
+IP6T="$(command -v ip6tables 2>/dev/null || true)"
 
 echo ""
 echo "  ============================="
@@ -53,20 +58,31 @@ fi
 if [ "$IS_PROXY" = "1" ]; then
   ok "isolated proxy mode active (port 40000 / SSH safe)"
   ok "kill-switch disabled in proxy mode (protects SSH connection)"
+  port_open 40000 \
+    && ok "WARP isolated SOCKS proxy: listening on 127.0.0.1:40000" \
+    || bad "WARP proxy port 40000 is not listening — restart the keeper"
   # In isolated mode, query through proxy so we verify WARP egress without touching SSH eth0
-  CF_TRACE=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || timeout 12 curl -x http://127.0.0.1:41987 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  CF_TRACE=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
   V6=$(echo "$CF_TRACE" | grep "^ip=" | cut -d= -f2)
   WARP_STATUS=$(echo "$CF_TRACE" | grep "^warp=" | cut -d= -f2)
   if [ -z "$V6" ]; then
     V6=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://api64.ipify.org 2>/dev/null || true)
   fi
 else
-  sudo -n /usr/sbin/iptables  -nL OUC_LEAKGUARD >/dev/null 2>&1 \
-    && ok "kill-switch v4 installed" \
-    || bad "kill-switch v4 gone — keeper reinstalls it every 45s, or restart it"
-  sudo -n /usr/sbin/ip6tables -nL OUC_LEAKGUARD >/dev/null 2>&1 \
-    && ok "kill-switch v6 installed" \
-    || bad "kill-switch v6 gone — keeper reinstalls it every 45s, or restart it"
+  if [ -n "$IPT" ]; then
+    sudo -n "$IPT" -nL OUC_LEAKGUARD >/dev/null 2>&1 \
+      && ok "kill-switch v4 installed" \
+      || bad "kill-switch v4 gone — keeper reinstalls it every 45s, or restart it"
+  else
+    warn "iptables not installed — kill-switch check skipped"
+  fi
+  if [ -n "$IP6T" ]; then
+    sudo -n "$IP6T" -nL OUC_LEAKGUARD >/dev/null 2>&1 \
+      && ok "kill-switch v6 installed" \
+      || bad "kill-switch v6 gone — keeper reinstalls it every 45s, or restart it"
+  else
+    warn "ip6tables not installed — kill-switch check skipped"
+  fi
   CF_TRACE=$(timeout 12 curl -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
   V6=$(echo "$CF_TRACE" | grep "^ip=" | cut -d= -f2)
   WARP_STATUS=$(echo "$CF_TRACE" | grep "^warp=" | cut -d= -f2)
@@ -87,10 +103,21 @@ else
   bad "no egress through warp — tunnel down, restart keeper"
 fi
 
+# ---- Linux lane proxy modules
+if PYTHONPATH="$DEST/python" python3 -c "import zen_proxy" >/dev/null 2>&1; then
+  ok "Linux lane proxy: installed ($DEST/python)"
+else
+  bad "Linux lane proxy missing — rerun install.sh"
+fi
+
 # ---- guard (user service)
 systemctl --user is-active ${BRAND}-guard >/dev/null 2>&1 \
   && ok "zen-guard service (user)" \
   || bad "zen-guard down — systemctl --user start ${BRAND}-guard"
+
+if [ -f "$DEST/keeper.pause" ]; then
+  warn "keeper pause file present — a rotation may still be running; remove $DEST/keeper.pause only if it is stuck"
+fi
 
 # ---- guard state
 if [ -f "$DEST/guard/state.json" ]; then
@@ -105,10 +132,10 @@ PY
 fi
 
 # ---- TUI shim
-if [ -f "$HOME/.local/bin/opencode" ] && grep -q "zen-lane" "$HOME/.local/bin/opencode" 2>/dev/null; then
+if [ -f "$BIN_DIR/opencode" ] && grep -q "zen-lane" "$BIN_DIR/opencode" 2>/dev/null; then
   ok "opencode entry → lane"
 else
-  warn "opencode entry doesn't point at the lane — reinstall or check ~/.local/bin/opencode"
+  warn "opencode entry doesn't point at the lane — reinstall or check $BIN_DIR/opencode"
 fi
 
 echo ""

@@ -1,6 +1,6 @@
-﻿<#
+<#
 .SYNOPSIS
-    Opencode Unlimited Usage v2.4.2 — clean Windows uninstaller.
+    Opencode Unlimited Usage v3.0 — clean Windows uninstaller.
 #>
 [CmdletBinding()]
 param()

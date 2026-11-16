@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Opencode Unlimited Usage — native Windows installer.
 #>
@@ -33,7 +33,7 @@ function Test-IsAdmin {
 
 Write-Host ""
 Write-Host "  ==================================================="
-Write-Host "  Opencode Unlimited (Windows v2.4.2)"
+Write-Host "  Opencode Unlimited (Windows v3.0)"
 Write-Host "  Created & Maintained by Avatar (ShadowySphinX)"
 Write-Host "  ==================================================="
 Write-Host ""

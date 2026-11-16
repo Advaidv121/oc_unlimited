@@ -1,4 +1,4 @@
-"""Shared paths, process helpers, WARP controls, and IPv6 utilities for Windows."""
+"""Shared paths, process helpers, WARP controls, and IPv6 utilities."""
 
 from __future__ import annotations
 
@@ -21,10 +21,22 @@ from typing import Iterator
 BRAND = "opencode-unlimited"
 CREATE_NO_WINDOW = 0x08000000
 
-LOCAL_APPDATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+
+def _default_data_root() -> Path:
+    """Return the per-user state root for this platform."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+
+
+LOCAL_APPDATA = _default_data_root()
 DEST_DIR = LOCAL_APPDATA / BRAND
 SCRIPTS_DIR = DEST_DIR / "scripts"
-BIN_DIR = DEST_DIR / "bin"
+BIN_DIR = (
+    DEST_DIR / "bin"
+    if sys.platform == "win32"
+    else Path(os.environ.get("XDG_BIN_HOME", Path.home() / ".local" / "bin"))
+)
 GUARD_DIR = DEST_DIR / "guard"
 KEEPER_DIR = DEST_DIR / "keeper"
 LANE_DIR = DEST_DIR / "lane"
@@ -105,13 +117,16 @@ def run_hidden(
     args: list[str],
     timeout: float = 15.0,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess without spawning a visible Windows console window."""
+    """Run a subprocess without spawning a visible console window on Windows."""
+    kwargs: dict[str, object] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
     return subprocess.run(
         args,
         capture_output=True,
         text=True,
         timeout=timeout,
-        creationflags=CREATE_NO_WINDOW,
+        **kwargs,
     )
 
 
@@ -746,7 +761,12 @@ def acquire_mutex(name: str) -> int | None:
 
 
 def is_admin() -> bool:
-    """Return True if the current process has Administrator privileges."""
+    """Return True if the current process has administrator/root privileges."""
+    if sys.platform != "win32":
+        try:
+            return os.geteuid() == 0
+        except AttributeError:
+            return False
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:

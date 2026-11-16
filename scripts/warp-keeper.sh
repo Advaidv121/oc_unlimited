@@ -23,31 +23,49 @@ wo(){ "$WARP" --accept-tos "$@" 2>/dev/null && return 0; "$WARP" "$@" 2>/dev/nul
 IFACE=CloudflareWARP
 TICK=45
 
+DEST="${OUC_DEST:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode-unlimited}"
+PAUSE_FILE="${OUC_PAUSE_FILE:-$DEST/keeper.pause}"
+mkdir -p "$(dirname "$PAUSE_FILE")" 2>/dev/null || true
+
 # Detect SSH session or cloud VPS environment
 IS_VPS=0
 if [ -f /etc/opencode-unlimited-vps.flag ] || [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ] || [ -n "${SSH_CONNECTION:-}" ] || [ -f /etc/cloud/cloud.cfg ] || [ -d /var/lib/cloud ]; then
   IS_VPS=1
 fi
 
+# The Linux installer selects isolated proxy mode. Users who deliberately
+# choose TUN set OUC_WARP_MODE=warp in the unit or environment.
 MODE="${OUC_WARP_MODE:-proxy}"
 REPAIR_COOLDOWN=120
 LAST_REPAIR=0
 
+proxy_ready(){
+  (exec 3<>/dev/tcp/127.0.0.1/40000) 2>/dev/null
+}
+
 ensure_connected(){
-  # 1. Already connected: do not touch anything
-  wo status | head -1 | grep -q Connected && return 0
+  # 1. Already connected in the right shape: do not touch anything.
+  #    A stale "Connected" with no port 40000 listener is mode drift, not health.
+  if wo status | head -1 | grep -q Connected; then
+    if [ "$MODE" != "proxy" ] || proxy_ready; then
+      return 0
+    fi
+    w disconnect
+  fi
 
   # 2. In-flight handshake grace window
   if wo status | head -1 | grep -qi "connecting"; then
     for i in $(seq 1 8); do
       sleep 1
-      wo status | head -1 | grep -q Connected && return 0
+      if wo status | head -1 | grep -q Connected; then
+        if [ "$MODE" != "proxy" ] || proxy_ready; then return 0; fi
+      fi
       wo status | head -1 | grep -qi "connecting" || break
     done
   fi
 
-  # 3. Disconnected: ensure mode and connect
-  if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
+  # 3. Disconnected: ensure the selected mode and connect
+  if [ "$MODE" = "warp" ]; then
     w mode warp
   else
     w mode proxy
@@ -57,7 +75,9 @@ ensure_connected(){
 
   for i in $(seq 1 8); do
     sleep 1
-    wo status | head -1 | grep -q Connected && return 0
+    if wo status | head -1 | grep -q Connected; then
+      if [ "$MODE" != "proxy" ] || proxy_ready; then return 0; fi
+    fi
   done
 
   # 4. Gentle recovery: renew the session keys (registration is preserved).
@@ -73,7 +93,7 @@ ensure_connected(){
     w tunnel protocol set WireGuard
   fi
   w tunnel rotate-keys
-  if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
+  if [ "$MODE" = "warp" ]; then
     w mode warp
   else
     w mode proxy
@@ -83,14 +103,16 @@ ensure_connected(){
 
   for i in $(seq 1 6); do
     sleep 1
-    wo status | head -1 | grep -q Connected && return 0
+    if wo status | head -1 | grep -q Connected; then
+      if [ "$MODE" != "proxy" ] || proxy_ready; then return 0; fi
+    fi
   done
 
   # 5. Only register new if registration is explicitly missing
   STATUS="$(wo status 2>/dev/null)"
   if echo "$STATUS" | grep -qiE "registration missing|not registered"; then
     w registration new || return 1
-    if [ "$MODE" = "warp" ] && [ "$IS_VPS" = "0" ]; then
+    if [ "$MODE" = "warp" ]; then
       w mode warp
     else
       w mode proxy
@@ -98,10 +120,14 @@ ensure_connected(){
     fi
     w connect
     sleep 4
-    wo status | head -1 | grep -q Connected && return 0
+    if wo status | head -1 | grep -q Connected; then
+      [ "$MODE" != "proxy" ] || proxy_ready
+      return $?
+    fi
   fi
 
-  wo status | head -1 | grep -q Connected
+  wo status | head -1 | grep -q Connected || return 1
+  [ "$MODE" != "proxy" ] || proxy_ready
 }
 
 ensure_guard(){
@@ -167,7 +193,13 @@ for i in 1 2 3 4 5 6; do
 done
 
 while true; do
+  # Guard/hop touch this file before rotating so a keeper tick cannot
+  # reconnect the tunnel underneath them.
+  if [ -f "$PAUSE_FILE" ]; then
+    sleep "$TICK"
+    continue
+  fi
   ensure_connected || true
   ensure_guard
-  sleep $TICK
+  sleep "$TICK"
 done

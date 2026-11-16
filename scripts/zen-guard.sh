@@ -14,9 +14,11 @@
 set -u
 
 LOGF="$HOME/.local/share/opencode/log/opencode.log"
-STATE_DIR="$HOME/.local/share/opencode-unlimited/guard"
+DEST="${OUC_DEST:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode-unlimited}"
+STATE_DIR="$DEST/guard"
 STATE="$STATE_DIR/state.json"
 GUARD_LOG="$STATE_DIR/guard.log"
+PAUSE_FILE="${OUC_PAUSE_FILE:-$DEST/keeper.pause}"
 
 # warp binary: service env → PATH → common fallbacks. probe with/without
 # --accept-tos (shimmed boxes pass it twice = dead CLI).
@@ -30,13 +32,19 @@ fi
 [ -n "$WARP" ] || { echo "warp-cli not found"; exit 1; }
 KEEPER="${OUC_KEEPER_UNIT:-opencode-unlimited-keeper}"
 
+# Keep the installer's isolated proxy mode unless the user deliberately
+# selected TUN. A wrong mode here can silently move traffic out of WARP.
+MODE="${OUC_WARP_MODE:-proxy}"
+
 COOLDOWN=75        # seconds between rotations (a rotation takes ~15s)
 MAX_HOP_TRIES=4
 BLACKLIST_MAX=200  # blacklist cap; oldest entries are recycled when full
 
 mkdir -p "$STATE_DIR"
 
-svc(){ sudo -n systemctl "$@" >/dev/null 2>&1 || sudo systemctl "$@" >/dev/null 2>&1; }
+# The guard is an unprivileged user service. Never fall back to interactive
+# sudo here: with no TTY it hangs and the keeper races the rotation.
+svc(){ sudo -n systemctl "$@" >/dev/null 2>&1; }
 w(){  sudo -n "$WARP" --accept-tos "$@" >/dev/null 2>&1 && return 0; sudo -n "$WARP" "$@" >/dev/null 2>&1; }
 wo(){ sudo -n "$WARP" --accept-tos "$@" 2>/dev/null && return 0; sudo -n "$WARP" "$@" 2>/dev/null; }
 
@@ -55,20 +63,18 @@ except: d={'blacklist':[],'offset':0,'last_hop':0,'hops':0,'current':''}
 d['$1']=sys.argv[1]
 json.dump(d,open('$STATE','w'))" "$2" 2>/dev/null; }
 
-IS_VPS=0
-if [ -n "${SSH_CLIENT:-}" ] || [ -n "${SSH_TTY:-}" ] || [ -n "${SSH_CONNECTION:-}" ] || [ -f /etc/cloud/cloud.cfg ] || [ -d /var/lib/cloud ] || wo settings 2>/dev/null | grep -qi "proxy"; then
-  IS_VPS=1
+USE_PROXY=0
+if [ "$MODE" != "warp" ] || [ -f /etc/opencode-unlimited-vps.flag ] || [ -f "$DEST/vps.flag" ]; then
+  USE_PROXY=1
 fi
 
 cur_v6(){
   local v ep
-  if [ "$IS_VPS" = "1" ]; then
+  if [ "$USE_PROXY" = "1" ]; then
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 "$ep" 2>/dev/null)
       case "$v" in *:*) echo "$v"; return;; esac
     done
-    v=$(timeout 10 curl -x http://127.0.0.1:41987 -s -m 8 https://api6.ipify.org 2>/dev/null)
-    case "$v" in *:*) echo "$v"; return;; esac
   else
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -6 -s -m 8 "$ep" 2>/dev/null)
@@ -84,10 +90,10 @@ m64(){ echo "$1" | cut -d: -f1-4; }
 # cannot return with a different interface ID and pass the check.
 blacklist_add(){
   [ -n "$1" ] || return 0
-  python3 - "$1" <<'PY' 2>/dev/null
-import json,sys,os
+  python3 - "$1" "$STATE" <<'PY' 2>/dev/null
+import json,sys
 def m64(a): return ":".join(a.split(":")[:4])
-p=os.path.expanduser("~/.local/share/opencode-unlimited/guard/state.json")
+p=sys.argv[2]
 try: d=json.load(open(p))
 except: d={"blacklist":[],"offset":0,"last_hop":0,"hops":0,"current":""}
 m=m64(sys.argv[1])
@@ -98,20 +104,30 @@ PY
 }
 
 is_burnt(){
-  python3 - "$1" <<'PY' 2>/dev/null
-import json,sys,os
+  python3 - "$1" "$STATE" <<'PY' 2>/dev/null
+import json,sys
 def m64(a): return ":".join(a.split(":")[:4])
-try: d=json.load(open(os.path.expanduser("~/.local/share/opencode-unlimited/guard/state.json")))
+try: d=json.load(open(sys.argv[2]))
 except: sys.exit(1)
 m=m64(sys.argv[1])
 sys.exit(0 if any(x and m64(x)==m for x in d.get("blacklist",[])) else 1)
 PY
 }
 
+keeper_pause(){
+  touch "$PAUSE_FILE" 2>/dev/null || true
+  svc stop "$KEEPER" || glog "keeper stop not permitted; pause file holds the next tick"
+}
+
+keeper_resume(){
+  rm -f "$PAUSE_FILE" 2>/dev/null || true
+  svc start "$KEEPER" || true
+}
+
 hop_once(){
   # one non-destructive session rotation. prints the new IPv6 or empty.
   local old="$1" v="" i
-  svc stop "$KEEPER"
+  keeper_pause
   w disconnect
 
   # Recreate a registration only when it is actually missing.
@@ -125,11 +141,11 @@ hop_once(){
   # rotate-keys keeps the device registration and renews the WireGuard
   # session, so Cloudflare assigns a new client /64.
   w tunnel rotate-keys
-  if [ "$IS_VPS" = "1" ]; then
+  if [ "$MODE" = "warp" ]; then
+    w mode warp
+  else
     w mode proxy
     w proxy port 40000
-  else
-    w mode warp
   fi
   w connect
 
@@ -139,7 +155,7 @@ hop_once(){
     case "$v" in
       *:*)
         if [ -z "$old" ] || [ "$(m64 "$v")" != "$(m64 "$old")" ]; then
-          svc start "$KEEPER"
+          keeper_resume
           echo "$v"
           return
         fi
@@ -148,7 +164,7 @@ hop_once(){
     v=""
   done
 
-  svc start "$KEEPER"
+  keeper_resume
   echo ""
 }
 

@@ -10,7 +10,7 @@ function New-OucVersionFile {
         [string]$Description = "Opencode Unlimited",
         [string]$ProductName = "Opencode Unlimited",
         [string]$Company = "Avatar",
-        [string]$Version = "2.4.2"
+        [string]$Version = "3.0"
     )
 
     $parts = @($Version.Split(".") | ForEach-Object { [int]$_ })

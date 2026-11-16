@@ -163,6 +163,14 @@ def _task_exists(task_name: str) -> bool:
         return False
 
 
+def _task_xml_enabled(xml: str) -> bool:
+    """Parse a task XML export; enabled tasks omit the Enabled element."""
+    # schtasks writes UTF-16, which run_hidden may decode as single-byte text.
+    # Removing NULs recovers the ASCII XML we need on every Windows locale.
+    text = (xml or "").replace("\x00", "")
+    return not re.search(r"<enabled>\s*false\s*</enabled>", text, re.IGNORECASE)
+
+
 def _task_enabled(task_name: str) -> bool:
     """True only for an existing, enabled logon task.
 
@@ -170,15 +178,8 @@ def _task_enabled(task_name: str) -> bool:
     never restarted behind their back.
     """
     try:
-        # Task XML keeps the Enabled element in English on every Windows
-        # locale, unlike the localized text output of /FO LIST.
         res = run_hidden(["schtasks", "/Query", "/TN", task_name, "/XML"], timeout=5.0)
-        if res.returncode != 0:
-            return False
-        xml = res.stdout or ""
-        if re.search(r"<enabled>\s*false\s*</enabled>", xml, re.IGNORECASE):
-            return False
-        return True
+        return res.returncode == 0 and _task_xml_enabled(res.stdout or "")
     except Exception:
         return False
 

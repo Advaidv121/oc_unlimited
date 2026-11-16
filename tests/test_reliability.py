@@ -115,6 +115,21 @@ class EdgeFailoverTests(unittest.TestCase):
         self.assertIn("fallback:", log)
 
 
+class TaskEnabledParseTests(unittest.TestCase):
+    def test_enabled_tasks_omit_the_element(self) -> None:
+        self.assertTrue(avatar_ui._task_xml_enabled("<Task><Settings></Settings></Task>"))
+
+    def test_disabled_task_is_detected(self) -> None:
+        self.assertFalse(
+            avatar_ui._task_xml_enabled("<Task><Settings><Enabled>false</Enabled></Settings></Task>")
+        )
+
+    def test_utf16_text_decoded_as_single_bytes_still_parses(self) -> None:
+        xml = "<Task><Settings><Enabled>false</Enabled></Settings></Task>"
+        interleaved = "".join(char + "\x00" for char in xml)
+        self.assertFalse(avatar_ui._task_xml_enabled(interleaved))
+
+
 class AutoRepairTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -185,6 +200,53 @@ class AutoRepairTests(unittest.TestCase):
             api._auto_repair_tick()
 
         self.assertEqual(api._repair_performed, ["start_keeper"])
+
+
+class HealthTests(unittest.TestCase):
+    def _health(self, *, proxy: dict, net_errors: list[str]) -> dict:
+        api = object.__new__(avatar_ui.AvatarControlApi)
+        return api._build_health(
+            warp_installed=True,
+            warp_connected=True,
+            rotating=False,
+            egress={"mode": "warp"},
+            keeper_running=True,
+            guard_running=True,
+            proxy_listening=True,
+            svc_wired=True,
+            installed=True,
+            probe={"ok": True, "code": "ok", "ms": 120},
+            proxy=proxy,
+            net_errors=net_errors,
+            desktop_installed=True,
+            cli_installed=True,
+            path_wired=True,
+        )
+
+    def test_direct_fallback_is_visible_and_actionable(self) -> None:
+        health = self._health(
+            proxy={"fallback_active": True, "fallback_age": 120}, net_errors=[]
+        )
+        issue = next(i for i in health["issues"] if i["title"] == "Using a direct connection")
+
+        self.assertEqual(issue["level"], "warn")
+        self.assertEqual(issue["fix"], "repair_warp")
+        self.assertIn("2 minutes ago", issue["detail"])
+
+    def test_recent_transport_errors_are_reported_without_duplicate_fallback(self) -> None:
+        health = self._health(
+            proxy={"fallback_active": False}, net_errors=["ECONNRESET while reading"]
+        )
+        titles = [i["title"] for i in health["issues"]]
+        self.assertIn("OpenCode hit a network error", titles)
+
+        duplicate = self._health(
+            proxy={"fallback_active": True, "fallback_age": 120},
+            net_errors=["ECONNRESET while reading"],
+        )
+        duplicate_titles = [i["title"] for i in duplicate["issues"]]
+        self.assertIn("Using a direct connection", duplicate_titles)
+        self.assertNotIn("OpenCode hit a network error", duplicate_titles)
 
 
 class CustomProxyFailoverTests(unittest.TestCase):

@@ -327,6 +327,25 @@ def _find_pythonw() -> str | None:
     return None
 
 
+def _write_cmd_wrapper(path: Path, content: str) -> None:
+    """Write a .cmd shim, switching to UTF-8 when a path holds non-ASCII text.
+
+    cmd.exe reads batch files in the active console code page, so a UTF-8 shim
+    needs ``chcp 65001`` before the first non-ASCII line. ASCII shims keep the
+    plain fast path and leave the console code page alone.
+    """
+    try:
+        path.write_bytes(content.encode("ascii"))
+        return
+    except UnicodeEncodeError:
+        pass
+
+    lines = content.split("\r\n")
+    if lines and lines[0].lower().startswith("@echo off"):
+        lines.insert(1, "chcp 65001 >nul")
+    path.write_bytes("\r\n".join(lines).encode("utf-8"))
+
+
 def _deploy_scripts_and_shims() -> dict[str, str]:
     ensure_dirs()
     src_dir = _BUNDLE
@@ -358,7 +377,7 @@ def _deploy_scripts_and_shims() -> dict[str, str]:
             "opencode-unlimited-guard.cmd": f'@echo off\r\n"{py_exe}" "{SCRIPTS_DIR / "zen_guard.py"}" %*\r\nexit /b %ERRORLEVEL%\r\n',
         }
         for name, content in wrappers.items():
-            (BIN_DIR / name).write_text(content, encoding="ascii")
+            _write_cmd_wrapper(BIN_DIR / name, content)
     elif getattr(sys, "frozen", False):
         exe = sys.executable
         wrappers = {
@@ -370,7 +389,7 @@ def _deploy_scripts_and_shims() -> dict[str, str]:
             "opencode-unlimited-guard.cmd": f'@echo off\r\n"{exe}" --worker guard\r\nexit /b %ERRORLEVEL%\r\n',
         }
         for name, content in wrappers.items():
-            (BIN_DIR / name).write_text(content, encoding="ascii")
+            _write_cmd_wrapper(BIN_DIR / name, content)
 
     return {"scripts_dir": str(SCRIPTS_DIR), "bin_dir": str(BIN_DIR)}
 

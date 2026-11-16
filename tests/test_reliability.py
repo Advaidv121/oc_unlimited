@@ -539,5 +539,53 @@ class CustomProxyFailoverTests(unittest.TestCase):
         self.assertEqual(proxy_chain.PROXY_INDEX_FILE.read_text(encoding="utf-8"), "0")
 
 
+class CmdWrapperEncodingTests(unittest.TestCase):
+    def test_non_ascii_path_switches_the_shim_to_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "opencode.cmd"
+            content = (
+                "@echo off\r\n"
+                '"C:\\Users\\\u043f\u0440\u043e\u0444\u0438\u043b\u044c\\python.exe" '
+                '"C:\\Users\\\u043f\u0440\u043e\u0444\u0438\u043b\u044c\\zen_lane.py" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n"
+            )
+            avatar_ui._write_cmd_wrapper(target, content)
+            data = target.read_bytes()
+            self.assertIn(b"chcp 65001 >nul", data)
+            self.assertEqual(
+                data.decode("utf-8"),
+                content.replace("@echo off\r\n", "@echo off\r\nchcp 65001 >nul\r\n", 1),
+            )
+
+    def test_ascii_path_keeps_the_shim_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "opencode.cmd"
+            content = (
+                '@echo off\r\n"C:\\Python310\\python.exe" '
+                '"C:\\ouc\\zen_lane.py" %*\r\nexit /b %ERRORLEVEL%\r\n'
+            )
+            avatar_ui._write_cmd_wrapper(target, content)
+            self.assertEqual(target.read_bytes(), content.encode("ascii"))
+            self.assertNotIn(b"chcp", target.read_bytes())
+
+    def test_deploy_handles_a_non_ascii_install_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "\u043f\u0440\u043e\u0444\u0438\u043b\u044c"
+            bin_dir = base / "bin"
+            scripts_dir = base / "scripts"
+            bin_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            with mock.patch.object(avatar_ui, "BIN_DIR", bin_dir), mock.patch.object(
+                avatar_ui, "SCRIPTS_DIR", scripts_dir
+            ), mock.patch.object(avatar_ui, "ensure_dirs"), mock.patch.object(
+                avatar_ui.sys, "frozen", True, create=True
+            ):
+                avatar_ui._deploy_scripts_and_shims()
+
+            shim = bin_dir / "opencode.cmd"
+            self.assertTrue(shim.is_file())
+            self.assertIn(b"chcp 65001 >nul", shim.read_bytes())
+
+
 if __name__ == "__main__":
     unittest.main()

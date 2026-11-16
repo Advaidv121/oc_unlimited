@@ -56,6 +56,9 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
   * Isolated proxy mode remains the installer default. `OUC_WARP_MODE=warp` is the explicit opt-in for full TUN.
   * Rotation pauses the keeper with a pause file plus a service stop/start, so a keeper tick cannot reconnect WARP underneath a rotation.
   * `opencode-unlimited-doctor` now checks the Python proxy modules, WARP port `40000`, resolved iptables paths, both services, the shim, and stale pause files.
+* **Install/Repair on non-English Windows:**
+  * The `.cmd` shims are written as UTF-8 with `chcp 65001` when the Windows profile path contains non-ASCII characters. Previously the app stopped with `UnicodeEncodeError: 'ascii' codec can't encode characters ...` on those systems.
+  * ASCII-only paths keep the previous plain shims and do not touch the console code page.
 * **Existing Chat Auto-Unlock & History Preservation:**
   * Removes client-side rate limit lockouts (`free-limit`, `go-upsell`) from `%APPDATA%\ai.opencode.desktop\drafts.sqlite` after a successful rotation.
   * Leaves the chat history and session tables untouched.

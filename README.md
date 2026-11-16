@@ -1,6 +1,6 @@
 # PLEASE GIVE PROPER CREDITS. JUST DONT REBRAND AND LAUNCH IT AS YOURS.
 # NEW VERSION-3.0 (Fixed:503,ECONNRESET, keeper flapping, quota resets, drafts.sqlite unlock, WireGuard enforcement, auto-resume and some other BUGS)
-# Opencode-Unlimited-Limit-Bypass (Remember all burnt IPs reset aroun midnight of your region)
+# Opencode-Unlimited-Limit-Bypass (Remember all burnt IPs reset around midnight of your region)
 
 [![Version](https://img.shields.io/badge/Version-v3.0-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
 [![Author](https://img.shields.io/badge/Author-Avatar%20%28ShadowySphinX%29-22d3ee?style=for-the-badge&logo=github)](https://github.com/ShadowySphinX)

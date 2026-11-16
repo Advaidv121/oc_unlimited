@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -241,6 +242,93 @@ class BodyReadTests(unittest.TestCase):
                 return b"abc" if self.calls == 1 else b""
 
         self.assertEqual(zen_proxy._read_exact(TruncatedStream(), 10), b"abc")
+
+
+class StreamResetReportingTests(unittest.TestCase):
+    class _FakeSocket:
+        def __init__(self, recv_events: list[object]) -> None:
+            self.recv_events = list(recv_events)
+            self.sent: list[bytes] = []
+            self.shutdowns: list[int] = []
+
+        def setsockopt(self, *args) -> None:
+            pass
+
+        def ioctl(self, *args) -> None:
+            pass
+
+        def recv(self, size: int, flags: int = 0) -> bytes:
+            event = self.recv_events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        def shutdown(self, how: int) -> None:
+            self.shutdowns.append(how)
+
+    def test_reset_after_the_client_closed_is_not_a_cut_stream(self) -> None:
+        client = self._FakeSocket([b""])
+        upstream = self._FakeSocket(
+            [b"HTTP/1.1 200 OK\r\n\r\n", ConnectionResetError("cut")]
+        )
+        with mock.patch.object(
+            zen_proxy.select,
+            "select",
+            side_effect=[
+                ([upstream], [], []),
+                ([client], [], []),
+                ([upstream], [], []),
+            ],
+        ), mock.patch.object(
+            zen_proxy, "_drain_client"
+        ), mock.patch.object(
+            zen_proxy, "_note_stream_reset"
+        ) as note, mock.patch.object(
+            zen_proxy, "_record_reset"
+        ) as reset:
+            zen_proxy._relay(client, upstream, "opencode.ai", None, "edge-a")
+
+        self.assertFalse(note.called)
+        self.assertFalse(reset.called)
+
+    def test_reset_while_the_client_waits_is_reported(self) -> None:
+        client = self._FakeSocket([])
+        upstream = self._FakeSocket(
+            [b"HTTP/1.1 200 OK\r\n\r\n", ConnectionResetError("cut")]
+        )
+        with mock.patch.object(
+            zen_proxy.select,
+            "select",
+            side_effect=[
+                ([upstream], [], []),
+                ([upstream], [], []),
+                ([], [], []),
+            ],
+        ), mock.patch.object(
+            zen_proxy, "_drain_client"
+        ), mock.patch.object(
+            zen_proxy, "_note_stream_reset"
+        ) as note:
+            zen_proxy._relay(client, upstream, "opencode.ai", None, "edge-a")
+
+        note.assert_called_once()
+        host, detail, state, edge = note.call_args.args
+        self.assertEqual(host, "opencode.ai")
+        self.assertIn("after response", detail)
+        self.assertIsNone(state)
+        self.assertEqual(edge, "edge-a")
+
+    def test_client_gone_detects_a_pending_close(self) -> None:
+        left, right = socket.socketpair()
+        try:
+            self.assertFalse(zen_proxy._client_gone(left, set(), seconds=0.02))
+            right.close()
+            self.assertTrue(zen_proxy._client_gone(left, set(), seconds=0.5))
+        finally:
+            left.close()
 
 
 class TaskEnabledParseTests(unittest.TestCase):

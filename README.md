@@ -36,7 +36,7 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 * **Long responses survive flaky edges (Windows):**
   * Fixed a relay bug where the proxy's buffered header reader could swallow the first TLS bytes after `CONNECT`, leaving the tunnel waiting for a response that had already arrived.
   * The relay is now unbuffered, enables `TCP_NODELAY` and TCP keepalive on both sockets, and drains the client briefly when the upstream sends FIN. Windows closes with FIN instead of turning a completed response into an `ECONNRESET`.
-  * Mid-stream resets are recorded as `stream_reset` and counted separately from connection failures. The Proxy tab and health panel now distinguish "the route never came up" from "a live stream was cut".
+  * Mid-stream resets are recorded as `stream_reset` and counted separately from connection failures when the client was still waiting for data. A response that already completed before the server sent RST is not counted. The Proxy tab and health panel now distinguish "the route never came up" from "a live stream was cut".
   * A pinned Cloudflare edge that cuts two live streams within five minutes is retired for new connections. Existing streams are left alone.
   * WARP tunnel repair is deferred while another proxy tunnel is active, so a repair cannot kill a response that is still generating. The failed request gets one quick retry first.
 * **Connection Recovery & Diagnostics:**
@@ -181,7 +181,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 * **What v3.0 changed:**
   1. The proxy no longer buffers bytes past the `CONNECT` header. That bug could leave the TLS tunnel half-open until the client timed out or reset.
   2. Both sockets use TCP keepalive and `TCP_NODELAY`, and the proxy drains the client briefly when the upstream sends FIN. This makes Windows close with FIN instead of RST.
-  3. A reset after response bytes started is logged as `stream_reset` (not `reset`) and counted in `stream_resets_5m`.
+  3. A reset after response bytes started, while the client was still waiting for data, is logged as `stream_reset` (not `reset`) and counted in `stream_resets_5m`. A completed response that ends with a server RST after the client closed is not counted.
   4. If the same pinned edge cuts two live streams within five minutes, new connections move to another edge. The current stream is not force-killed.
   5. Tunnel repair waits while another proxy tunnel is active, so a repair cannot tear down a response that is still generating.
 * **If it keeps happening:**

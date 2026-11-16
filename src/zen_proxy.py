@@ -391,6 +391,24 @@ def _note_stream_reset(
     _record_stream_reset(host, detail, edge)
 
 
+def _client_gone(sock: socket.socket, closed: set, seconds: float = 0.15) -> bool:
+    """Return True when the client already closed, including a pending EOF.
+
+    A reset after the client stopped reading is not a cut stream the user can
+    see. Waiting briefly for a pending EOF keeps completed responses from
+    being reported as failures when the server closes with RST.
+    """
+    if sock in closed:
+        return True
+    try:
+        readable, _, _ = select.select([sock], [], [], seconds)
+        if not readable:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
+
+
 def _read_exact(stream, size: int) -> bytes:
     """Read exactly ``size`` bytes from an unbuffered socket stream."""
     chunks: list[bytes] = []
@@ -470,9 +488,13 @@ def _relay(
                     # of a clean FIN. A reset before the upstream sent anything
                     # is a route failure; one after data started is a cut stream.
                     if src is b and src in seen_data:
-                        _note_stream_reset(
-                            host, f"{type(exc).__name__} after response", warp_state, edge
-                        )
+                        if not _client_gone(a, closed):
+                            _note_stream_reset(
+                                host,
+                                f"{type(exc).__name__} after response",
+                                warp_state,
+                                edge,
+                            )
                     elif not closed and src not in seen_data:
                         _record_reset(host, f"{type(exc).__name__} before response")
                     data = b""
@@ -480,14 +502,15 @@ def _relay(
                     # Windows reports a peer reset as plain OSError/WSAECONNRESET.
                     winerror = getattr(exc, "winerror", None)
                     if src is b and src in seen_data:
-                        _note_stream_reset(
-                            host,
-                            f"winsock {winerror} after response"
-                            if winerror
-                            else f"{type(exc).__name__} after response",
-                            warp_state,
-                            edge,
-                        )
+                        if not _client_gone(a, closed):
+                            _note_stream_reset(
+                                host,
+                                f"winsock {winerror} after response"
+                                if winerror
+                                else f"{type(exc).__name__} after response",
+                                warp_state,
+                                edge,
+                            )
                     elif not closed and src not in seen_data and winerror in (10053, 10054):
                         _record_reset(host, f"winsock {winerror} before response")
                     data = b""

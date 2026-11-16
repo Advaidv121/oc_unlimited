@@ -38,6 +38,7 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
   * The relay is now unbuffered, enables `TCP_NODELAY` and TCP keepalive on both sockets, and drains the client briefly when the upstream sends FIN. Windows closes with FIN instead of turning a completed response into an `ECONNRESET`.
   * Mid-stream resets are recorded as `stream_reset` and counted separately from connection failures when the client was still waiting for data. A response that already completed before the server sent RST is not counted. The Proxy tab and health panel now distinguish "the route never came up" from "a live stream was cut".
   * A pinned Cloudflare edge that cuts two live streams within five minutes is retired for new connections. Existing streams are left alone.
+  * If WARP reconnects with a new local IPv6 while a request is connecting, the proxy detects the stale bind (`WinError 10049` / `EADDRNOTAVAIL`) and retries once with the fresh address instead of failing every edge.
   * WARP tunnel repair is deferred while another proxy tunnel is active, so a repair cannot kill a response that is still generating. The failed request gets one quick retry first.
 * **Connection Recovery & Diagnostics:**
   * The local proxy fails over to another Cloudflare edge instead of stalling on one dead address.

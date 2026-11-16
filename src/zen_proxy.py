@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import random
@@ -335,6 +336,12 @@ class _WarpState:
                 pass
             return replacement
 
+    def invalidate(self) -> None:
+        """Drop the cached tunnel address after WARP reconnects."""
+        with self._lock:
+            self._ts = 0.0
+            self._v6 = None
+
     def get(self, wait_if_rotating: bool = True) -> tuple[str | None, str]:
         deadline = time.monotonic() + (18.0 if wait_if_rotating else 0.0)
         while True:
@@ -571,28 +578,53 @@ def _open_pinned_v6(dest_ip: str, port: int, local_v6: str, timeout: float = 12.
         raise
 
 
+def _local_address_stale(exc: OSError) -> bool:
+    """Return True when the bound WARP address disappeared mid-flight."""
+    return getattr(exc, "winerror", None) == 10049 or exc.errno == errno.EADDRNOTAVAIL
+
+
 def _open_pinned_any(
     label: str,
     port: int,
     warp_state: _WarpState,
 ) -> tuple[socket.socket, str]:
-    """Try the current pinned address, then a few alternatives, before declaring the route dead."""
+    """Try the current pinned address, then a few alternatives, before declaring the route dead.
+
+    A WARP reconnect replaces the local IPv6 address. Binding the old one fails
+    on every edge, so refresh the cached address once instead of reporting the
+    whole route as dead.
+    """
     local_v6, _ = warp_state.get(wait_if_rotating=True)
     if not local_v6:
         raise ConnectionRefusedError("WARP tunnel has no IPv6 address")
 
     last: Exception | None = None
-    for edge in warp_state.edges_to_try():
-        try:
-            sock = _open_pinned_v6(
-                edge, port, local_v6, timeout=EDGE_CONNECT_TIMEOUT
-            )
-            warp_state.mark_edge_ok(edge)
-            return sock, edge
-        except Exception as exc:
-            last = exc
-            warp_state.mark_edge_failed(edge)
-            _record_event("edge_fail", f"{type(exc).__name__}: {exc}", label, edge)
+    for attempt in range(2):
+        stale_local = False
+        for edge in warp_state.edges_to_try():
+            try:
+                sock = _open_pinned_v6(
+                    edge, port, local_v6, timeout=EDGE_CONNECT_TIMEOUT
+                )
+                warp_state.mark_edge_ok(edge)
+                return sock, edge
+            except Exception as exc:
+                last = exc
+                if isinstance(exc, OSError) and _local_address_stale(exc):
+                    stale_local = True
+                    break
+                warp_state.mark_edge_failed(edge)
+                _record_event("edge_fail", f"{type(exc).__name__}: {exc}", label, edge)
+
+        if not stale_local or attempt:
+            break
+        warp_state.invalidate()
+        fresh, _ = warp_state.get(wait_if_rotating=True)
+        if not fresh or fresh == local_v6:
+            break
+        local_v6 = fresh
+        _record_event("repair", "local WARP address changed; retrying", label)
+
     raise ConnectionRefusedError(f"No Cloudflare edge answered ({last})") from last
 
 

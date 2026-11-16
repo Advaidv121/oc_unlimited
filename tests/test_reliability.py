@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -138,6 +139,28 @@ class EdgeFailoverTests(unittest.TestCase):
             zen_proxy.PROXY_LOG_FILE,
         ) = self._saved
         self.tmp.cleanup()
+
+    def test_stale_warp_address_is_refreshed_once(self) -> None:
+        state = zen_proxy._WarpState(["edge-a"], "edge-a")
+        calls: list[tuple[str, str]] = []
+        fresh = object()
+
+        def fake_open(edge, port, local_v6, timeout=0.0):
+            calls.append((edge, local_v6))
+            if local_v6 == "2001:db8::1":
+                raise OSError(errno.EADDRNOTAVAIL, "address not available")
+            return fresh
+
+        with mock.patch.object(
+            zen_proxy, "get_warp_local_v6", side_effect=["2001:db8::1", "2001:db8::2"]
+        ), mock.patch.object(zen_proxy, "_open_pinned_v6", side_effect=fake_open):
+            sock, edge = zen_proxy._open_pinned_any("opencode.ai", 443, state)
+
+        self.assertIs(sock, fresh)
+        self.assertEqual(edge, "edge-a")
+        self.assertEqual(
+            calls, [("edge-a", "2001:db8::1"), ("edge-a", "2001:db8::2")]
+        )
 
     def test_primary_edge_is_first_and_failed_edge_is_skipped(self) -> None:
         state = zen_proxy._WarpState(["edge-a", "edge-b", "edge-c"], "edge-a")

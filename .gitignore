@@ -8,6 +8,8 @@ __pycache__/
 build/
 dist/
 *.spec
+*.exe.new
+*.exe~RF*.TMP
 
 # OS metadata
 Thumbs.db

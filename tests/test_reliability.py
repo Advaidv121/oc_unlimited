@@ -1,0 +1,246 @@
+"""Focused regression tests for route failover, diagnostics, and health parsing."""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import threading
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+import avatar_ui
+import proxy_chain
+import zen_proxy
+
+
+class RecentNetworkErrorTests(unittest.TestCase):
+    def _line(self, when: datetime, message: str) -> str:
+        return (
+            f"timestamp={when.strftime('%Y-%m-%dT%H:%M:%S')}.123Z "
+            f'level=ERROR run=test message="{message}"'
+        )
+
+    def test_only_recent_upstream_failures_are_reported(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = self._line(now - timedelta(hours=2), "ECONNRESET while contacting provider")
+        recent = self._line(now - timedelta(seconds=30), "AI.Error: ECONNRESET")
+        own_503 = (
+            f"timestamp={now.strftime('%Y-%m-%dT%H:%M:%S')}.123Z level=INFO "
+            'message="Sent HTTP response" http.method=GET http.url=/api/info http.status=503'
+        )
+        upstream_503 = self._line(
+            now - timedelta(seconds=20), "AI_APICallError statusCode=503"
+        )
+
+        found = avatar_ui._recent_network_errors(
+            [old, recent, own_503, upstream_503]
+        )
+
+        self.assertEqual(len(found), 2)
+        self.assertTrue(any("ECONNRESET" in line for line in found))
+        self.assertTrue(any("AI_APICallError" in line for line in found))
+        self.assertFalse(any("api/info" in line for line in found))
+
+    def test_lines_without_a_timestamp_are_ignored(self) -> None:
+        self.assertEqual(
+            avatar_ui._recent_network_errors(["stack trace: ECONNRESET"]), []
+        )
+
+
+class EdgeFailoverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._saved = (
+            zen_proxy.LANE_DIR,
+            zen_proxy.PROXY_STATUS_FILE,
+            zen_proxy.FALLBACK_FLAG,
+            zen_proxy.PROXY_LOG_FILE,
+        )
+        zen_proxy.LANE_DIR = self.dir
+        zen_proxy.PROXY_STATUS_FILE = self.dir / "proxy_status.json"
+        zen_proxy.FALLBACK_FLAG = self.dir / "fallback.flag"
+        zen_proxy.PROXY_LOG_FILE = self.dir / "proxy.log"
+
+    def tearDown(self) -> None:
+        (
+            zen_proxy.LANE_DIR,
+            zen_proxy.PROXY_STATUS_FILE,
+            zen_proxy.FALLBACK_FLAG,
+            zen_proxy.PROXY_LOG_FILE,
+        ) = self._saved
+        self.tmp.cleanup()
+
+    def test_primary_edge_is_first_and_failed_edge_is_skipped(self) -> None:
+        state = zen_proxy._WarpState(["edge-a", "edge-b", "edge-c"], "edge-a")
+        self.assertEqual(state.edges_to_try()[0], "edge-a")
+
+        state.mark_edge_failed("edge-a")
+        choices = state.edges_to_try()
+
+        self.assertNotIn("edge-a", choices)
+        self.assertLessEqual(len(choices), zen_proxy.EDGE_TRY_LIMIT)
+        self.assertNotEqual(state.get(wait_if_rotating=False)[1], "edge-a")
+
+    def test_success_clears_fallback_and_switches_primary(self) -> None:
+        state = zen_proxy._WarpState(["edge-a", "edge-b"], "edge-a")
+        zen_proxy.FALLBACK_FLAG.write_text("1", encoding="utf-8")
+
+        state.mark_edge_ok("edge-b")
+
+        self.assertFalse(zen_proxy.FALLBACK_FLAG.exists())
+        self.assertEqual(state.get(wait_if_rotating=False)[1], "edge-b")
+        self.assertEqual(
+            (self.dir / "last_edge.txt").read_text(encoding="utf-8").strip(),
+            "edge-b",
+        )
+
+    def test_status_counts_errors_and_fallbacks(self) -> None:
+        zen_proxy._record_event("reset", "ConnectionResetError", "opencode.ai", "edge-a")
+        zen_proxy._record_event("fallback", "direct route used", "opencode.ai")
+        status = zen_proxy.proxy_status()
+
+        self.assertEqual(status["errors_5m"], 1)
+        self.assertEqual(status["fallbacks_5m"], 1)
+        self.assertIsNotNone(status["fallback_age"])
+        self.assertLessEqual(status["fallback_age"], 2)
+        log = (self.dir / "proxy.log").read_text(encoding="utf-8")
+        self.assertIn("reset:", log)
+        self.assertIn("fallback:", log)
+
+
+class AutoRepairTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._saved_log = avatar_ui.AUTO_REPAIR_LOG
+        avatar_ui.AUTO_REPAIR_LOG = Path(self.tmp.name) / "auto_repair.log"
+
+    def tearDown(self) -> None:
+        avatar_ui.AUTO_REPAIR_LOG = self._saved_log
+        self.tmp.cleanup()
+
+    def _api(self, state: dict) -> avatar_ui.AvatarControlApi:
+        api = object.__new__(avatar_ui.AvatarControlApi)
+        api._repair_lock = threading.Lock()
+        api._repair_last = {}
+        api._repair_actions = []
+        api._repair_status = ""
+        api._repair_enabled = True
+        api._action_lock = threading.Lock()
+        api.get_state = lambda force_egress=False: state
+        api._repair_performed = []
+        api._run_repair_action = lambda action: (
+            api._repair_performed.append(action) or {"ok": True, "message": "done"}
+        )
+        return api
+
+    def _state(self, *, wired: bool, listening: bool, keeper_running: bool) -> dict:
+        return {
+            "services": {
+                "proxy_listening": listening,
+                "keeper_running": keeper_running,
+                "keeper_heartbeat": 1.0,
+            },
+            "warp": {"connected": True, "rotating": False},
+            "proxy": {"fallback_active": False, "errors_5m": 0},
+            "probe": {"code": "ok"},
+            "egress": {"mode": "warp"},
+            "lane": {"desktop_service_wired": wired, "path_wired": False},
+        }
+
+    def test_repairs_proxy_only_when_the_task_was_not_disabled(self) -> None:
+        state = self._state(wired=True, listening=False, keeper_running=False)
+        api = self._api(state)
+
+        with mock.patch.object(avatar_ui, "_task_enabled", return_value=True):
+            api._auto_repair_tick()
+        self.assertEqual(api._repair_performed, ["start_keeper"])
+
+        api2 = self._api(state)
+        with mock.patch.object(avatar_ui, "_task_enabled", return_value=False):
+            api2._auto_repair_tick()
+        self.assertEqual(api2._repair_performed, [])
+
+    def test_fallback_changes_edge_instead_of_restarting_a_healthy_route(self) -> None:
+        state = self._state(wired=True, listening=True, keeper_running=True)
+        state["proxy"] = {"fallback_active": True, "errors_5m": 1}
+        api = self._api(state)
+
+        api._auto_repair_tick()
+
+        self.assertEqual(api._repair_performed, ["hop"])
+
+    def test_repeated_repairs_respect_the_cooldown(self) -> None:
+        state = self._state(wired=True, listening=False, keeper_running=False)
+        api = self._api(state)
+
+        with mock.patch.object(avatar_ui, "_task_enabled", return_value=True):
+            api._auto_repair_tick()
+            api._auto_repair_tick()
+
+        self.assertEqual(api._repair_performed, ["start_keeper"])
+
+
+class CustomProxyFailoverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._saved = (
+            proxy_chain.EGRESS_CONFIG_FILE,
+            proxy_chain.PROXY_INDEX_FILE,
+            proxy_chain.ensure_dirs,
+        )
+        proxy_chain.EGRESS_CONFIG_FILE = self.dir / "egress_mode.json"
+        proxy_chain.PROXY_INDEX_FILE = self.dir / "custom_proxy_index.txt"
+        proxy_chain.ensure_dirs = lambda: None
+        proxy_chain.EGRESS_CONFIG_FILE.write_text(
+            json.dumps(
+                {
+                    "mode": "custom",
+                    "warp_scope": "tun",
+                    "custom_proxy": "10.0.0.1:1080,10.0.0.2:1080",
+                    "custom_type": "socks5",
+                }
+            ),
+            encoding="utf-8",
+        )
+        proxy_chain.PROXY_INDEX_FILE.write_text("0", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        (
+            proxy_chain.EGRESS_CONFIG_FILE,
+            proxy_chain.PROXY_INDEX_FILE,
+            proxy_chain.ensure_dirs,
+        ) = self._saved
+        self.tmp.cleanup()
+
+    def test_failover_advances_without_blocking_verification(self) -> None:
+        def warp_down(host: str, port: int):
+            raise ConnectionError("warp down")
+
+        with mock.patch.object(
+            proxy_chain, "open_socks5_tunnel", side_effect=OSError("node down")
+        ), mock.patch.object(
+            proxy_chain, "open_http_proxy_tunnel", side_effect=OSError("node down")
+        ), mock.patch.object(
+            proxy_chain,
+            "rotate_custom_proxy",
+            side_effect=AssertionError("request path must not verify proxy nodes"),
+        ), mock.patch.object(
+            proxy_chain, "advance_custom_proxy", wraps=proxy_chain.advance_custom_proxy
+        ) as advance:
+            with self.assertRaises(ConnectionError):
+                proxy_chain.open_multi_egress_upstream("opencode.ai", 443, warp_down)
+
+        self.assertGreaterEqual(advance.call_count, 1)
+        self.assertEqual(proxy_chain.PROXY_INDEX_FILE.read_text(encoding="utf-8"), "0")
+
+
+if __name__ == "__main__":
+    unittest.main()

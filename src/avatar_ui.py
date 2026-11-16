@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -44,6 +46,7 @@ from ouc_common import (
     SERVICE_PROXY_PORT,
     TASK_GUARD,
     TASK_KEEPER,
+    append_log,
     ensure_dirs,
     ensure_warp_mode,
     fetch_opencode_aaaa_pool,
@@ -99,6 +102,20 @@ PROBE_EVERY = 120.0
 PROBE_TIMEOUT = 8.0
 HEARTBEAT_STALE = 240.0
 
+# Auto-repair only touches connectivity, never the user's selected route or
+# OpenCode itself. Cooldowns keep a permanent outage from becoming a loop.
+AUTO_REPAIR_FILE = LANE_DIR / "auto_repair.json"
+AUTO_REPAIR_LOG = LANE_DIR / "auto_repair.log"
+AUTO_REPAIR_TICK = 25.0
+AUTO_REPAIR_MAX_PER_HOUR = 6
+AUTO_REPAIR_COOLDOWNS = {
+    "start_keeper": 120.0,
+    "restart_keeper": 600.0,
+    "connect_warp": 180.0,
+    "hop": 300.0,
+    "repair_warp": 900.0,
+}
+
 
 def _enable_dark_titlebar() -> None:
     """Apply native Windows 10/11 dark mode to the PyWebView window frame."""
@@ -142,6 +159,26 @@ def _task_exists(task_name: str) -> bool:
     try:
         res = run_hidden(["schtasks", "/Query", "/TN", task_name], timeout=5.0)
         return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _task_enabled(task_name: str) -> bool:
+    """True only for an existing, enabled logon task.
+
+    Auto-repair uses this so a worker the user deliberately turned off is
+    never restarted behind their back.
+    """
+    try:
+        # Task XML keeps the Enabled element in English on every Windows
+        # locale, unlike the localized text output of /FO LIST.
+        res = run_hidden(["schtasks", "/Query", "/TN", task_name, "/XML"], timeout=5.0)
+        if res.returncode != 0:
+            return False
+        xml = res.stdout or ""
+        if re.search(r"<enabled>\s*false\s*</enabled>", xml, re.IGNORECASE):
+            return False
+        return True
     except Exception:
         return False
 
@@ -212,6 +249,50 @@ def _tail_lines(path: Path, count: int = 75) -> list[str]:
         return lines[-count:]
     except Exception:
         return []
+
+
+_NET_ERROR_RE = re.compile(
+    r"ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENETUNREACH|"
+    r"EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|CF_HAPPY_EYEBALLS|UND_ERR_|"
+    r"Transport error|fetch failed",
+    re.IGNORECASE,
+)
+_UPSTREAM_503_RE = re.compile(
+    r"AI_APICallError|statusCode[=:\s]+503|Request failed with status 503",
+    re.IGNORECASE,
+)
+_LOG_TS_RE = re.compile(r"^timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _recent_network_errors(lines: list[str], max_age: float = 600.0) -> list[str]:
+    """Upstream connection failures OpenCode logged in the last few minutes.
+
+    OpenCode's own ``http.status=503`` replies are not upstream failures, so
+    the match list is limited to transport errors and provider 503s.
+    """
+    cutoff = time.time() - max_age
+    found: list[str] = []
+    for line in lines:
+        if not (_NET_ERROR_RE.search(line) or _UPSTREAM_503_RE.search(line)):
+            continue
+        stamp = _LOG_TS_RE.match(line)
+        if not stamp:
+            continue
+        try:
+            when = datetime.datetime.strptime(
+                stamp.group(1), "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if when.timestamp() < cutoff:
+            continue
+        text = _LOG_TS_RE.sub("", line).replace("\\n", " ").strip()
+        for marker in ("level=ERROR ", "level=WARN "):
+            if text.startswith(marker):
+                text = text[len(marker):]
+                break
+        found.append(text[:260])
+    return found[-3:]
 
 
 def _read_db_stats() -> dict[str, int]:
@@ -293,11 +374,11 @@ def _deploy_scripts_and_shims() -> dict[str, str]:
     return {"scripts_dir": str(SCRIPTS_DIR), "bin_dir": str(BIN_DIR)}
 
 
-def _stop_worker_processes(name: str) -> int:
+def _stop_worker_processes(name: str) -> tuple[int, str]:
     """Stop the running keeper/guard process without touching tasks or service settings."""
     script_name = "warp_keeper.py" if name == "keeper" else "zen_guard.py"
     me = os.getpid()
-    killed = 0
+    targets = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             if proc.info["pid"] == me:
@@ -305,14 +386,26 @@ def _stop_worker_processes(name: str) -> int:
             pname = (proc.info.get("name") or "").lower()
             cmd = " ".join(proc.info.get("cmdline") or []).lower()
             if pname in ("python.exe", "pythonw.exe") and script_name in cmd:
-                proc.kill()
-                killed += 1
+                targets.append(proc)
             elif f"--worker {name}" in cmd:
-                proc.kill()
-                killed += 1
+                targets.append(proc)
         except Exception:
             pass
-    return killed
+
+    killed = 0
+    errors: list[str] = []
+    for proc in targets:
+        try:
+            proc.kill()
+            proc.wait(timeout=3.0)
+            killed += 1
+        except psutil.NoSuchProcess:
+            killed += 1
+        except psutil.AccessDenied:
+            errors.append(f"permission denied for PID {proc.pid}")
+        except Exception as exc:
+            errors.append(f"PID {proc.pid}: {exc}")
+    return killed, "; ".join(errors[:3])
 
 
 def _update_user_path(add: bool) -> bool:
@@ -365,10 +458,148 @@ class AvatarControlApi:
         self._probe: dict = {"ok": None, "code": "unknown", "ms": 0, "ts": 0}
         self._probe_checking = False
         self._probe_ts = 0.0
+        self._repair_lock = threading.Lock()
+        self._repair_last: dict[str, float] = {}
+        self._repair_actions: list[dict] = []
+        self._repair_status = "Watching for connection problems"
+        self._repair_enabled = self._load_repair_setting()
         self._refresh_egress_async(force=True)
         self._refresh_pool_async()
         self._refresh_probe_async(force=True)
         self._auto_heal_warp_startup()
+        threading.Thread(target=self._auto_repair_loop, daemon=True).start()
+
+    def _load_repair_setting(self) -> bool:
+        try:
+            data = json.loads(AUTO_REPAIR_FILE.read_text(encoding="utf-8"))
+            return bool(data.get("enabled", True))
+        except Exception:
+            return True
+
+    def _save_repair_setting(self, enabled: bool) -> None:
+        try:
+            tmp = AUTO_REPAIR_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
+            tmp.replace(AUTO_REPAIR_FILE)
+        except Exception:
+            pass
+
+    def _auto_repair_loop(self) -> None:
+        # Let startup checks settle before watching; the first pass is cheap.
+        time.sleep(20.0)
+        while True:
+            try:
+                if self._repair_enabled:
+                    self._auto_repair_tick()
+            except Exception as exc:
+                self._repair_status = f"Auto-repair hit an internal error: {exc}"
+            time.sleep(AUTO_REPAIR_TICK)
+
+    def _auto_repair_tick(self) -> None:
+        now = time.monotonic()
+        with self._repair_lock:
+            recent = [a for a in self._repair_actions if now - a["mono"] < 3600.0]
+            if len(recent) >= AUTO_REPAIR_MAX_PER_HOUR:
+                self._repair_status = (
+                    "Several repairs did not restore the route. Check the Connection tab; "
+                    "auto-repair will try again later."
+                )
+                return
+
+        if self._action_lock.locked():
+            return  # a user action or rotation is running
+
+        state = self.get_state()
+        services = state["services"]
+        warp = state["warp"]
+        proxy = state.get("proxy") or {}
+        probe = state.get("probe") or {}
+        mode = state["egress"].get("mode", "warp")
+        wired = state["lane"]["desktop_service_wired"] or state["lane"]["path_wired"]
+
+        action = ""
+        reason = ""
+        keeper_allowed = services["keeper_running"] or _task_enabled(TASK_KEEPER)
+        if wired and not services["proxy_listening"] and keeper_allowed:
+            action, reason = "start_keeper", "OpenCode is wired to the local proxy but it stopped"
+        elif services["keeper_running"] and services["keeper_heartbeat"] is not None and services["keeper_heartbeat"] > HEARTBEAT_STALE:
+            action, reason = "restart_keeper", "The background service stopped responding"
+        elif mode in ("warp", "clean") and not warp["connected"] and not warp["rotating"]:
+            action, reason = "connect_warp", "WARP is disconnected"
+        elif mode in ("warp", "clean") and services["proxy_listening"] and not warp["rotating"]:
+            code = probe.get("code", "")
+            failing = proxy.get("fallback_active") or code in ("upstream", "timeout")
+            if failing:
+                last_hop = self._repair_last.get("hop", 0.0)
+                if proxy.get("fallback_active") and now - last_hop > 600.0 and proxy.get("errors_5m", 0) >= 4:
+                    action, reason = "repair_warp", "The tunnel kept failing after an edge change"
+                else:
+                    action, reason = "hop", "The local proxy could not reach opencode.ai"
+        if not action:
+            self._repair_status = "Watching for connection problems"
+            return
+
+        with self._repair_lock:
+            last = self._repair_last.get(action, 0.0)
+            if now - last < AUTO_REPAIR_COOLDOWNS.get(action, 300.0):
+                return
+            self._repair_last[action] = now
+
+        self._repair_status = f"Repairing: {reason.lower()}..."
+        result = self._run_repair_action(action)
+        entry = {
+            "ts": int(time.time()),
+            "mono": time.monotonic(),
+            "action": action,
+            "reason": reason,
+            "ok": bool(result.get("ok")),
+            "message": str(result.get("message", ""))[:240],
+        }
+        with self._repair_lock:
+            self._repair_actions = (self._repair_actions + [entry])[-20:]
+        append_log(AUTO_REPAIR_LOG, f"{'ok' if entry['ok'] else 'failed'} {action}: {entry['message']}")
+        self._repair_status = (
+            f"Repaired: {reason}." if entry["ok"] else f"Could not repair automatically: {entry['message']}"
+        )
+
+    def _run_repair_action(self, action: str) -> dict:
+        if action == "start_keeper":
+            return self.fix_issue("start_keeper")
+        if action == "restart_keeper":
+            _stop_worker_processes("keeper")
+            time.sleep(1.0)
+            return self.toggle_worker("keeper", True)
+        if action == "connect_warp":
+            return self.warp_connect()
+        if action == "hop":
+            return self.hop_now()
+        if action == "repair_warp":
+            return self.repair_warp_connection()
+        return {"ok": False, "message": f"Unknown repair action: {action}"}
+
+    def get_auto_repair(self) -> dict:
+        with self._repair_lock:
+            actions = list(self._repair_actions[-6:])
+        return {
+            "enabled": self._repair_enabled,
+            "status": self._repair_status,
+            "actions": list(reversed(actions)),
+            "max_per_hour": AUTO_REPAIR_MAX_PER_HOUR,
+        }
+
+    def toggle_auto_repair(self, enable: bool) -> dict:
+        self._repair_enabled = bool(enable)
+        self._save_repair_setting(self._repair_enabled)
+        if not self._repair_enabled:
+            self._repair_status = "Auto-repair is off"
+        else:
+            self._repair_status = "Watching for connection problems"
+        return {
+            "ok": True,
+            "message": "Auto-repair is on. It only reconnects the proxy and route; your settings stay as chosen."
+            if self._repair_enabled
+            else "Auto-repair is off.",
+        }
 
     def _auto_heal_warp_startup(self) -> None:
         def _check_and_heal() -> None:
@@ -534,6 +765,18 @@ class AvatarControlApi:
         cli_path = find_opencode_cli() or ""
         desktop_path = find_opencode_desktop() or ""
         log_size = OPENCODE_LOG_FILE.stat().st_size if OPENCODE_LOG_FILE.is_file() else 0
+        keeper_hb = _heartbeat_age(KEEPER_LOG_FILE.parent / "heartbeat.txt")
+        guard_hb = _heartbeat_age(GUARD_LOG_FILE.parent / "heartbeat.txt")
+        opencode_lines = _tail_lines(OPENCODE_LOG_FILE, 160)
+        recent_errors = _recent_network_errors(opencode_lines)
+        proxy: dict = {}
+        try:
+            from zen_proxy import proxy_status
+
+            proxy = proxy_status()
+        except Exception:
+            proxy = {}
+        proxy["fallback_active"] = (LANE_DIR / "fallback.flag").is_file()
 
         state = {
             "warp": {
@@ -561,6 +804,8 @@ class AvatarControlApi:
                 "firewall_installed": is_killswitch_installed(),
                 "is_admin": is_admin(),
                 "auto_resume": self._is_auto_resume_active(),
+                "keeper_heartbeat": keeper_hb,
+                "guard_heartbeat": guard_hb,
             },
             "lane": {
                 "pinned_edge": pinned_edge,
@@ -586,9 +831,12 @@ class AvatarControlApi:
             "logs": {
                 "guard": _tail_lines(GUARD_LOG_FILE, 75),
                 "keeper": _tail_lines(KEEPER_LOG_FILE, 75),
-                "opencode": _tail_lines(OPENCODE_LOG_FILE, 55),
+                "opencode": opencode_lines[-55:],
+                "proxy": _tail_lines(LANE_DIR / "proxy.log", 75),
             },
             "egress": self._get_egress_state(),
+            "proxy": proxy,
+            "auto_repair": self.get_auto_repair(),
         }
 
         state["probe"] = probe
@@ -604,11 +852,13 @@ class AvatarControlApi:
             installed=state["lane"]["scripts_installed"],
             probe=probe,
             guard_backoff=int(guard_state.get("backoff_until", 0) or 0),
-            keeper_heartbeat=_heartbeat_age(KEEPER_LOG_FILE.parent / "heartbeat.txt"),
-            guard_heartbeat=_heartbeat_age(GUARD_LOG_FILE.parent / "heartbeat.txt"),
+            keeper_heartbeat=keeper_hb,
+            guard_heartbeat=guard_hb,
             desktop_installed=bool(desktop_path),
             cli_installed=bool(cli_path),
             path_wired=state["lane"]["path_wired"],
+            proxy=proxy,
+            net_errors=recent_errors,
         )
         return state
 
@@ -631,9 +881,13 @@ class AvatarControlApi:
         desktop_installed: bool = False,
         cli_installed: bool = False,
         path_wired: bool = False,
+        proxy: dict | None = None,
+        net_errors: list[str] | None = None,
     ) -> dict:
         """Summarise the live state as a short list of plain-language problems with one-click fixes."""
         issues: list[dict] = []
+        proxy = proxy or {}
+        net_errors = net_errors or []
 
         def add(level: str, title: str, detail: str, fix: str | None = None, fix_label: str = "Fix it") -> None:
             issues.append({"level": level, "title": title, "detail": detail, "fix": fix, "fix_label": fix_label})
@@ -715,6 +969,28 @@ class AvatarControlApi:
             )
 
         code = (probe or {}).get("code", "")
+        fallback_active = bool(proxy.get("fallback_active"))
+        if proxy_listening and fallback_active:
+            route = {
+                "warp": "Cloudflare WARP",
+                "clean": "the clean endpoint",
+                "tor": "Tor",
+                "custom": "your proxy",
+            }.get(mode, "the selected route")
+            age = proxy.get("fallback_age")
+            when = (
+                f"{max(1, int(age // 60))} minute{'s' if int(age // 60) != 1 else ''} ago"
+                if isinstance(age, int) and age >= 60
+                else "in the last few minutes"
+            )
+            add(
+                "warn",
+                "Using a direct connection",
+                f"The route through {route} dropped {when}, so OpenCode was sent straight out to stay usable. "
+                "It keeps working, but the free limit may not rotate until this is repaired.",
+                "start_tor" if mode == "tor" else "hop" if mode == "custom" else "repair_warp",
+                "Repair route",
+            )
         if proxy_listening and code in ("upstream", "timeout", "offline"):
             if code == "offline":
                 add(
@@ -739,6 +1015,23 @@ class AvatarControlApi:
                     "start_tor" if mode == "tor" else "hop" if mode == "custom" else "repair_warp",
                     "Try" if mode in ("tor", "custom") else "Repair",
                 )
+
+        if net_errors and proxy_listening and not fallback_active and code not in (
+            "upstream",
+            "timeout",
+            "offline",
+        ):
+            sample = net_errors[-1]
+            fix = "start_tor" if mode == "tor" else "hop" if mode == "custom" else "repair_warp"
+            label = "Restart Tor" if mode == "tor" else "Next node" if mode == "custom" else "Repair"
+            add(
+                "bad",
+                "OpenCode hit a network error",
+                f"OpenCode logged a connection failure in the last few minutes: {sample} "
+                "Press Repair to rebuild the route; the Proxy tab shows which edge dropped it.",
+                fix,
+                label,
+            )
 
         if guard_backoff and guard_backoff > time.time():
             mins = max(1, int((guard_backoff - time.time()) // 60))
@@ -1211,9 +1504,15 @@ class AvatarControlApi:
                 run_hidden(
                     ["schtasks", "/Change", "/TN", task_name, "/DISABLE"], timeout=8.0
                 )
-            killed = _stop_worker_processes(name)
+            killed, error = _stop_worker_processes(name)
             if name == "keeper":
                 self.toggle_desktop_service_proxy(False)
+            if error:
+                return {
+                    "ok": False,
+                    "message": f"Stopped {killed} {name} process{'es' if killed != 1 else ''}, but {error}. "
+                    "Close OpenCode or run this app as administrator, then try again.",
+                }
             return {"ok": True, "message": f"Stopped {name} ({killed} process{'es' if killed != 1 else ''})."}
 
         _deploy_scripts_and_shims()

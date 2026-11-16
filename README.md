@@ -33,6 +33,12 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 
 ## What's New in v2.4.2
 
+* **Connection Recovery & Diagnostics (current build):**
+  * The local proxy now fails over to another Cloudflare edge in seconds instead of stalling on one dead address.
+  * A dropped WARP tunnel or proxy route is recorded, repaired, and surfaced in the dashboard instead of returning an empty `503`.
+  * **Auto-Repair** is on by default: it restarts a stopped proxy, reconnects WARP, or changes edge without changing your selected mode, clearing chats, or restarting OpenCode. It respects workers you deliberately turned off.
+  * A new **Proxy** log tab shows edge failover, dropped streams, direct fallbacks, and tunnel repairs for real troubleshooting.
+  * A direct fallback is still allowed in Standard mode so OpenCode stays usable, but the health panel now says **Using a direct connection** and offers a one-click repair.
 * **WARP Keeper Stability:**
   * A connected tunnel is left alone unless the selected WARP scope changed; the keeper repairs disconnected or error states.
   * Routine repairs renew the WireGuard session keys instead of deleting the device registration.
@@ -93,7 +99,8 @@ Select the method that best matches your network environment:
   * **Scope (Windows):** `Full System TUN` (keeps the WARP adapter active; recommended if App-Only mode shows no adapter).
   * **Scope (Linux / VPS):** `App Only (Isolated)` on port `40000` (leaves the system's normal routing and SSH access in place).
   * **Protocol:** `WireGuard` (MASQUE uses UDP 443, which some ISPs throttle or block).
-  * **Switches:** Turn ON **WARP Keeper**, **Zen Guard**, and **Auto-Resume**.
+  * **Switches:** Turn ON **WARP Keeper**, **Zen Guard**, **Auto-Resume**, and **Auto-Repair**.
+  * **Strict mode:** Leave it OFF for normal use. It is only for users who prefer a failed request over a direct fallback.
 
 ### Method 2: Clean WireGuard Endpoints (Best for ISP Throttling / Restricted Countries)
 * **Best for:** Users in Russia, Iran, China, or university/corporate networks where Cloudflare's default Anycast IPs are throttled or blocked (`CF_HAPPY_EYEBALLS_MITM_FAILURE`).
@@ -165,6 +172,15 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
   1. Update to **v2.4.2** (the keeper no longer changes protocol or mode on every tick; it leaves a connected tunnel alone unless the selected scope changed).
   2. Ensure you are not running third-party VPNs (NordVPN, ExpressVPN) alongside WARP, as they compete for the Windows Wintun driver.
   3. Ensure **Desktop App Proxy** is on (15-minute idle ceiling with TCP keepalive).
+  4. If it still happens, open the **Proxy** log tab. Repeated `reset` or `edge_fail` lines mean the pinned edge is unhealthy; press **Re-roll** or let Auto-Repair change it.
+
+### 3.1 What to do if OpenCode returns `503 Service Unavailable`
+* **Cause:** The selected Cloudflare edge or WARP tunnel stopped answering. A stale edge, ISP UDP drop, or a proxy that is not running can all produce a 503.
+* **Fix:**
+  1. Open the **Proxy** log tab and check the last event.
+  2. Press **Fix WARP (Reset Keys)** if the tunnel is down, or **Re-roll** if only the edge is failing.
+  3. Leave **Auto-Repair** on. It retries safe fixes with cooldowns instead of looping.
+  4. If the health panel says **Using a direct connection**, the app kept OpenCode online through a fallback; press **Repair route** to put it back on your selected egress.
 
 ### 4. What to do if WARP keeps reconnecting or looping (`Connecting...`)
 * **Cause:** ISP UDP packet drops or corrupt local WireGuard keys.

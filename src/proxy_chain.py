@@ -234,6 +234,27 @@ def rotate_custom_proxy() -> tuple[bool, str]:
     )
 
 
+def advance_custom_proxy() -> dict:
+    """Move to the next proxy node without a blocking reachability test.
+
+    Request-path failover has to stay fast. ``rotate_custom_proxy`` keeps the
+    verification that the Next Node button needs; routers use this instead.
+    """
+    ensure_dirs()
+    cfg = get_egress_config()
+    default_type = str(cfg.get("custom_type", "socks5")).lower()
+    specs = parse_proxy_specs(
+        cfg.get("custom_proxy", "127.0.0.1:10808"), default_type
+    )
+    idx = _proxy_index(len(specs))
+    new_idx = (idx + 1) % len(specs)
+    try:
+        PROXY_INDEX_FILE.write_text(str(new_idx), encoding="utf-8")
+    except Exception:
+        pass
+    return specs[new_idx]
+
+
 def _basic_auth_header(username: str, password: str) -> str:
     import base64
 
@@ -360,7 +381,7 @@ def open_multi_egress_upstream(host: str, port: int, warp_fallback_fn) -> socket
                         pass
             # If current node failed and we have more nodes, advance pool to next node
             if len(specs) > 1:
-                rotate_custom_proxy()
+                advance_custom_proxy()
 
         if warp_fallback_fn and not (
             os.environ.get("OUC_STRICT_PROXY") == "1"

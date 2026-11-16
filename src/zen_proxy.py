@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import select
@@ -14,6 +15,7 @@ import urllib.parse
 
 from ouc_common import (
     LANE_DIR,
+    append_log,
     ensure_dirs,
     fetch_opencode_aaaa_pool,
     get_warp_local_v6,
@@ -31,6 +33,127 @@ PINNED_HOSTS = {
     "inference.opencode.ai",
 }
 
+PROXY_LOG_FILE = LANE_DIR / "proxy.log"
+PROXY_STATUS_FILE = LANE_DIR / "proxy_status.json"
+FALLBACK_FLAG = LANE_DIR / "fallback.flag"
+
+# Three quick attempts beat one long stall: OpenCode shows a network error long
+# before a 12-second connect timeout per address finishes.
+EDGE_CONNECT_TIMEOUT = 3.0
+EDGE_TRY_LIMIT = 3
+EDGE_FAILURE_COOLDOWN = 120.0
+STATUS_LOCK = threading.Lock()
+_LAST_FALLBACK_NOTE = 0.0
+_RESET_LOCK = threading.Lock()
+_LAST_RESET_NOTE = 0.0
+
+# Kinds that describe a failed route rather than a lifecycle note.
+ERROR_KINDS = {"error", "reset", "connect_fail", "edge_fail", "fallback", "bind_fail"}
+LOG_KINDS = ERROR_KINDS | {"repair", "start"}
+
+
+def _read_proxy_status() -> dict:
+    try:
+        data = json.loads(PROXY_STATUS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_proxy_status(data: dict) -> None:
+    try:
+        tmp = PROXY_STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(PROXY_STATUS_FILE)
+    except Exception:
+        pass
+
+
+def _record_event(kind: str, detail: str, host: str = "", edge: str = "") -> None:
+    """Keep a small, bounded trail of route failures for health checks and logs."""
+    now = int(time.time())
+    entry = {
+        "ts": now,
+        "kind": kind,
+        "detail": str(detail)[:400],
+        "host": host[:120],
+        "edge": edge[:120],
+    }
+    try:
+        with STATUS_LOCK:
+            data = _read_proxy_status()
+            recent = [e for e in data.get("recent", []) if now - int(e.get("ts", 0)) <= 900]
+            recent.append(entry)
+            data["recent"] = recent[-30:]
+            data["last_event"] = entry
+            if kind in ERROR_KINDS:
+                data["last_error"] = entry["detail"]
+                data["last_error_ts"] = now
+            if edge:
+                data["edge"] = edge
+            if kind == "fallback":
+                data["fallback_ts"] = now
+            if kind == "edge_fail" and edge:
+                data["last_bad_edge"] = edge
+            _write_proxy_status(data)
+    except Exception:
+        pass
+    if kind in LOG_KINDS:
+        append_log(
+            PROXY_LOG_FILE,
+            f"{kind}: {entry['detail']}"
+            + (f" host={entry['host']}" if entry["host"] else "")
+            + (f" edge={entry['edge']}" if entry["edge"] else ""),
+        )
+
+
+def _mark_fallback(host: str, reason: str) -> None:
+    """Record that a request left through the normal network instead of WARP."""
+    global _LAST_FALLBACK_NOTE
+    now = time.monotonic()
+    if now - _LAST_FALLBACK_NOTE >= 30.0:
+        _LAST_FALLBACK_NOTE = now
+        try:
+            FALLBACK_FLAG.write_text(str(int(time.time())), encoding="utf-8")
+        except Exception:
+            pass
+        _record_event("fallback", reason, host)
+
+
+def _record_reset(host: str, detail: str) -> None:
+    """One line per ten seconds is enough; a dropped stream resets in bursts."""
+    global _LAST_RESET_NOTE
+    now = time.monotonic()
+    with _RESET_LOCK:
+        if now - _LAST_RESET_NOTE < 10.0:
+            return
+        _LAST_RESET_NOTE = now
+    _record_event("reset", detail, host)
+
+
+def _clear_fallback() -> None:
+    try:
+        if FALLBACK_FLAG.is_file():
+            FALLBACK_FLAG.unlink()
+    except Exception:
+        pass
+
+
+def proxy_status() -> dict:
+    """Return a compact snapshot for the dashboard and doctor."""
+    with STATUS_LOCK:
+        data = _read_proxy_status()
+    now = time.time()
+    recent = [e for e in data.get("recent", []) if now - float(e.get("ts", 0)) <= 300]
+    data["recent"] = recent
+    data["errors_5m"] = sum(
+        1 for e in recent if e.get("kind") in ("error", "reset", "connect_fail", "edge_fail")
+    )
+    data["fallbacks_5m"] = sum(1 for e in recent if e.get("kind") == "fallback")
+    fallback_ts = float(data.get("fallback_ts", 0) or 0)
+    data["fallback_age"] = max(0, int(now - fallback_ts)) if fallback_ts else None
+    return data
+
 
 class _WarpState:
     """Thread-safe cache for active WARP IPv6 and auto-rotated pinned edge."""
@@ -44,6 +167,7 @@ class _WarpState:
         self._pool = pool
         self._edge = initial_edge
         self._reroll_mtime = 0.0
+        self._bad_edges: dict[str, float] = {}
 
     def _apply_edge_controls(self) -> None:
         override_file = LANE_DIR / "edge_override.txt"
@@ -74,6 +198,62 @@ class _WarpState:
         """Refresh edge override / reroll state immediately without waiting for traffic."""
         with self._lock:
             self._apply_edge_controls()
+
+    def _pick_edge_locked(self, exclude: str = "") -> str:
+        now = time.monotonic()
+        bad = {
+            edge
+            for edge, failed_at in self._bad_edges.items()
+            if now - failed_at < EDGE_FAILURE_COOLDOWN
+        }
+        choices = [e for e in self._pool if e != exclude and e not in bad]
+        if not choices:
+            choices = [e for e in self._pool if e != exclude]
+        if not choices:
+            choices = list(self._pool)
+        return random.choice(choices) if choices else self._edge
+
+    def edges_to_try(self) -> list[str]:
+        """Current edge first, then healthy alternatives instead of one long stall."""
+        with self._lock:
+            now = time.monotonic()
+            bad = {
+                edge
+                for edge, failed_at in self._bad_edges.items()
+                if now - failed_at < EDGE_FAILURE_COOLDOWN
+            }
+            primary = self._edge
+            healthy = [e for e in self._pool if e != primary and e not in bad]
+            if primary in bad and healthy:
+                choices = healthy
+            else:
+                choices = [primary, *healthy]
+            if not healthy:
+                # Every edge is cooling down: keep trying rather than failing
+                # outright, but still don't repeat the same address first.
+                choices = [e for e in self._pool if e != primary] or [primary]
+            return choices[:EDGE_TRY_LIMIT]
+
+    def mark_edge_ok(self, edge: str) -> None:
+        with self._lock:
+            self._bad_edges.pop(edge, None)
+            if edge and edge != self._edge:
+                self._edge = edge
+                try:
+                    (LANE_DIR / "last_edge.txt").write_text(edge + "\n", encoding="utf-8")
+                except Exception:
+                    pass
+        _clear_fallback()
+
+    def mark_edge_failed(self, edge: str) -> None:
+        with self._lock:
+            self._bad_edges[edge] = time.monotonic()
+            if edge == self._edge:
+                self._edge = self._pick_edge_locked(exclude=edge)
+                try:
+                    (LANE_DIR / "last_edge.txt").write_text(self._edge + "\n", encoding="utf-8")
+                except Exception:
+                    pass
 
     def get(self, wait_if_rotating: bool = True) -> tuple[str | None, str]:
         deadline = time.monotonic() + (18.0 if wait_if_rotating else 0.0)
@@ -116,7 +296,7 @@ class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def _relay(a: socket.socket, b: socket.socket) -> None:
+def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
     """Bidirectionally forward bytes between two sockets with TCP keepalive and resilient streaming."""
     sockets = [a, b]
     closed = set()
@@ -153,13 +333,25 @@ def _relay(a: socket.socket, b: socket.socket) -> None:
                 dst = b if src is a else a
                 try:
                     data = src.recv(65536)
-                except (OSError, ConnectionResetError):
+                except (ConnectionResetError, ConnectionAbortedError) as exc:
+                    # A reset after one side already closed cleanly is how many
+                    # servers finish a response; only an active-stream reset is
+                    # evidence of a real route failure.
+                    if not closed:
+                        _record_reset(host, f"{type(exc).__name__} while reading")
+                    data = b""
+                except OSError as exc:
+                    # Windows reports a peer reset as plain OSError/WSAECONNRESET.
+                    if not closed and getattr(exc, "winerror", None) in (10053, 10054):
+                        _record_reset(host, f"winsock {exc.winerror} while reading")
                     data = b""
 
                 if data:
                     try:
                         dst.sendall(data)
-                    except (OSError, ConnectionResetError):
+                    except (OSError, ConnectionResetError) as exc:
+                        if not closed:
+                            _record_reset(host, f"send failed: {type(exc).__name__}")
                         return
                 else:
                     # EOF from src -> send TCP FIN to dst (half-close)
@@ -188,6 +380,31 @@ def _open_pinned_v6(dest_ip: str, port: int, local_v6: str, timeout: float = 12.
     except Exception:
         sock.close()
         raise
+
+
+def _open_pinned_any(
+    label: str,
+    port: int,
+    warp_state: _WarpState,
+) -> tuple[socket.socket, str]:
+    """Try the current pinned address, then a few alternatives, before declaring the route dead."""
+    local_v6, _ = warp_state.get(wait_if_rotating=True)
+    if not local_v6:
+        raise ConnectionRefusedError("WARP tunnel has no IPv6 address")
+
+    last: Exception | None = None
+    for edge in warp_state.edges_to_try():
+        try:
+            sock = _open_pinned_v6(
+                edge, port, local_v6, timeout=EDGE_CONNECT_TIMEOUT
+            )
+            warp_state.mark_edge_ok(edge)
+            return sock, edge
+        except Exception as exc:
+            last = exc
+            warp_state.mark_edge_failed(edge)
+            _record_event("edge_fail", f"{type(exc).__name__}: {exc}", label, edge)
+    raise ConnectionRefusedError(f"No Cloudflare edge answered ({last})") from last
 
 
 def _open_warp_direct(
@@ -220,12 +437,11 @@ def _open_warp_direct(
 
     # 2. TUN mode or fallback: bind explicitly to the WARP adapter's IPv6
     if is_opencode_host:
-        local_v6, pinned_edge = warp_state.get(wait_if_rotating=True)
-        if local_v6:
-            try:
-                return _open_pinned_v6(pinned_edge, port, local_v6)
-            except Exception:
-                pass
+        try:
+            sock, _ = _open_pinned_any(clean_host, port, warp_state)
+            return sock
+        except Exception as exc:
+            _record_event("connect_fail", f"pinned route failed: {exc}", clean_host)
 
         # Try local WARP SOCKS5 if TUN socket bind failed
         try:
@@ -278,7 +494,10 @@ def _open_warp_direct(
         except Exception:
             pass
 
-    # Direct standard dual-stack connection (IPv4/IPv6)
+    # Direct standard dual-stack connection (IPv4/IPv6). In isolated scope this
+    # bypasses WARP, so record it instead of silently changing the route.
+    if scope == "isolated" and is_opencode_host:
+        _mark_fallback(clean_host, "isolated WARP proxy unavailable; used the direct route")
     sock = socket.create_connection((clean_host, port), timeout=8.0)
     sock.settimeout(None)
     return sock
@@ -296,21 +515,38 @@ def _strict_mode() -> bool:
 
 
 def _repair_warp_tunnel(warp_state: _WarpState) -> bool:
-    """Reconnect a dropped WARP tunnel once per interval before failing."""
+    """Reconnect a dropped WARP tunnel, at most once per interval.
+
+    Only runs when the route is actually down; reconnecting a healthy tunnel
+    resets its pin and can cause the drops this function exists to repair.
+    """
     global _LAST_REPAIR
-    if not _strict_mode():
+    try:
+        from proxy_chain import get_egress_config
+
+        cfg = get_egress_config()
+    except Exception:
         return False
+    mode = str(cfg.get("mode", "warp"))
+    if mode not in ("warp", "clean"):
+        return False
+    scope = str(cfg.get("warp_scope", "tun"))
+    if scope == "isolated":
+        try:
+            with socket.create_connection(("127.0.0.1", 40000), timeout=0.6):
+                return False
+        except OSError:
+            pass
+    elif get_warp_local_v6():
+        return False
+
     with _REPAIR_LOCK:
         if time.monotonic() - _LAST_REPAIR < _REPAIR_INTERVAL:
             return False
         _LAST_REPAIR = time.monotonic()
 
+    _record_event("repair", f"reconnecting WARP tunnel ({mode}/{scope})")
     try:
-        from proxy_chain import get_egress_config
-
-        cfg = get_egress_config()
-        if str(cfg.get("mode", "warp")) not in ("warp", "clean"):
-            return False
         from ouc_common import (
             ensure_warp_mode,
             ensure_warp_protocol,
@@ -330,7 +566,6 @@ def _repair_warp_tunnel(warp_state: _WarpState) -> bool:
             ensure_warp_protocol("wireguard", warp_bin=warp_bin)
         except Exception:
             pass
-        scope = str(cfg.get("warp_scope", "tun"))
         ensure_warp_mode(warp_bin, scope)
         run_warp(["connect"], warp_bin=warp_bin, timeout=12.0)
         for _ in range(8):
@@ -396,10 +631,14 @@ def _connect_upstream(
         return _open_upstream(host, port, warp_state)
     except Exception as first:
         if _repair_warp_tunnel(warp_state):
+            # Give the reconnected tunnel a moment to install routes, then retry once.
+            time.sleep(0.5)
             try:
                 return _open_upstream(host, port, warp_state)
             except Exception as second:
+                _record_event("connect_fail", f"{type(second).__name__}: {second}", host)
                 raise second from first
+        _record_event("connect_fail", f"{type(first).__name__}: {first}", host)
         raise
 
 
@@ -449,20 +688,25 @@ def _make_handler(warp_state: _WarpState):
                     upstream = _connect_upstream(host, port, warp_state)
                 except Exception as exc:
                     if _strict_mode():
-                        self._send_err(503, f"Service Unavailable: {exc}")
+                        _record_event("error", f"CONNECT {host}:{port}: {exc}", host)
+                        self._send_err(503, "Service Unavailable", f"Strict mode blocked the route to {host}:{port}. {exc}")
                         return
                     # Direct fallback keeps OpenCode usable when the route drops.
                     try:
                         upstream = socket.create_connection((host, port), timeout=8.0)
                         upstream.settimeout(None)
+                        _mark_fallback(host, f"CONNECT {host}:{port} used the direct route ({exc})")
                     except Exception as exc2:
-                        self._send_err(503, f"Service Unavailable: {exc2}")
+                        _record_event("error", f"CONNECT {host}:{port}: {exc2}", host)
+                        self._send_err(503, "Service Unavailable", f"Opencode Unlimited could not reach {host}:{port}. {exc2}")
                         return
 
                 try:
                     self.wfile.write(f"{proto} 200 Connection Established\r\n\r\n".encode("ascii"))
                     self.wfile.flush()
-                    _relay(self.connection, upstream)
+                    _relay(self.connection, upstream, host)
+                except OSError:
+                    _record_reset(host, "client closed before tunnel reply")
                 finally:
                     upstream.close()
                 return
@@ -481,14 +725,17 @@ def _make_handler(warp_state: _WarpState):
                 upstream = _connect_upstream(host, port, warp_state)
             except Exception as exc:
                 if _strict_mode():
-                    self._send_err(503, f"Service Unavailable: {exc}")
+                    _record_event("error", f"HTTP {host}:{port}: {exc}", host)
+                    self._send_err(503, "Service Unavailable", f"Strict mode blocked the route to {host}:{port}. {exc}")
                     return
                 # Direct fallback keeps OpenCode usable when the route drops.
                 try:
                     upstream = socket.create_connection((host, port), timeout=8.0)
                     upstream.settimeout(None)
+                    _mark_fallback(host, f"HTTP {host}:{port} used the direct route ({exc})")
                 except Exception as exc2:
-                    self._send_err(503, f"Service Unavailable: {exc2}")
+                    _record_event("error", f"HTTP {host}:{port}: {exc2}", host)
+                    self._send_err(503, "Service Unavailable", f"Opencode Unlimited could not reach {host}:{port}. {exc2}")
                     return
 
             try:
@@ -501,15 +748,25 @@ def _make_handler(warp_state: _WarpState):
                     body = self.rfile.read(content_len)
                     if body:
                         upstream.sendall(body)
-                _relay(self.connection, upstream)
+                _relay(self.connection, upstream, host)
             finally:
                 upstream.close()
 
-        def _send_err(self, code: int, reason: str) -> None:
+        def _send_err(self, code: int, reason: str, detail: str = "") -> None:
             try:
                 safe = reason.replace("\r", " ").replace("\n", " ")
-                msg = f"HTTP/1.1 {code} {safe}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-                self.wfile.write(msg.encode("ascii", errors="replace"))
+                text = safe
+                extra = detail.replace("\r", " ").replace("\n", " ").strip()
+                if extra:
+                    text = f"{safe}\n{extra}"
+                payload = text.encode("utf-8", errors="replace")
+                head = (
+                    f"HTTP/1.1 {code} {safe}\r\n"
+                    "Content-Type: text/plain; charset=utf-8\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("latin-1", errors="replace")
+                self.wfile.write(head + payload)
                 self.wfile.flush()
             except OSError:
                 pass
@@ -529,8 +786,14 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
 
     warp_state = _WarpState(pool=pool, initial_edge=chosen_edge, ttl=1.5)
     handler = _make_handler(warp_state)
-    srv = _ThreadedTCPServer(("127.0.0.1", port), handler)
+    try:
+        srv = _ThreadedTCPServer(("127.0.0.1", port), handler)
+    except OSError as exc:
+        _record_event("bind_fail", f"127.0.0.1:{port}: {exc}")
+        raise
     actual_port = srv.server_address[1]
+    _clear_fallback()
+    _record_event("start", f"listening on 127.0.0.1:{actual_port} (edge={chosen_edge})")
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
 

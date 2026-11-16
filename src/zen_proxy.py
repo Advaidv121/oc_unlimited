@@ -300,6 +300,7 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
     """Bidirectionally forward bytes between two sockets with TCP keepalive and resilient streaming."""
     sockets = [a, b]
     closed = set()
+    seen_data = set()
     for s in (a, b):
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -334,24 +335,35 @@ def _relay(a: socket.socket, b: socket.socket, host: str = "") -> None:
                 try:
                     data = src.recv(65536)
                 except (ConnectionResetError, ConnectionAbortedError) as exc:
-                    # A reset after one side already closed cleanly is how many
-                    # servers finish a response; only an active-stream reset is
-                    # evidence of a real route failure.
-                    if not closed:
-                        _record_reset(host, f"{type(exc).__name__} while reading")
+                    # Many servers end a completed response with a reset instead
+                    # of a clean FIN. Only a reset before that side sent any
+                    # bytes is evidence of a route failure; mid-response drops
+                    # are reported by OpenCode's own log and health check.
+                    if not closed and src not in seen_data:
+                        _record_reset(host, f"{type(exc).__name__} before response")
                     data = b""
                 except OSError as exc:
                     # Windows reports a peer reset as plain OSError/WSAECONNRESET.
-                    if not closed and getattr(exc, "winerror", None) in (10053, 10054):
-                        _record_reset(host, f"winsock {exc.winerror} while reading")
+                    if (
+                        not closed
+                        and src not in seen_data
+                        and getattr(exc, "winerror", None) in (10053, 10054)
+                    ):
+                        _record_reset(host, f"winsock {exc.winerror} before response")
                     data = b""
 
                 if data:
+                    seen_data.add(src)
                     try:
                         dst.sendall(data)
                     except (OSError, ConnectionResetError) as exc:
-                        if not closed:
-                            _record_reset(host, f"send failed: {type(exc).__name__}")
+                        # A failed write toward the client means the client went
+                        # away; only a failed write toward the upstream host
+                        # says anything about the WARP route.
+                        if not closed and dst is b and b not in seen_data:
+                            _record_reset(
+                                host, f"send to upstream failed: {type(exc).__name__}"
+                            )
                         return
                 else:
                     # EOF from src -> send TCP FIN to dst (half-close)

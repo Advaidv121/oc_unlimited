@@ -277,6 +277,38 @@
   .tag.warn { color: #fde68a; border-color: rgba(245,158,11,0.4); background: rgba(120,53,15,0.3); }
   .tag.bad { color: #fca5a5; border-color: rgba(239,68,68,0.4); background: rgba(127,29,29,0.3); }
 
+  /* Health panel */
+  .health-card { padding: 12px 15px; }
+  .health-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .health-title { font-size: 14px; font-weight: 700; color: var(--text); }
+  .health-title.ok { color: #6ee7b7; }
+  .health-title.warn { color: #fde68a; }
+  .health-title.bad { color: #fca5a5; }
+  .health-sub { margin-top: 3px; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+  .health-list { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; }
+  .health-list:empty { display: none; }
+  .health-issue {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 9px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-left: 3px solid var(--muted);
+    background: rgba(9, 14, 26, 0.65);
+  }
+  .health-issue.warn { border-left-color: var(--amber); background: rgba(120, 53, 15, 0.14); }
+  .health-issue.bad { border-left-color: var(--red); background: rgba(127, 29, 29, 0.16); }
+  .health-issue-text { min-width: 0; }
+  .health-issue-title { font-size: 12px; font-weight: 600; color: var(--text); }
+  .health-issue-detail { margin-top: 2px; font-size: 11px; color: var(--muted); line-height: 1.4; }
+  .health-issue .btn { margin-left: auto; flex-shrink: 0; }
+
   /* Controls Section */
   .section-head {
     font-size: 12px;
@@ -802,6 +834,25 @@
       </div>
     </section>
 
+    <!-- Health: the quick answer to "is it actually working?" -->
+    <section class="card health-card">
+      <div class="health-head">
+        <div>
+          <div class="health-title" id="healthTitle">Checking system health...</div>
+          <div class="health-sub" id="healthSub">Testing the local proxy and checking the background workers.</div>
+        </div>
+        <div class="btn-group">
+          <span id="probeTag" class="tag">Real test: ...</span>
+          <button id="btnFixEverything" class="btn btn-sm btn-primary"
+                  data-tip-title="Fix Everything"
+                  data-tip-body="Runs the one-click fixes suggested by the health check, most serious first. It won't delete WARP registration or touch your chats.">
+            Fix everything
+          </button>
+        </div>
+      </div>
+      <div id="healthIssues" class="health-list"></div>
+    </section>
+
     <!-- Primary Launch & Rotation Row -->
     <section class="hero-actions">
       <button id="btnLaunchDesktop" class="btn btn-primary"
@@ -1147,12 +1198,71 @@
     if (atBottom) box.scrollTop = box.scrollHeight;
   }
 
+  function renderHealth(s) {
+    const h = s.health || {};
+    const titleEl = $("healthTitle");
+    const subEl = $("healthSub");
+    titleEl.textContent = h.title || "Checking system health...";
+    titleEl.className = "health-title" + (h.status === "bad" ? " bad" : h.status === "warn" ? " warn" : h.status === "ok" ? " ok" : "");
+    subEl.textContent = h.sub || "";
+
+    const probe = s.probe || {};
+    const code = probe.checking ? "checking" : (probe.code || "unknown");
+    const labels = {
+      ok: "Real test: OK",
+      checking: "Real test: checking...",
+      proxy_down: "Real test: proxy down",
+      offline: "Real test: PC offline",
+      timeout: "Real test: timed out",
+      upstream: "Real test: no response",
+      unknown: "Real test: ..."
+    };
+    let probeText = labels[code] || labels.unknown;
+    if (code === "ok" && probe.ms) probeText += ` (${probe.ms} ms)`;
+    setTag($("probeTag"), probeText, code === "ok" ? "ok" : (code === "checking" || code === "unknown") ? "warn" : "bad");
+
+    const list = $("healthIssues");
+    list.innerHTML = "";
+    (h.issues || []).forEach((issue) => {
+      const row = document.createElement("div");
+      row.className = "health-issue " + (issue.level || "warn");
+      const text = document.createElement("div");
+      text.className = "health-issue-text";
+      const title = document.createElement("div");
+      title.className = "health-issue-title";
+      title.textContent = issue.title || "";
+      const detail = document.createElement("div");
+      detail.className = "health-issue-detail";
+      detail.textContent = issue.detail || "";
+      text.appendChild(title);
+      text.appendChild(detail);
+      row.appendChild(text);
+      if (issue.fix) {
+        const btn = document.createElement("button");
+        btn.className = "btn btn-sm" + (issue.level === "bad" ? " btn-danger" : "");
+        btn.textContent = issue.fix_label || "Fix it";
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            await runAction(null, () => window.pywebview.api.fix_issue(issue.fix));
+          } finally {
+            btn.disabled = false;
+          }
+        };
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    });
+  }
+
   function renderState(s) {
     state = s;
     const w = s.warp;
     const sv = s.services;
     const ln = s.lane;
     const st = s.stats;
+
+    renderHealth(s);
 
     // Header pill & Egress Mode
     const pillDot = $("overallDot");
@@ -1512,6 +1622,7 @@
 
   // Wire UI handlers
   $("btnRefresh").onclick = () => runAction("btnRefresh", () => refresh(true).then(() => ({ message: "Refreshed live WARP & IPv6 status." })), "...");
+  $("btnFixEverything").onclick = () => runAction("btnFixEverything", () => window.pywebview.api.fix_everything(), "Fixing...");
 
   // Multi-Egress Mode Handlers
   $("tabModeWarp").onclick = () => {

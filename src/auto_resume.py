@@ -8,6 +8,7 @@ a 'continue' action to the active OpenCode session.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -222,6 +223,73 @@ def send_continue_keystroke(reload_first: bool = True) -> bool:
     return False
 
 
+_SESSION_ID_RE = re.compile(r"\bsessionID=(ses_[A-Za-z0-9]+)")
+
+
+def session_id_in(line: str) -> str:
+    """The OpenCode session a log line belongs to ('' if none). Wall errors carry 'sessionID=ses_...'."""
+    match = _SESSION_ID_RE.search(line or "")
+    return match.group(1) if match else ""
+
+
+def _session_directory(session_id: str) -> str:
+    db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+        try:
+            row = conn.execute("SELECT directory FROM session_v2 WHERE id = ?", (session_id,)).fetchone()
+        finally:
+            conn.close()
+        return str(row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+
+def _stop_stale_continue(oc: str, session_id: str) -> None:
+    """End an earlier 'continue' we sent to this session if it is still hanging around."""
+    try:
+        import psutil
+
+        exe_name = Path(oc).name.lower()
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                cmd = proc.info.get("cmdline") or []
+                if (
+                    (proc.info.get("name") or "").lower() == exe_name
+                    and "run" in cmd
+                    and session_id in cmd
+                    and cmd[-1:] == ["continue"]
+                ):
+                    proc.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def resume_sessions(session_ids: list[str]) -> tuple[int, list[str]]:
+    """Send 'continue' to each listed session through OpenCode's background service."""
+    oc = find_opencode_cli()
+    if not oc:
+        return 0, ["OpenCode CLI not found"]
+    sent, notes = 0, []
+    for sid in dict.fromkeys(s for s in session_ids if s):
+        directory = _session_directory(sid)
+        cwd = directory if (directory and os.path.isdir(directory)) else None
+        _stop_stale_continue(oc, sid)
+        try:
+            kwargs: dict = {"cwd": cwd, "close_fds": True}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0x08000000 | 0x00000008
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(opencode_command(oc, ["run", "--session", sid, "continue"]), **kwargs)
+            sent += 1
+        except Exception as exc:
+            notes.append(f"{sid[:12]}: {exc}")
+    return sent, notes
+
+
 def _dispatch_cli_resume(oc: str, sess: tuple[str, str, str] | None) -> bool:
     """Start one CLI run that continues the newest session."""
     if sess:
@@ -244,8 +312,8 @@ def _dispatch_cli_resume(oc: str, sess: tuple[str, str, str] | None) -> bool:
         return False
 
 
-def resume_active_session() -> tuple[bool, str]:
-    """Resume the active OpenCode session with a 'continue' prompt."""
+def resume_active_session(session_ids: list[str] | None = None) -> tuple[bool, str]:
+    """Resume OpenCode after a new IP: every given session, or the active one if none are known."""
     if not is_auto_resume_enabled():
         return False, "Auto-resume is disabled."
 
@@ -253,6 +321,14 @@ def resume_active_session() -> tuple[bool, str]:
     details = []
     if cleared > 0:
         details.append(f"cleared {cleared} rate limit entries from database")
+
+    if session_ids:
+        sent, notes = resume_sessions(session_ids)
+        details.append(f"sent 'continue' to {sent} of {len(set(session_ids))} chat(s) that hit the limit")
+        details.extend(notes)
+        if sent:
+            return True, " | ".join(details)
+        # Nothing could be sent that way: fall through to the active window.
 
     # Prefer the open Desktop window so the user sees the resumed session.
     # Only fall back to a detached CLI run when no window is available; running

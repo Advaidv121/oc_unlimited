@@ -12,6 +12,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from pathlib import Path
 
@@ -89,6 +91,13 @@ _SERVICE_ENV_KEYS = (
     "NO_PROXY",
     "no_proxy",
 )
+# A real request through the local proxy is the only check that proves traffic
+# gets in and out; a listening port alone can hide a dead tunnel.
+PROBE_URL = "https://opencode.ai/"
+PROBE_DIRECT_URL = "https://cloudflare.com/cdn-cgi/trace"
+PROBE_EVERY = 120.0
+PROBE_TIMEOUT = 8.0
+HEARTBEAT_STALE = 240.0
 
 
 def _enable_dark_titlebar() -> None:
@@ -143,6 +152,50 @@ def _port_open(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _heartbeat_age(path: Path) -> float | None:
+    """Seconds since the worker last wrote its heartbeat, or None if it never did."""
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _probe_http(url: str, proxy: str | None, timeout: float = PROBE_TIMEOUT) -> tuple[bool, str]:
+    """Make one real HTTPS request. Returns (reached, stage).
+
+    Any HTTP answer (even 403/429) proves DNS, TCP, TLS and the tunnel work;
+    only transport errors count as failures. Stage is one of: ok, proxy,
+    timeout, upstream.
+    """
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})]
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "opencode-unlimited-probe/2.4.2",
+            "Cache-Control": "no-cache",
+            "Accept": "*/*",
+        },
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            resp.read(64)
+        return True, "ok"
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        return (False, "upstream") if exc.code in (407, 502, 503, 504) else (True, "ok")
+    except Exception as exc:
+        text = str(getattr(exc, "reason", exc)).lower()
+        if "connection refused" in text or "errno 10061" in text or "actively refused" in text:
+            return False, "proxy"
+        if "timed out" in text or "timeout" in text:
+            return False, "timeout"
+        return False, "upstream"
 
 
 def _tail_lines(path: Path, count: int = 75) -> list[str]:
@@ -240,6 +293,28 @@ def _deploy_scripts_and_shims() -> dict[str, str]:
     return {"scripts_dir": str(SCRIPTS_DIR), "bin_dir": str(BIN_DIR)}
 
 
+def _stop_worker_processes(name: str) -> int:
+    """Stop the running keeper/guard process without touching tasks or service settings."""
+    script_name = "warp_keeper.py" if name == "keeper" else "zen_guard.py"
+    me = os.getpid()
+    killed = 0
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == me:
+                continue
+            pname = (proc.info.get("name") or "").lower()
+            cmd = " ".join(proc.info.get("cmdline") or []).lower()
+            if pname in ("python.exe", "pythonw.exe") and script_name in cmd:
+                proc.kill()
+                killed += 1
+            elif f"--worker {name}" in cmd:
+                proc.kill()
+                killed += 1
+        except Exception:
+            pass
+    return killed
+
+
 def _update_user_path(add: bool) -> bool:
     import winreg
 
@@ -286,8 +361,13 @@ class AvatarControlApi:
         self._last_local_v6 = ""
         self._edge_pool: list[str] = []
         self._action_lock = threading.Lock()
+        self._probe_lock = threading.Lock()
+        self._probe: dict = {"ok": None, "code": "unknown", "ms": 0, "ts": 0}
+        self._probe_checking = False
+        self._probe_ts = 0.0
         self._refresh_egress_async(force=True)
         self._refresh_pool_async()
+        self._refresh_probe_async(force=True)
         self._auto_heal_warp_startup()
 
     def _auto_heal_warp_startup(self) -> None:
@@ -336,6 +416,51 @@ class AvatarControlApi:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _refresh_probe_async(self, force: bool = False) -> None:
+        """Ask opencode.ai through the local proxy whether traffic really gets in and out."""
+        with self._probe_lock:
+            if self._probe_checking:
+                return
+            # After a failure retry sooner (30 s), but don't hammer while the tunnel is fine (120 s).
+            limit = 30.0 if self._probe.get("ok") is False else PROBE_EVERY
+            if not force and (time.time() - self._probe_ts) < limit:
+                return
+            self._probe_checking = True
+
+        def _run() -> None:
+            started = time.time()
+            code = "unknown"
+            try:
+                # On startup the keeper may still be binding the port: give it a few seconds.
+                for _ in range(24):
+                    if _port_open(SERVICE_PROXY_PORT):
+                        break
+                    time.sleep(0.25)
+                proxy = f"http://127.0.0.1:{SERVICE_PROXY_PORT}"
+                if not _port_open(SERVICE_PROXY_PORT):
+                    code = "proxy_down"
+                else:
+                    reached, stage = _probe_http(PROBE_URL, proxy)
+                    if reached:
+                        code = "ok"
+                    else:
+                        direct_ok, _ = _probe_http(PROBE_DIRECT_URL, None, timeout=5.0)
+                        code = stage if direct_ok else "offline"
+            except Exception:
+                code = "upstream"
+            finally:
+                with self._probe_lock:
+                    self._probe = {
+                        "ok": code == "ok",
+                        "code": code,
+                        "ms": int((time.time() - started) * 1000),
+                        "ts": int(time.time()),
+                    }
+                    self._probe_ts = time.time()
+                    self._probe_checking = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def get_state(self, force_egress: bool = False) -> dict:
         warp_bin = find_warp_cli()
         connected, mode, status_text = warp_status(warp_bin) if warp_bin else (False, "", "Not Installed")
@@ -371,6 +496,11 @@ class AvatarControlApi:
             egress_v6 = self._egress_v6
             checking_egress = self._egress_checking
 
+        self._refresh_probe_async(force=force_egress)
+        with self._probe_lock:
+            probe = dict(self._probe)
+            probe["checking"] = self._probe_checking
+
         guard_state = {"blacklist": [], "hops": 0, "last_hop": 0, "current": ""}
         if GUARD_STATE_FILE.is_file():
             try:
@@ -405,7 +535,7 @@ class AvatarControlApi:
         desktop_path = find_opencode_desktop() or ""
         log_size = OPENCODE_LOG_FILE.stat().st_size if OPENCODE_LOG_FILE.is_file() else 0
 
-        return {
+        state = {
             "warp": {
                 "installed": bool(warp_bin),
                 "bin": warp_bin or "",
@@ -448,6 +578,8 @@ class AvatarControlApi:
                 "blacklist_count": len(blacklist),
                 "blacklist": list(reversed(blacklist)),
                 "last_hop": int(guard_state.get("last_hop", 0) or 0),
+                "failed_hops": int(guard_state.get("failed_hops", 0) or 0),
+                "backoff_until": int(guard_state.get("backoff_until", 0) or 0),
                 "db": _read_db_stats(),
                 "log_size_bytes": log_size,
             },
@@ -458,6 +590,319 @@ class AvatarControlApi:
             },
             "egress": self._get_egress_state(),
         }
+
+        state["probe"] = probe
+        state["health"] = self._build_health(
+            warp_installed=state["warp"]["installed"],
+            warp_connected=connected,
+            rotating=state["warp"]["rotating"],
+            egress=state["egress"],
+            keeper_running=state["services"]["keeper_running"],
+            guard_running=state["services"]["guard_running"],
+            proxy_listening=state["services"]["proxy_listening"],
+            svc_wired=svc_wired,
+            installed=state["lane"]["scripts_installed"],
+            probe=probe,
+            guard_backoff=int(guard_state.get("backoff_until", 0) or 0),
+            keeper_heartbeat=_heartbeat_age(KEEPER_LOG_FILE.parent / "heartbeat.txt"),
+            guard_heartbeat=_heartbeat_age(GUARD_LOG_FILE.parent / "heartbeat.txt"),
+            desktop_installed=bool(desktop_path),
+            cli_installed=bool(cli_path),
+            path_wired=state["lane"]["path_wired"],
+        )
+        return state
+
+    def _build_health(
+        self,
+        *,
+        warp_installed: bool,
+        warp_connected: bool,
+        rotating: bool,
+        egress: dict,
+        keeper_running: bool,
+        guard_running: bool,
+        proxy_listening: bool,
+        svc_wired: bool,
+        installed: bool,
+        probe: dict | None = None,
+        guard_backoff: int = 0,
+        keeper_heartbeat: float | None = None,
+        guard_heartbeat: float | None = None,
+        desktop_installed: bool = False,
+        cli_installed: bool = False,
+        path_wired: bool = False,
+    ) -> dict:
+        """Summarise the live state as a short list of plain-language problems with one-click fixes."""
+        issues: list[dict] = []
+
+        def add(level: str, title: str, detail: str, fix: str | None = None, fix_label: str = "Fix it") -> None:
+            issues.append({"level": level, "title": title, "detail": detail, "fix": fix, "fix_label": fix_label})
+
+        mode = egress.get("mode", "warp")
+        if not installed:
+            add(
+                "warn",
+                "Setup isn't finished",
+                "The background service isn't installed yet, so OpenCode isn't protected or auto-rotated.",
+                "install",
+                "Install",
+            )
+        if installed and (desktop_installed or cli_installed) and not svc_wired and not path_wired:
+            add(
+                "warn",
+                "OpenCode isn't using Opencode Unlimited",
+                "OpenCode is installed but it's connecting directly, so it will hit the free limit and nothing "
+                "will rotate. Press Connect, then reopen OpenCode.",
+                "connect_opencode",
+                "Connect",
+            )
+        if (svc_wired or path_wired) and not proxy_listening:
+            add(
+                "bad",
+                "OpenCode can't connect right now",
+                "OpenCode is set to go through the local proxy on port 41987, but it isn't running. "
+                "Messages fail with ECONNREFUSED until it's back.",
+                "start_keeper",
+                "Start it",
+            )
+        elif installed and not keeper_running:
+            add(
+                "warn",
+                "Background protection is off",
+                "WARP Keeper isn't running. This window is covering for it, but OpenCode will lose "
+                "its connection when you close the app.",
+                "start_keeper",
+                "Turn on",
+            )
+        if keeper_running and keeper_heartbeat is not None and keeper_heartbeat > HEARTBEAT_STALE:
+            add(
+                "bad",
+                "Background protection stopped responding",
+                f"WARP Keeper is still running but hasn't checked in for {int(keeper_heartbeat // 60)} minutes, "
+                "so OpenCode may lose its connection. Press Restart.",
+                "restart_workers",
+                "Restart",
+            )
+        if guard_running and guard_heartbeat is not None and guard_heartbeat > HEARTBEAT_STALE:
+            add(
+                "warn",
+                "Auto-rotation stopped responding",
+                f"Zen Guard is still running but hasn't checked in for {int(guard_heartbeat // 60)} minutes, "
+                "so the free limit won't rotate. Press Restart.",
+                "restart_workers",
+                "Restart",
+            )
+        if mode in ("warp", "clean"):
+            if not warp_installed:
+                add(
+                    "bad",
+                    "Cloudflare WARP isn't installed",
+                    "WARP mode needs the free Cloudflare WARP app (1.1.1.1).",
+                    "install_warp",
+                    "Download WARP",
+                )
+            elif not warp_connected and not rotating:
+                add("bad", "WARP is disconnected", "Traffic can't go through Cloudflare right now.", "connect_warp", "Connect")
+        elif mode == "tor" and not egress.get("tor_active"):
+            add("bad", "Tor isn't running", "Tor mode is selected but no Tor proxy is reachable.", "start_tor", "Start Tor")
+        if installed and not guard_running:
+            add(
+                "warn",
+                "Auto-rotation is off",
+                "Zen Guard isn't running, so when you hit the free limit you'll have to rotate manually.",
+                "start_guard",
+                "Turn on",
+            )
+
+        code = (probe or {}).get("code", "")
+        if proxy_listening and code in ("upstream", "timeout", "offline"):
+            if code == "offline":
+                add(
+                    "bad",
+                    "This PC has no internet",
+                    "Neither the direct connection nor the local proxy could reach the internet. "
+                    "Check Wi-Fi or the network cable, then press Refresh.",
+                )
+            elif (
+                (mode in ("warp", "clean") and warp_connected)
+                or (mode == "tor" and egress.get("tor_active"))
+                or mode == "custom"
+            ):
+                hint = {
+                    "tor": "Press Start Tor, or pick another connection type in the mode bar.",
+                    "custom": "Press Next Node to try another proxy node, or pick another connection type in the mode bar.",
+                }.get(mode, "Press Fix WARP, or pick another connection type in the mode bar.")
+                add(
+                    "bad",
+                    "OpenCode can't get through the local proxy",
+                    "The local proxy is running, but nothing comes back from opencode.ai. " + hint,
+                    "start_tor" if mode == "tor" else "hop" if mode == "custom" else "repair_warp",
+                    "Try" if mode in ("tor", "custom") else "Repair",
+                )
+
+        if guard_backoff and guard_backoff > time.time():
+            mins = max(1, int((guard_backoff - time.time()) // 60))
+            add(
+                "warn",
+                "Auto-rotation is taking a break",
+                f"New addresses kept hitting the free limit right away, so rotation paused for about "
+                f"{mins} more minute{'s' if mins != 1 else ''} to avoid a loop. It tries again by itself after "
+                "that, or press Try now to get a new IP immediately.",
+                "hop",
+                "Try now",
+            )
+
+        bad = any(i["level"] == "bad" for i in issues)
+        wired = svc_wired or path_wired
+        if rotating:
+            status, title, sub = (
+                "busy",
+                "Rotating to a fresh IP...",
+                "This takes about 10-15 seconds. OpenCode will continue automatically.",
+            )
+        elif bad:
+            status, title, sub = "bad", "OpenCode needs attention", "Fix the problem below and OpenCode will work again."
+        elif issues:
+            status, title, sub = "warn", "Working, with warnings", "OpenCode works, but something below should be turned on."
+        elif wired and probe is not None and probe.get("ok") is not True:
+            if probe.get("ok") is None:
+                status, title, sub = (
+                    "warn",
+                    "Checking the connection...",
+                    "Making sure traffic really gets through the local proxy. This takes a few seconds.",
+                )
+            else:
+                status, title, sub = (
+                    "warn",
+                    "Couldn't confirm the connection",
+                    "The last real test didn't finish. Press Refresh to try again.",
+                )
+        else:
+            status, title = "ok", "Everything is working"
+            sub = {
+                "tor": "OpenCode is connected through the Tor network.",
+                "custom": "OpenCode is connected through your custom proxy.",
+            }.get(mode, "OpenCode is connected through Cloudflare WARP and auto-rotates when you hit the limit.")
+        return {"status": status, "title": title, "sub": sub, "issues": issues}
+
+    def fix_issue(self, action: str) -> dict:
+        """One-click fixes for the problems listed in the health panel."""
+        if action == "start_keeper":
+            res = self.toggle_worker("keeper", True)
+            for _ in range(20):
+                if _port_open(SERVICE_PROXY_PORT):
+                    break
+                time.sleep(0.3)
+            if _port_open(SERVICE_PROXY_PORT):
+                return {
+                    "ok": True,
+                    "message": "Background service is running. OpenCode can connect again - send 'continue'.",
+                }
+            return res
+        if action == "start_guard":
+            return self.toggle_worker("guard", True)
+        if action == "restart_workers":
+            return self.restart_workers()
+        if action == "connect_warp":
+            return self.warp_connect()
+        if action == "repair_warp":
+            return self.repair_warp_connection()
+        if action == "hop":
+            return self.hop_now()
+        if action == "fix_port":
+            return self.fix_opencode_service()
+        if action == "start_tor":
+            return self.toggle_tor_service(True)
+        if action == "install":
+            return self.install_or_repair()
+        if action == "connect_opencode":
+            res = self.toggle_desktop_service_proxy(True)
+            if res.get("ok"):
+                try:
+                    _deploy_scripts_and_shims()
+                    _update_user_path(True)
+                except Exception:
+                    pass
+                res["message"] = (
+                    "OpenCode is connected to the local proxy. Close and reopen OpenCode so it picks up the change."
+                )
+            return res
+        if action == "install_warp":
+            webbrowser.open("https://one.one.one.one/")
+            return {"ok": True, "message": "Opened the Cloudflare WARP download page. Install it, then press Refresh."}
+        return {"ok": False, "message": "Unknown fix."}
+
+    def fix_everything(self) -> dict:
+        """Run every one-click fix the health check suggests, most serious first."""
+        order = [
+            "install",
+            "connect_opencode",
+            "start_keeper",
+            "restart_workers",
+            "connect_warp",
+            "start_tor",
+            "start_guard",
+            "fix_port",
+        ]
+        done: list[str] = []
+        failed: list[str] = []
+        manual: list[str] = []
+        tried: set[str] = set()
+        for _round in range(2):
+            health = self.get_state().get("health") or {}
+            issues = sorted(health.get("issues", []), key=lambda i: 0 if i.get("level") == "bad" else 1)
+            todo = [i for i in issues if i.get("fix") and i["fix"] not in tried]
+            if not todo:
+                break
+            for issue in sorted(todo, key=lambda i: order.index(i["fix"]) if i["fix"] in order else 99):
+                fix = issue["fix"]
+                tried.add(fix)
+                if fix == "install_warp":
+                    manual.append("Install Cloudflare WARP (free) from one.one.one.one, then press Fix everything again.")
+                    continue
+                try:
+                    res = self.fix_issue(fix)
+                except Exception as exc:
+                    res = {"ok": False, "message": str(exc)}
+                (done if res.get("ok") else failed).append(issue.get("title", fix))
+        final = self.get_state().get("health") or {}
+        left = [i.get("title", "") for i in final.get("issues", []) if i.get("level") == "bad"]
+        if not left and not manual:
+            msg = "Everything is working." if not done else f"Fixed: {', '.join(done)}. Everything is working."
+            return {"ok": True, "message": msg, "fixed": done, "remaining": []}
+        parts = []
+        if done:
+            parts.append(f"Fixed: {', '.join(done)}.")
+        if failed:
+            parts.append(f"Couldn't fix: {', '.join(failed)}.")
+        if left:
+            parts.append(f"Still not working: {', '.join(left)}.")
+        parts += manual
+        return {"ok": False, "message": " ".join(parts), "fixed": done, "remaining": left + manual}
+
+    def restart_workers(self) -> dict:
+        """Restart the keeper and guard with the code currently deployed, without changing service wiring."""
+        if not self._action_lock.acquire(blocking=False):
+            return {"ok": False, "message": "Another rotation or setup action is already running."}
+        try:
+            _deploy_scripts_and_shims()
+            for name in ("guard", "keeper"):
+                _stop_worker_processes(name)
+            time.sleep(1.0)
+            for name in ("guard", "keeper"):
+                self.toggle_worker(name, True)
+            for _ in range(20):
+                if _port_open(SERVICE_PROXY_PORT):
+                    break
+                time.sleep(0.3)
+            if _port_open(SERVICE_PROXY_PORT):
+                return {"ok": True, "message": "Background service restarted with the current code."}
+            return {
+                "ok": False,
+                "message": "Workers restarted, but the local proxy is not listening yet. Check the Keeper log.",
+            }
+        finally:
+            self._action_lock.release()
 
     def _get_egress_state(self) -> dict:
         try:
@@ -741,6 +1186,10 @@ class AvatarControlApi:
             st["hops"] = int(st.get("hops", 0) or 0) + 1
             st["last_hop"] = int(time.time())
             st["current"] = new_v6
+            # A manual rotation is an explicit request to try again now.
+            st["failed_hops"] = 0
+            st["backoff_until"] = 0
+            st["hop_counted"] = 0
             GUARD_STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
             old_p = normalize_v6_64(old_v6) or "?"
             new_p = normalize_v6_64(new_v6) or new_v6
@@ -762,20 +1211,8 @@ class AvatarControlApi:
                 run_hidden(
                     ["schtasks", "/Change", "/TN", task_name, "/DISABLE"], timeout=8.0
                 )
-            killed = 0
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-                try:
-                    pname = (proc.info.get("name") or "").lower()
-                    cmd = " ".join(proc.info.get("cmdline") or []).lower()
-                    if pname in ("python.exe", "pythonw.exe") and script_name in cmd:
-                        proc.kill()
-                        killed += 1
-                    elif f"--worker {worker_flag}" in cmd and proc.info["pid"] != os.getpid():
-                        proc.kill()
-                        killed += 1
-                except Exception:
-                    pass
-            if not enable and name == "keeper":
+            killed = _stop_worker_processes(name)
+            if name == "keeper":
                 self.toggle_desktop_service_proxy(False)
             return {"ok": True, "message": f"Stopped {name} ({killed} process{'es' if killed != 1 else ''})."}
 

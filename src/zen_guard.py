@@ -36,6 +36,22 @@ COOLDOWN_SECONDS = 75
 MAX_HOP_TRIES = 4
 BLACKLIST_MAX = 200
 MAX_READ_BYTES = 4_000_000
+# Loop protection: if the limit comes back this soon after a new IP, that IP
+# didn't help. The pause is short because WARP's /64 blocks are shared and the
+# next one is often fine.
+REWALL_SECONDS = 180
+FAILED_HOPS_MAX = 2
+BACKOFF_SECONDS = 2 * 60
+HEARTBEAT_FILE = GUARD_LOG_FILE.parent / "heartbeat.txt"
+PENDING_MAX_AGE = 30 * 60
+
+
+def _heartbeat() -> None:
+    """Cheap liveness signal the app checks; a running but hung guard stops writing this."""
+    try:
+        HEARTBEAT_FILE.write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _default_state(offset: int = 0) -> dict:
@@ -49,6 +65,12 @@ def _default_state(offset: int = 0) -> dict:
         "wall_seen": 0,
         "last_ok_hop": 0,
         "last_wait_log": 0,
+        "pending": {},
+        "resumed": {},
+        "failed_hops": 0,
+        "backoff_until": 0,
+        "hop_counted": 0,
+        "backoff_logged": 0,
     }
 
 
@@ -74,20 +96,89 @@ def _save_state(state: dict) -> None:
         pass
 
 
-def _dispatch_auto_resume() -> None:
-    """Dispatches 'continue' to the active OpenCode session once the limit is bypassed."""
+def _resumable(state: dict) -> list[str]:
+    """Chats that hit the limit and haven't had a 'continue' since the last new IP."""
+    last_hop = float(state.get("last_ok_hop", 0) or 0)
+    resumed = state.get("resumed") or {}
+    return [sid for sid in (state.get("pending") or {}) if float(resumed.get(sid, 0) or 0) < last_hop]
+
+
+def _prune(state: dict) -> None:
+    cutoff = time.time() - PENDING_MAX_AGE
+    for key in ("pending", "resumed"):
+        state[key] = {k: v for k, v in (state.get(key) or {}).items() if float(v or 0) >= cutoff}
+
+
+def _dispatch_auto_resume(state: dict) -> None:
+    """After a new IP: send 'continue' to every chat that hit the limit, not just the latest one."""
     try:
         from auto_resume import resume_active_session, is_auto_resume_enabled, clear_opencode_free_limit
 
         # Always clear client-side free-limit locks immediately upon rotation
         clear_opencode_free_limit()
 
+        sids = _resumable(state)
         if is_auto_resume_enabled():
             time.sleep(1.5)
-            ok, res_msg = resume_active_session()
+            ok, res_msg = resume_active_session(sids or None)
             append_log(GUARD_LOG_FILE, f"[auto-resume] Limit bypassed -> {res_msg}")
+        now = time.time()
+        for sid in sids:
+            state.setdefault("resumed", {})[sid] = now
+            (state.get("pending") or {}).pop(sid, None)
+        _prune(state)
+        _save_state(state)
     except Exception as exc:
         append_log(GUARD_LOG_FILE, f"[auto-resume] note: {exc}")
+
+
+def _note_wall(state: dict, now: int) -> bool:
+    """Track walls that return right after a new IP and pause rotation when it's clearly a loop.
+
+    Returns True while auto-rotation is paused (the caller should not rotate or resume).
+    """
+    backoff_until = int(state.get("backoff_until", 0) or 0)
+    if backoff_until and now >= backoff_until:
+        state["backoff_until"] = 0
+        state["failed_hops"] = 0
+        append_log(GUARD_LOG_FILE, "rotation pause is over - trying again on the next limit")
+    if now < int(state.get("backoff_until", 0) or 0):
+        if now - int(state.get("backoff_logged", 0) or 0) >= 60:
+            state["backoff_logged"] = now
+            _save_state(state)
+            left = max(0, (int(state["backoff_until"]) - now) // 60)
+            append_log(
+                GUARD_LOG_FILE,
+                f"limit seen again, but auto-rotation is paused for ~{left} more min "
+                f"(new IPs kept hitting the limit immediately)",
+            )
+        return True
+
+    last_hop = int(state.get("last_ok_hop", 0) or 0)
+    if last_hop and now - last_hop <= REWALL_SECONDS:
+        if int(state.get("hop_counted", 0) or 0) != last_hop:
+            state["hop_counted"] = last_hop
+            state["failed_hops"] = int(state.get("failed_hops", 0) or 0) + 1
+            append_log(
+                GUARD_LOG_FILE,
+                f"limit came back {now - last_hop}s after the last IP change "
+                f"(failed attempt {state['failed_hops']} of {FAILED_HOPS_MAX})",
+            )
+    elif last_hop:
+        # The previous IP lasted long enough: this isn't a rotation loop.
+        state["failed_hops"] = 0
+
+    if int(state.get("failed_hops", 0) or 0) >= FAILED_HOPS_MAX:
+        state["backoff_until"] = now + BACKOFF_SECONDS
+        state["backoff_logged"] = now
+        append_log(
+            GUARD_LOG_FILE,
+            f"pausing auto-rotation for {BACKOFF_SECONDS // 60} min: the last "
+            f"{FAILED_HOPS_MAX} new addresses hit the limit again immediately. "
+            f"It will try one more address by itself after that, or press Rotate /64 Now.",
+        )
+    _save_state(state)
+    return now < int(state.get("backoff_until", 0) or 0)
 
 
 def _blacklist_add(state: dict, addr: str) -> None:
@@ -106,14 +197,14 @@ def _is_burnt(state: dict, addr: str) -> bool:
     return any(x and normalize_v6_64(x) == prefix for x in state.get("blacklist", []))
 
 
-def _read_new_log_bytes(state: dict) -> bool:
-    """Return True if a quota wall appeared since the last offset."""
+def _read_new_log_bytes(state: dict) -> tuple[bool, list[str]]:
+    """(wall seen since the last offset?, session IDs of the chats that hit it)."""
     if not OPENCODE_LOG_FILE.is_file():
-        return False
+        return False, []
     try:
         size = OPENCODE_LOG_FILE.stat().st_size
     except OSError:
-        return False
+        return False, []
 
     offset = int(state.get("offset", 0) or 0)
     if size < offset:
@@ -122,6 +213,7 @@ def _read_new_log_bytes(state: dict) -> bool:
     start = max(offset, size - MAX_READ_BYTES)
     delta = size - start
     wall = False
+    sessions: list[str] = []
     if delta > 0:
         try:
             with OPENCODE_LOG_FILE.open("rb") as fh:
@@ -151,6 +243,17 @@ def _read_new_log_bytes(state: dict) -> bool:
             )
             if any(p in chunk_lower for p in wall_patterns):
                 wall = True
+                try:
+                    from auto_resume import session_id_in
+                except Exception:
+                    session_id_in = None
+                if session_id_in:
+                    for line in chunk.splitlines():
+                        low = line.lower()
+                        if any(p in low for p in wall_patterns):
+                            sid = session_id_in(line)
+                            if sid and sid not in sessions:
+                                sessions.append(sid)
         except OSError:
             pass
 
@@ -159,7 +262,7 @@ def _read_new_log_bytes(state: dict) -> bool:
         state["wall_pending"] = True
         state["wall_seen"] = int(time.time())
     _save_state(state)
-    return wall
+    return wall, sessions
 
 
 def _rotate(state: dict, warp_bin: str | None) -> bool:
@@ -186,7 +289,7 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
             _save_state(state)
             append_log(GUARD_LOG_FILE, f"Tor rotated #{state['hops']}: {msg}")
             if ok:
-                _dispatch_auto_resume()
+                _dispatch_auto_resume(state)
             return ok
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"Tor rotation error: {exc}")
@@ -205,7 +308,7 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
             _save_state(state)
             append_log(GUARD_LOG_FILE, f"Custom proxy rotated #{state['hops']}: {msg}")
             if ok:
-                _dispatch_auto_resume()
+                _dispatch_auto_resume(state)
             return ok
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"Custom proxy rotation error: {exc}")
@@ -224,6 +327,7 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
         or (get_warp_local_v6() or "")
         or str(state.get("current", ""))
     )
+    old_prefix = normalize_v6_64(old_v6)
     append_log(GUARD_LOG_FILE, f"wall detected — rotating WARP /64 (was: {old_v6 or '?'})")
     _blacklist_add(state, old_v6)
     _save_state(state)
@@ -239,6 +343,12 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
             )
             if not cand:
                 append_log(GUARD_LOG_FILE, f"try {attempt}: rotation produced no fresh /64")
+                continue
+            if old_prefix and normalize_v6_64(cand) == old_prefix:
+                append_log(
+                    GUARD_LOG_FILE,
+                    f"try {attempt}: WARP returned the same /64 again ({cand}) - not a new IP",
+                )
                 continue
             if _is_burnt(state, cand):
                 append_log(
@@ -260,10 +370,15 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
                 new_v6 = cand
 
     state["last_hop"] = now
-    if new_v6:
+    same_address = bool(old_prefix) and bool(new_v6) and normalize_v6_64(new_v6) == old_prefix
+    if new_v6 and not same_address:
         state["current"] = new_v6
         state["hops"] = int(state.get("hops", 0) or 0) + 1
         state["last_ok_hop"] = now
+        state["failed_hops"] = 0
+        state["backoff_until"] = 0
+        state["backoff_logged"] = 0
+        state["hop_counted"] = 0
         _save_state(state)
         append_log(GUARD_LOG_FILE, f"rotated #{state['hops']}: {old_v6} -> {new_v6}")
         try:
@@ -271,8 +386,29 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
             (LANE_DIR / "edge_reroll").write_text(str(time.time()), encoding="utf-8")
         except Exception:
             pass
-        _dispatch_auto_resume()
+        _dispatch_auto_resume(state)
         return True
+
+    if same_address:
+        # Don't send "continue" on the same limited IP: that is exactly the loop users saw.
+        # last_ok_hop is deliberately left alone so the next wall is not treated as
+        # a fresh IP (and so no resume is sent here).
+        state["failed_hops"] = int(state.get("failed_hops", 0) or 0) + 1
+        if state["failed_hops"] >= FAILED_HOPS_MAX:
+            state["backoff_until"] = now + BACKOFF_SECONDS
+            state["backoff_logged"] = now
+            append_log(
+                GUARD_LOG_FILE,
+                f"pausing auto-rotation for {BACKOFF_SECONDS // 60} min: WARP kept "
+                f"returning the same /64 ({new_v6}). It will try again by itself after that.",
+            )
+        else:
+            append_log(
+                GUARD_LOG_FILE,
+                f"rotation ended on the same /64 ({new_v6}) - chat left paused instead of looping",
+            )
+        _save_state(state)
+        return False
 
     _save_state(state)
     append_log(
@@ -294,21 +430,46 @@ def main() -> int:
         GUARD_LOG_FILE,
         f"guard up (poll {POLL_SECONDS}s, cooldown {COOLDOWN_SECONDS}s, warp={'found' if warp_bin else 'none'})",
     )
+    _heartbeat()
 
     while True:
         time.sleep(POLL_SECONDS)
         try:
+            _heartbeat()
             state = _load_state()
-            wall = _read_new_log_bytes(state)
+            now = int(time.time())
+            backoff_until = int(state.get("backoff_until", 0) or 0)
+            if backoff_until and now >= backoff_until:
+                state["backoff_until"] = 0
+                state["failed_hops"] = 0
+                state["backoff_logged"] = 0
+                state["hop_counted"] = 0
+                _save_state(state)
+                append_log(GUARD_LOG_FILE, "rotation pause is over - trying again")
+            wall, sessions = _read_new_log_bytes(state)
             if not wall and not state.get("wall_pending"):
                 continue
 
-            now = int(time.time())
+            if wall:
+                pending = state.setdefault("pending", {})
+                for sid in sessions:
+                    pending.setdefault(sid, now)
+                _save_state(state)
+                if _note_wall(state, now):
+                    continue
+            elif int(state.get("backoff_until", 0) or 0) > now:
+                # Still paused: leave the wall queued for after the break.
+                continue
+
             last_hop = int(state.get("last_hop", 0) or 0)
             last_ok = int(state.get("last_ok_hop", 0) or 0)
             seen = int(state.get("wall_seen", 0) or 0)
             if seen and seen <= last_ok:
                 # The wall came from the session that was already rotated.
+                for sid in list(state.get("pending") or {}):
+                    state.setdefault("resumed", {})[sid] = last_ok
+                    (state.get("pending") or {}).pop(sid, None)
+                _prune(state)
                 state["wall_pending"] = False
                 _save_state(state)
                 continue
@@ -321,14 +482,29 @@ def main() -> int:
                     state["wall_pending"] = True
                     _save_state(state)
             else:
-                last_log = int(state.get("last_wait_log", 0) or 0)
-                if now - last_log >= 60:
+                # Only continue other tabs when the last hop really produced a
+                # new IP. A failed hop or one that stayed on the same /64 must
+                # not send 'continue' on the old, limited address.
+                fresh_ip = wall and last_ok >= last_hop
+                resumable = _resumable(state) if fresh_ip else []
+                if resumable:
+                    # Other tabs that were cut off by the same wall arrived after
+                    # the IP change; the new IP is fresh, so continue them too.
                     append_log(
                         GUARD_LOG_FILE,
-                        f"wall queued — waiting out cooldown ({age}s < {COOLDOWN_SECONDS}s)",
+                        f"{len(resumable)} more chat(s) hit the limit around the last IP change "
+                        f"({age}s ago) - sending them 'continue'",
                     )
-                    state["last_wait_log"] = now
-                    _save_state(state)
+                    _dispatch_auto_resume(state)
+                else:
+                    last_log = int(state.get("last_wait_log", 0) or 0)
+                    if now - last_log >= 60:
+                        append_log(
+                            GUARD_LOG_FILE,
+                            f"wall queued — waiting out cooldown ({age}s < {COOLDOWN_SECONDS}s)",
+                        )
+                        state["last_wait_log"] = now
+                        _save_state(state)
         except Exception as exc:
             append_log(GUARD_LOG_FILE, f"guard error: {exc}")
 

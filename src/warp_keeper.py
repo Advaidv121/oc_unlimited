@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import threading
 import time
 
 from ouc_common import (
@@ -28,7 +29,18 @@ from zen_proxy import start_proxy_server
 
 TICK_SECONDS = 45
 REPAIR_COOLDOWN_SECONDS = 120.0
+PROXY_WATCH_SECONDS = 3.0
+HEARTBEAT_FILE = KEEPER_LOG_FILE.parent / "heartbeat.txt"
+_PROXY_LOCK = threading.Lock()
 _last_repair = 0.0
+
+
+def _heartbeat() -> None:
+    """Cheap liveness signal the app checks; a running but hung keeper stops writing this."""
+    try:
+        HEARTBEAT_FILE.write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _active_scope() -> str:
@@ -131,22 +143,48 @@ def _port_open(port: int) -> bool:
         return False
 
 
-def _start_service_proxy() -> object | None:
-    if _port_open(SERVICE_PROXY_PORT):
-        return None
-    try:
-        srv, bound_port, edge = start_proxy_server(SERVICE_PROXY_PORT)
-        append_log(
-            KEEPER_LOG_FILE,
-            f"service proxy listening on 127.0.0.1:{bound_port} (edge={edge})",
-        )
-        return srv
-    except Exception as exc:
-        append_log(
-            KEEPER_LOG_FILE,
-            f"service proxy bind failed on port {SERVICE_PROXY_PORT}: {exc}",
-        )
-        return None
+def _start_service_proxy(quiet: bool = False) -> object | None:
+    with _PROXY_LOCK:
+        if _port_open(SERVICE_PROXY_PORT):
+            return None
+        try:
+            srv, bound_port, edge = start_proxy_server(SERVICE_PROXY_PORT)
+            if not quiet:
+                append_log(
+                    KEEPER_LOG_FILE,
+                    f"service proxy listening on 127.0.0.1:{bound_port} (edge={edge})",
+                )
+            return srv
+        except Exception as exc:
+            if not quiet:
+                append_log(
+                    KEEPER_LOG_FILE,
+                    f"service proxy bind failed on port {SERVICE_PROXY_PORT}: {exc}",
+                )
+            return None
+
+
+def _proxy_watchdog() -> None:
+    """Keep the local proxy served; rebind it within seconds if it disappears."""
+    servers = []  # keep references so the servers are not garbage collected
+    bind_failing = False
+    while True:
+        try:
+            if not _port_open(SERVICE_PROXY_PORT):
+                srv = _start_service_proxy(quiet=True)
+                if srv is not None:
+                    servers.append(srv)
+                    bind_failing = False
+                elif not bind_failing:
+                    append_log(
+                        KEEPER_LOG_FILE,
+                        f"service proxy is not listening on port {SERVICE_PROXY_PORT}; retrying every "
+                        f"{int(PROXY_WATCH_SECONDS)}s",
+                    )
+                    bind_failing = True
+        except Exception:
+            pass
+        time.sleep(PROXY_WATCH_SECONDS)
 
 
 def main() -> int:
@@ -157,10 +195,12 @@ def main() -> int:
 
     warp_bin = find_warp_cli()
     append_log(KEEPER_LOG_FILE, f"keeper up (tick={TICK_SECONDS}s, warp={'found' if warp_bin else 'none'})")
+    _heartbeat()
 
     # Start the desktop/service proxy on 41987 so every egress mode is routable.
     proxy_srv = _start_service_proxy()
     reported_external = proxy_srv is None and _port_open(SERVICE_PROXY_PORT)
+    threading.Thread(target=_proxy_watchdog, daemon=True).start()
 
     # On startup, allow network interface initialization if booting and warp is installed
     if warp_bin:
@@ -172,6 +212,7 @@ def main() -> int:
 
     while True:
         try:
+            _heartbeat()
             if proxy_srv is None and not _port_open(SERVICE_PROXY_PORT):
                 proxy_srv = _start_service_proxy()
             elif proxy_srv is None and not reported_external:

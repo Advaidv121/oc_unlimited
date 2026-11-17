@@ -252,8 +252,12 @@ def _tail_lines(path: Path, count: int = 75) -> list[str]:
         return []
 
 
+# EPIPE is deliberately absent: OpenCode reports a closed stdout/stderr pipe as
+# "Error: EPIPE: broken pipe, write" with role=cli, which is local and must not
+# raise the network banner. Upstream write failures still carry fetch failed,
+# UND_ERR_*, or ECONNRESET.
 _NET_ERROR_RE = re.compile(
-    r"ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENETUNREACH|"
+    r"ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENETUNREACH|"
     r"EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|CF_HAPPY_EYEBALLS|UND_ERR_|"
     r"Transport error|fetch failed",
     re.IGNORECASE,

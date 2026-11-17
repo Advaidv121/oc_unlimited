@@ -45,6 +45,7 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
   * A dropped WARP tunnel or proxy route is recorded, repaired, and surfaced in the dashboard instead of returning an empty `503`.
   * **Auto-Repair** is on by default and only performs safe actions: start or restart a stopped proxy, reconnect WARP, repair the tunnel, or re-roll the edge. It never changes the selected mode, clears chats, restarts OpenCode, or deletes the WARP registration, and it respects workers you deliberately disabled.
   * The **Proxy** log tab shows edge failover, `stream_reset`, direct fallback, and tunnel repair events.
+  * A local `EPIPE: broken pipe` from OpenCode's own console pipe is no longer reported as an upstream network error.
   * Standard mode still permits a direct fallback so OpenCode stays usable; the health panel labels it **Using a direct connection** and offers a one-click repair.
 * **WARP Keeper Stability:**
   * A connected tunnel is left alone unless the selected WARP scope changed; the keeper repairs disconnected or error states.

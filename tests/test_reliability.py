@@ -114,6 +114,15 @@ class RecentNetworkErrorTests(unittest.TestCase):
             avatar_ui._recent_network_errors(["stack trace: ECONNRESET"]), []
         )
 
+    def test_local_cli_broken_pipe_is_not_a_network_error(self) -> None:
+        now = datetime.now(timezone.utc)
+        line = (
+            f"timestamp={now.strftime('%Y-%m-%dT%H:%M:%S')}.507Z level=ERROR "
+            'run=5aa107ed message="unhandled rejection" '
+            'cause="Error: EPIPE: broken pipe, write" role=cli'
+        )
+        self.assertEqual(avatar_ui._recent_network_errors([line]), [])
+
 
 class EdgeFailoverTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Ensure local script and bundled directories are resolvable
@@ -42,6 +43,12 @@ MAX_READ_BYTES = 4_000_000
 REWALL_SECONDS = 180
 FAILED_HOPS_MAX = 2
 BACKOFF_SECONDS = 2 * 60
+# A hop that could not be confirmed is not worth retrying every cooldown:
+# each attempt reconnects WARP and cuts live streams.
+ROTATION_RETRY_SECONDS = 10 * 60
+# Confirmed new IPv6 addresses that still hit the free wall mean the allowance
+# is not following the IP. Stop rotating until it resets at 00:00 UTC.
+FREE_WALL_HOPS_MAX = 2
 HEARTBEAT_FILE = GUARD_LOG_FILE.parent / "heartbeat.txt"
 PENDING_MAX_AGE = 30 * 60
 
@@ -71,6 +78,10 @@ def _default_state(offset: int = 0) -> dict:
         "backoff_until": 0,
         "hop_counted": 0,
         "backoff_logged": 0,
+        "last_free_wall": 0,
+        "free_wall_hops": 0,
+        "free_wall_counted": 0,
+        "free_wall_until": 0,
     }
 
 
@@ -132,6 +143,13 @@ def _dispatch_auto_resume(state: dict) -> None:
         append_log(GUARD_LOG_FILE, f"[auto-resume] note: {exc}")
 
 
+def _next_utc_midnight(now: int) -> int:
+    """Return the next 00:00 UTC, when the gateway's free allowance resets."""
+    stamp = datetime.fromtimestamp(now, timezone.utc)
+    reset = (stamp + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(reset.timestamp())
+
+
 def _note_wall(state: dict, now: int) -> bool:
     """Track walls that return right after a new IP and pause rotation when it's clearly a loop.
 
@@ -141,6 +159,8 @@ def _note_wall(state: dict, now: int) -> bool:
     if backoff_until and now >= backoff_until:
         state["backoff_until"] = 0
         state["failed_hops"] = 0
+        state["free_wall_hops"] = 0
+        state["free_wall_until"] = 0
         append_log(GUARD_LOG_FILE, "rotation pause is over - trying again on the next limit")
     if now < int(state.get("backoff_until", 0) or 0):
         if now - int(state.get("backoff_logged", 0) or 0) >= 60:
@@ -167,6 +187,36 @@ def _note_wall(state: dict, now: int) -> bool:
     elif last_hop:
         # The previous IP lasted long enough: this isn't a rotation loop.
         state["failed_hops"] = 0
+
+    free_wall = int(state.get("last_free_wall", 0) or 0)
+    fresh_free = bool(last_hop) and bool(free_wall) and 0 <= free_wall - last_hop <= REWALL_SECONDS
+    if fresh_free:
+        if int(state.get("free_wall_counted", 0) or 0) != last_hop:
+            state["free_wall_counted"] = last_hop
+            state["free_wall_hops"] = int(state.get("free_wall_hops", 0) or 0) + 1
+            append_log(
+                GUARD_LOG_FILE,
+                f"free limit came back {free_wall - last_hop}s after a confirmed new IPv6 "
+                f"address ({state['free_wall_hops']} of {FREE_WALL_HOPS_MAX})",
+            )
+    else:
+        state["free_wall_hops"] = 0
+
+    if int(state.get("free_wall_hops", 0) or 0) >= FREE_WALL_HOPS_MAX:
+        until = _next_utc_midnight(now)
+        state["free_wall_until"] = until
+        state["backoff_until"] = until
+        state["backoff_logged"] = now
+        state["hop_counted"] = last_hop
+        reset_at = datetime.fromtimestamp(until, timezone.utc).strftime("%H:%M UTC")
+        append_log(
+            GUARD_LOG_FILE,
+            f"free limit is not following the IP: {FREE_WALL_HOPS_MAX} confirmed new IPv6 "
+            f"addresses hit it again. Pausing rotation until {reset_at}. Another provider, "
+            f"OpenCode Go, or pressing Try now is the way forward.",
+        )
+        _save_state(state)
+        return True
 
     if int(state.get("failed_hops", 0) or 0) >= FAILED_HOPS_MAX:
         state["backoff_until"] = now + BACKOFF_SECONDS
@@ -261,6 +311,8 @@ def _read_new_log_bytes(state: dict) -> tuple[bool, list[str]]:
     if wall:
         state["wall_pending"] = True
         state["wall_seen"] = int(time.time())
+        if "free usage limit" in chunk_lower:
+            state["last_free_wall"] = state["wall_seen"]
     _save_state(state)
     return wall, sessions
 
@@ -410,10 +462,13 @@ def _rotate(state: dict, warp_bin: str | None) -> bool:
         _save_state(state)
         return False
 
+    state["backoff_until"] = now + ROTATION_RETRY_SECONDS
+    state["backoff_logged"] = now
     _save_state(state)
     append_log(
         GUARD_LOG_FILE,
-        "rotation failed — keeper keeps the tunnel alive; retrying after cooldown",
+        f"rotation failed — no confirmed new IPv6 egress. Pausing retries for "
+        f"{ROTATION_RETRY_SECONDS // 60} min so the tunnel is not reconnected in a loop.",
     )
     return False
 

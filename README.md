@@ -46,7 +46,11 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
   * **Auto-Repair** is on by default and only performs safe actions: start or restart a stopped proxy, reconnect WARP, repair the tunnel, or re-roll the edge. It never changes the selected mode, clears chats, restarts OpenCode, or deletes the WARP registration, and it respects workers you deliberately disabled.
   * The **Proxy** log tab shows edge failover, `stream_reset`, direct fallback, and tunnel repair events.
   * A local `EPIPE: broken pipe` from OpenCode's own console pipe is no longer reported as an upstream network error.
-  * Standard mode still permits a direct fallback so OpenCode stays usable; the health panel labels it **Using a direct connection** and offers a one-click repair.
+  * Standard mode still permits a direct fallback so OpenCode stays usable; the health panel labels it **Using a direct connection** and offers a one-click repair. This now also applies to `opencode.ai` traffic in TUN mode, which previously changed the route without recording it.
+* **Honest IP rotation (new):**
+  * A hop only counts when the **public** IPv6 address changes. The WARP adapter keeps its old IPv6 when the tunnel stops carrying traffic, so the old check could report a successful rotation while requests were really leaving over IPv4. Users then saw "rotated" followed by the same free-limit error, which looks like the method was patched.
+  * `hop_once` checks that WARP is connected before rotating, and a hop that cannot be confirmed waits 10 minutes instead of reconnecting the tunnel every 75 seconds.
+  * If two confirmed new IPv6 addresses still hit the free wall, rotation pauses until the allowance resets at 00:00 UTC and the dashboard explains why. Press **Try now** to force one more address.
 * **WARP Keeper Stability:**
   * A connected tunnel is left alone unless the selected WARP scope changed; the keeper repairs disconnected or error states.
   * Routine repairs renew the WireGuard session keys instead of deleting the device registration.
@@ -164,7 +168,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 +------------------------------------+
 ```
 
-1. **Server-Side Quota (IP-Based):** OpenCode's backend applies free-tier limits to the incoming public IP address. Rotating the IPv6 `/64` presents a different address, which is the behavior the rotator relies on.
+1. **Server-Side Quota (IP-Based):** OpenCode's backend applies free-tier limits to the incoming public IP address, and the allowance is shared across the free models. Rotating the IPv6 `/64` presents a different address, which is the behavior the rotator relies on. The check now uses the address seen from outside, not the local WARP adapter. If WARP cannot carry IPv6, requests leave over IPv4 or a direct route and no amount of `/64` rotation changes the server-side bucket. The dashboard reports that case instead of claiming success.
 2. **Client-Side Lockout Removal:** When OpenCode Desktop hits a rate limit, the local Electron app writes a lockout timestamp into `%APPDATA%\ai.opencode.desktop\drafts.sqlite` (`state` table). Zen Guard deletes this key (`DELETE FROM state WHERE key IN ('free-limit', 'go-upsell')`).
 3. **History Preservation:** The reset only touches those lockout keys. Chat history, system prompts, code blocks, and context in the `document` and `session_v2` tables are left unchanged.
 4. **Window Reload & Resume:** The app reloads OpenCode Desktop, which refreshes the view and clears the banner, then sends `continue{ENTER}`. If the window cannot be focused safely, it falls back to a CLI resume.
@@ -175,6 +179,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 
 ### 1. What to do when you hit a rate limit wall
 * **Automatic Behavior:** With Zen Guard and Auto-Resume on, the guard rotates the egress address, clears the client lockout, and attempts to resume the session. A rotation usually completes within a minute.
+* **If the limit comes back on a confirmed new address:** the free allowance is not following your IP. After two confirmed new IPv6 addresses, rotation pauses until 00:00 UTC so it stops reconnecting WARP and cutting live streams. Use another provider (`/connect`), subscribe to OpenCode Go, or press **Try now** to force another address.
 * **Manual Override:** To rotate now, click the hop button on the dashboard. Its label follows the active mode: **Rotate /64 Now (Hop)** for WARP, **Rotate Circuit (Hop)** for Tor, and **Rotate Proxy (Hop)** for a custom pool.
 
 ### 2. What to do if OpenCode shows "You've reached your free usage limit" banner in an existing chat

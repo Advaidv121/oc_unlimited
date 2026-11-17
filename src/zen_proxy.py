@@ -697,13 +697,16 @@ def _open_warp_direct(
         from tor_manager import get_active_tor_target, open_socks5_tunnel
         tor_target = get_active_tor_target()
         if tor_target:
-            return open_socks5_tunnel(
+            sock = open_socks5_tunnel(
                 clean_host,
                 port,
                 socks_host=tor_target[0],
                 socks_port=tor_target[1],
                 timeout=6.0,
             )
+            if is_opencode_host:
+                _mark_fallback(clean_host, "WARP route unavailable; OpenCode used the Tor fallback")
+            return sock
     except Exception:
         pass
 
@@ -720,10 +723,13 @@ def _open_warp_direct(
         except Exception:
             pass
 
-    # Direct standard dual-stack connection (IPv4/IPv6). In isolated scope this
-    # bypasses WARP, so record it instead of silently changing the route.
-    if scope == "isolated" and is_opencode_host:
-        _mark_fallback(clean_host, "isolated WARP proxy unavailable; used the direct route")
+    # Direct standard dual-stack connection (IPv4/IPv6). This silently leaves
+    # the WARP IPv6 route, so record it instead of changing the route unseen.
+    if is_opencode_host:
+        _mark_fallback(
+            clean_host,
+            f"pinned IPv6 edge unavailable; OpenCode used the fallback route ({scope})",
+        )
     sock = socket.create_connection((clean_host, port), timeout=8.0)
     sock.settimeout(None)
     return sock

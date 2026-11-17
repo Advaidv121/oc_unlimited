@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import avatar_ui
 import ouc_common
 import proxy_chain
+import zen_guard
 import zen_proxy
 
 
@@ -451,7 +453,14 @@ class AutoRepairTests(unittest.TestCase):
 
 
 class HealthTests(unittest.TestCase):
-    def _health(self, *, proxy: dict, net_errors: list[str]) -> dict:
+    def _health(
+        self,
+        *,
+        proxy: dict,
+        net_errors: list[str],
+        guard_free_wall: int = 0,
+        guard_backoff: int = 0,
+    ) -> dict:
         api = object.__new__(avatar_ui.AvatarControlApi)
         return api._build_health(
             warp_installed=True,
@@ -469,6 +478,8 @@ class HealthTests(unittest.TestCase):
             desktop_installed=True,
             cli_installed=True,
             path_wired=True,
+            guard_free_wall=guard_free_wall,
+            guard_backoff=guard_backoff,
         )
 
     def test_direct_fallback_is_visible_and_actionable(self) -> None:
@@ -496,6 +507,27 @@ class HealthTests(unittest.TestCase):
         self.assertIn("Using a direct connection", duplicate_titles)
         self.assertNotIn("OpenCode hit a network error", duplicate_titles)
 
+    def test_free_limit_that_ignores_new_ips_is_explained(self) -> None:
+        future = int(time.time()) + 3600
+        health = self._health(
+            proxy={"fallback_active": False},
+            net_errors=[],
+            guard_free_wall=future,
+        )
+        issue = next(
+            i
+            for i in health["issues"]
+            if i["title"] == "The free limit is not following the IP"
+        )
+
+        self.assertEqual(issue["level"], "warn")
+        self.assertEqual(issue["fix"], "hop")
+        self.assertIn("resets around", issue["detail"])
+        self.assertNotIn(
+            "Auto-rotation is taking a break",
+            [i["title"] for i in health["issues"]],
+        )
+
     def test_repeated_stream_resets_are_surfaced_with_a_rotation_action(self) -> None:
         health = self._health(
             proxy={"fallback_active": False, "stream_resets_5m": 2}, net_errors=[]
@@ -514,6 +546,83 @@ class HealthTests(unittest.TestCase):
             "Response streams keep dropping",
             [i["title"] for i in single["issues"]],
         )
+
+
+class PublicEgressTests(unittest.TestCase):
+    def test_local_warp_address_is_not_accepted_as_public_egress(self) -> None:
+        with mock.patch.object(
+            ouc_common, "get_egress_ip", return_value="203.0.113.7"
+        ), mock.patch.object(
+            ouc_common, "get_warp_local_v6", return_value="2606:4700:110:8a1e::1"
+        ), mock.patch.object(
+            proxy_chain, "get_egress_config", return_value={"mode": "warp", "warp_scope": "tun"}
+        ):
+            self.assertEqual(
+                ouc_common.get_egress_v6(timeout=0.1), "2606:4700:110:8a1e::1"
+            )
+            self.assertEqual(ouc_common.get_public_v6(timeout=0.1), "")
+
+    def test_public_ipv6_is_returned(self) -> None:
+        with mock.patch.object(
+            ouc_common, "get_egress_ip", return_value="2606:4700:110:8a1e::2"
+        ):
+            self.assertEqual(
+                ouc_common.get_public_v6(timeout=0.1), "2606:4700:110:8a1e::2"
+            )
+
+
+class HopGuardTests(unittest.TestCase):
+    def test_a_disconnected_tunnel_is_not_rotated_in_a_loop(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            return (0, "")
+
+        with mock.patch.object(
+            ouc_common, "warp_status", return_value=(False, "warp", "Disconnected")
+        ), mock.patch.object(
+            ouc_common, "run_warp", side_effect=fake_run
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_mode"
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_protocol"
+        ), mock.patch.object(
+            ouc_common.time, "sleep"
+        ):
+            self.assertEqual(ouc_common.hop_once("warp-cli"), "")
+
+        self.assertEqual(calls, [["connect"]])
+
+
+class FreeWallTests(unittest.TestCase):
+    def test_reset_is_the_next_utc_midnight(self) -> None:
+        now = int(datetime(2026, 11, 17, 12, 29, tzinfo=timezone.utc).timestamp())
+        reset = datetime.fromtimestamp(
+            zen_guard._next_utc_midnight(now), timezone.utc
+        )
+        self.assertEqual(reset, datetime(2026, 11, 18, 0, 0, tzinfo=timezone.utc))
+
+    def test_two_fresh_addresses_that_hit_the_free_wall_pause_until_reset(self) -> None:
+        now = int(datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).timestamp())
+        state = zen_guard._default_state()
+        state["last_ok_hop"] = now - 30
+        state["last_free_wall"] = now - 5
+
+        with mock.patch.object(zen_guard, "_save_state"), mock.patch.object(
+            zen_guard, "append_log"
+        ):
+            self.assertFalse(zen_guard._note_wall(state, now))
+            self.assertEqual(state["free_wall_hops"], 1)
+
+            state["last_ok_hop"] = now + 100
+            state["last_free_wall"] = now + 105
+            self.assertTrue(zen_guard._note_wall(state, now + 110))
+
+        self.assertEqual(
+            state["free_wall_until"], zen_guard._next_utc_midnight(now + 110)
+        )
+        self.assertEqual(state["backoff_until"], state["free_wall_until"])
 
 
 class CustomProxyFailoverTests(unittest.TestCase):

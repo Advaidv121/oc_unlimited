@@ -876,6 +876,7 @@ class AvatarControlApi:
             installed=state["lane"]["scripts_installed"],
             probe=probe,
             guard_backoff=int(guard_state.get("backoff_until", 0) or 0),
+            guard_free_wall=int(guard_state.get("free_wall_until", 0) or 0),
             keeper_heartbeat=keeper_hb,
             guard_heartbeat=guard_hb,
             desktop_installed=bool(desktop_path),
@@ -900,6 +901,7 @@ class AvatarControlApi:
         installed: bool,
         probe: dict | None = None,
         guard_backoff: int = 0,
+        guard_free_wall: int = 0,
         keeper_heartbeat: float | None = None,
         guard_heartbeat: float | None = None,
         desktop_installed: bool = False,
@@ -1072,7 +1074,19 @@ class AvatarControlApi:
                 label,
             )
 
-        if guard_backoff and guard_backoff > time.time():
+        if guard_free_wall and guard_free_wall > time.time():
+            reset = time.strftime("%H:%M", time.localtime(guard_free_wall))
+            add(
+                "warn",
+                "The free limit is not following the IP",
+                f"Two confirmed new IPv6 addresses still hit the free limit, so the allowance is no "
+                f"longer tied to your address. Rotation is paused until it resets around {reset} "
+                f"(your time). Use another provider, subscribe to OpenCode Go, or press Try now to "
+                f"force another address.",
+                "hop",
+                "Try now",
+            )
+        elif guard_backoff and guard_backoff > time.time():
             mins = max(1, int((guard_backoff - time.time()) // 60))
             add(
                 "warn",

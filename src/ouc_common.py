@@ -700,6 +700,18 @@ def get_egress_v6(timeout: float = 6.0) -> str:
     return ""
 
 
+def get_public_v6(timeout: float = 6.0) -> str:
+    """Return the public IPv6 address the far side sees, or an empty string.
+
+    The WARP adapter keeps its IPv6 address when the tunnel stops carrying
+    traffic, so the adapter address is not proof that IPv6 works. Rotation must
+    be confirmed with the address observed from outside; otherwise a failed hop
+    looks successful while every request quietly leaves over IPv4.
+    """
+    egress = get_egress_ip(timeout=timeout)
+    return egress if ":" in egress else ""
+
+
 def normalize_v6_64(addr: str) -> str:
     """Normalize an IPv6 address to its /64 network prefix string."""
     clean = addr.strip().split("%", 1)[0]
@@ -875,7 +887,7 @@ def _rotated_egress(
     connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
     if not connected:
         return ""
-    candidate = get_egress_v6(timeout=timeout)
+    candidate = get_public_v6(timeout=timeout)
     prefix = normalize_v6_64(candidate)
     if not candidate or not prefix or prefix in avoid:
         return ""
@@ -906,6 +918,20 @@ def hop_once(
     scope = _current_warp_scope()
     ensure_warp_mode(warp_bin, scope)
     ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+
+    # A disconnected tunnel cannot produce a /64. Reconnecting a few times is
+    # fine, but rotate-keys/disconnect/connect in a loop only cuts live
+    # sessions without changing anything.
+    connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+    if not connected:
+        run_warp(["connect"], warp_bin=warp_bin, timeout=15.0)
+        for _ in range(4):
+            time.sleep(1.5)
+            connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+            if connected:
+                break
+        if not connected:
+            return ""
 
     for _rotation in range(3):
         # rotate-keys keeps the device registration and only renews the

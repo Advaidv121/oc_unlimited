@@ -173,6 +173,27 @@ class EdgeFailoverTests(unittest.TestCase):
             calls, [("edge-a", "2001:db8::1"), ("edge-a", "2001:db8::2")]
         )
 
+    def test_new_warp_address_is_polled_until_the_adapter_publishes_it(self) -> None:
+        state = zen_proxy._WarpState(["edge-a"], "edge-a")
+        reported = ["2001:db8::1", "2001:db8::1", "2001:db8::2"]
+
+        with mock.patch.object(zen_proxy, "get_warp_local_v6", side_effect=reported):
+            fresh = zen_proxy._wait_for_new_local_v6(
+                state, "2001:db8::1", time.monotonic() + 5.0
+            )
+
+        self.assertEqual(fresh, "2001:db8::2")
+
+    def test_stale_address_wait_gives_up_at_the_deadline(self) -> None:
+        state = zen_proxy._WarpState(["edge-a"], "edge-a")
+
+        with mock.patch.object(zen_proxy, "get_warp_local_v6", return_value="2001:db8::1"):
+            fresh = zen_proxy._wait_for_new_local_v6(
+                state, "2001:db8::1", time.monotonic() - 1.0
+            )
+
+        self.assertEqual(fresh, "")
+
     def test_primary_edge_is_first_and_failed_edge_is_skipped(self) -> None:
         state = zen_proxy._WarpState(["edge-a", "edge-b", "edge-c"], "edge-a")
         self.assertEqual(state.edges_to_try()[0], "edge-a")
@@ -248,6 +269,164 @@ class EdgeFailoverTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class DoorHoldTests(unittest.TestCase):
+    """A request that arrives during a rotation waits instead of failing."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._saved = (
+            zen_proxy.LANE_DIR,
+            zen_proxy.PROXY_STATUS_FILE,
+            zen_proxy.FALLBACK_FLAG,
+            zen_proxy.PROXY_LOG_FILE,
+        )
+        zen_proxy.LANE_DIR = self.dir
+        zen_proxy.PROXY_STATUS_FILE = self.dir / "proxy_status.json"
+        zen_proxy.FALLBACK_FLAG = self.dir / "fallback.flag"
+        zen_proxy.PROXY_LOG_FILE = self.dir / "proxy.log"
+
+    def tearDown(self) -> None:
+        (
+            zen_proxy.LANE_DIR,
+            zen_proxy.PROXY_STATUS_FILE,
+            zen_proxy.FALLBACK_FLAG,
+            zen_proxy.PROXY_LOG_FILE,
+        ) = self._saved
+        self.tmp.cleanup()
+
+    def test_connect_waits_while_the_guard_rotates(self) -> None:
+        sock = object()
+        paused = [True, True, False]
+        attempts: list[int] = []
+
+        def fake_open(host, port, state):
+            attempts.append(len(attempts))
+            if len(attempts) < 3:
+                raise ConnectionRefusedError("tunnel is down for the rotation")
+            return sock
+
+        with mock.patch.object(zen_proxy, "_open_upstream", side_effect=fake_open), mock.patch.object(
+            zen_proxy, "_rotation_in_progress", side_effect=lambda: paused.pop(0) if paused else False
+        ), mock.patch.object(zen_proxy, "time") as fake_time:
+            fake_time.monotonic.side_effect = lambda: 0.0
+            fake_time.sleep.return_value = None
+            result = zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
+
+        self.assertIs(result, sock)
+        self.assertEqual(len(attempts), 3)
+        log = (self.dir / "proxy.log").read_text(encoding="utf-8")
+        self.assertIn("hold:", log)
+        self.assertNotIn("connect_fail:", log)
+
+    def test_connect_gives_up_when_the_rotation_never_ends(self) -> None:
+        with mock.patch.object(
+            zen_proxy,
+            "_open_upstream",
+            side_effect=ConnectionRefusedError("tunnel is down"),
+        ), mock.patch.object(zen_proxy, "_rotation_in_progress", return_value=True), mock.patch.object(
+            zen_proxy, "_active_tunnels", return_value=1
+        ), mock.patch.object(zen_proxy, "ROTATION_HOLD_SECONDS", 0.0):
+            with self.assertRaises(ConnectionRefusedError):
+                zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
+
+        log = (self.dir / "proxy.log").read_text(encoding="utf-8")
+        self.assertIn("connect_fail:", log)
+
+    def test_a_fresh_pause_file_means_a_rotation_is_running(self) -> None:
+        pause = self.dir / "keeper.pause"
+        pause.write_text(json.dumps({"until": time.time() + 600}), encoding="utf-8")
+
+        with mock.patch.object(zen_proxy, "PAUSE_FILE", pause), mock.patch.object(
+            zen_proxy, "is_keeper_paused", return_value=True
+        ):
+            self.assertTrue(zen_proxy._rotation_in_progress())
+
+    def test_a_pause_left_by_a_killed_guard_does_not_hold_requests(self) -> None:
+        pause = self.dir / "keeper.pause"
+        pause.write_text(json.dumps({"until": time.time() + 600}), encoding="utf-8")
+        old = time.time() - zen_proxy.ROTATION_FRESH_SECONDS - 30
+        os.utime(pause, (old, old))
+
+        with mock.patch.object(zen_proxy, "PAUSE_FILE", pause), mock.patch.object(
+            zen_proxy, "is_keeper_paused", return_value=True
+        ):
+            self.assertFalse(zen_proxy._rotation_in_progress())
+
+    def test_connect_repairs_once_when_no_tunnel_is_streaming(self) -> None:
+        sock = object()
+        attempts: list[int] = []
+
+        def fake_open(host, port, state):
+            attempts.append(len(attempts))
+            if len(attempts) < 2:
+                raise ConnectionRefusedError("edge is dead")
+            return sock
+
+        with mock.patch.object(zen_proxy, "_open_upstream", side_effect=fake_open), mock.patch.object(
+            zen_proxy, "_rotation_in_progress", return_value=False
+        ), mock.patch.object(zen_proxy, "_active_tunnels", return_value=0), mock.patch.object(
+            zen_proxy, "_repair_warp_tunnel", return_value=True
+        ) as repair:
+            result = zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
+
+        self.assertIs(result, sock)
+        repair.assert_called_once()
+
+    def test_connect_does_not_repair_while_another_stream_is_open(self) -> None:
+        with mock.patch.object(
+            zen_proxy,
+            "_open_upstream",
+            side_effect=ConnectionRefusedError("edge is dead"),
+        ), mock.patch.object(zen_proxy, "_rotation_in_progress", return_value=False), mock.patch.object(
+            zen_proxy, "_active_tunnels", return_value=2
+        ), mock.patch.object(zen_proxy, "_repair_warp_tunnel") as repair:
+            with self.assertRaises(ConnectionRefusedError):
+                zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
+
+        repair.assert_not_called()
+
+
+class RegistrationBackoffTests(unittest.TestCase):
+    def test_retries_wait_longer_each_time(self) -> None:
+        sleeps: list[float] = []
+
+        def fake_run_warp(args, **kwargs):
+            return 1, "registration failed"
+
+        with mock.patch.object(
+            ouc_common, "warp_registration_healthy", return_value=False
+        ), mock.patch.object(ouc_common, "run_warp", side_effect=fake_run_warp), mock.patch.object(
+            ouc_common.time, "sleep", side_effect=sleeps.append
+        ):
+            ok = ouc_common.repair_warp_registration("warp-cli", max_tries=4)
+
+        self.assertFalse(ok)
+        self.assertEqual(sleeps, [2.0, 4.0, 8.0])
+
+    def test_success_stops_the_backoff(self) -> None:
+        sleeps: list[float] = []
+        results = [(1, "failed"), (0, "ok")]
+
+        with mock.patch.object(
+            ouc_common, "warp_registration_healthy", return_value=False
+        ), mock.patch.object(
+            ouc_common, "run_warp", side_effect=lambda *a, **k: results.pop(0)
+        ), mock.patch.object(ouc_common.time, "sleep", side_effect=sleeps.append):
+            ok = ouc_common.repair_warp_registration("warp-cli", max_tries=4)
+
+        self.assertTrue(ok)
+        self.assertEqual(sleeps, [2.0])
+
+    def test_healthy_registration_skips_every_retry(self) -> None:
+        with mock.patch.object(
+            ouc_common, "warp_registration_healthy", return_value=True
+        ), mock.patch.object(ouc_common, "run_warp") as run:
+            self.assertTrue(ouc_common.repair_warp_registration("warp-cli"))
+
+        run.assert_not_called()
 
 
 class BodyReadTests(unittest.TestCase):
@@ -366,18 +545,28 @@ class StreamResetReportingTests(unittest.TestCase):
 
 
 class TaskEnabledParseTests(unittest.TestCase):
+    def _enabled_with(self, xml: str) -> bool:
+        res = mock.Mock(returncode=0, stdout=xml)
+        with mock.patch.object(ouc_common, "run_hidden", return_value=res):
+            return ouc_common.task_enabled("Example-Task")
+
     def test_enabled_tasks_omit_the_element(self) -> None:
-        self.assertTrue(avatar_ui._task_xml_enabled("<Task><Settings></Settings></Task>"))
+        self.assertTrue(self._enabled_with("<Task><Settings></Settings></Task>"))
 
     def test_disabled_task_is_detected(self) -> None:
         self.assertFalse(
-            avatar_ui._task_xml_enabled("<Task><Settings><Enabled>false</Enabled></Settings></Task>")
+            self._enabled_with("<Task><Settings><Enabled>false</Enabled></Settings></Task>")
         )
 
     def test_utf16_text_decoded_as_single_bytes_still_parses(self) -> None:
         xml = "<Task><Settings><Enabled>false</Enabled></Settings></Task>"
         interleaved = "".join(char + "\x00" for char in xml)
-        self.assertFalse(avatar_ui._task_xml_enabled(interleaved))
+        self.assertFalse(self._enabled_with(interleaved))
+
+    def test_missing_task_is_not_enabled(self) -> None:
+        res = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(ouc_common, "run_hidden", return_value=res):
+            self.assertFalse(ouc_common.task_enabled("Missing-Task"))
 
 
 class AutoRepairTests(unittest.TestCase):
@@ -423,12 +612,12 @@ class AutoRepairTests(unittest.TestCase):
         state = self._state(wired=True, listening=False, keeper_running=False)
         api = self._api(state)
 
-        with mock.patch.object(avatar_ui, "_task_enabled", return_value=True):
+        with mock.patch.object(avatar_ui, "task_enabled", return_value=True):
             api._auto_repair_tick()
         self.assertEqual(api._repair_performed, ["start_keeper"])
 
         api2 = self._api(state)
-        with mock.patch.object(avatar_ui, "_task_enabled", return_value=False):
+        with mock.patch.object(avatar_ui, "task_enabled", return_value=False):
             api2._auto_repair_tick()
         self.assertEqual(api2._repair_performed, [])
 
@@ -445,7 +634,7 @@ class AutoRepairTests(unittest.TestCase):
         state = self._state(wired=True, listening=False, keeper_running=False)
         api = self._api(state)
 
-        with mock.patch.object(avatar_ui, "_task_enabled", return_value=True):
+        with mock.patch.object(avatar_ui, "task_enabled", return_value=True):
             api._auto_repair_tick()
             api._auto_repair_tick()
 
@@ -522,7 +711,8 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(issue["level"], "warn")
         self.assertEqual(issue["fix"], "hop")
-        self.assertIn("resets around", issue["detail"])
+        self.assertIn("refills around", issue["detail"])
+        self.assertIn("continue by themselves", issue["detail"])
         self.assertNotIn(
             "Auto-rotation is taking a break",
             [i["title"] for i in health["issues"]],
@@ -570,6 +760,21 @@ class PublicEgressTests(unittest.TestCase):
                 ouc_common.get_public_v6(timeout=0.1), "2606:4700:110:8a1e::2"
             )
 
+    def test_the_egress_probe_measures_the_inference_host_first(self) -> None:
+        # A trace from another Cloudflare host can report an address the model
+        # traffic never uses, which makes a rotation that changed nothing look
+        # successful.
+        self.assertTrue(
+            ouc_common._EGRESS_ENDPOINTS[0].startswith("https://opencode.ai/")
+        )
+
+    def test_a_trace_body_is_parsed_to_its_address(self) -> None:
+        body = "fl=abc\nh=opencode.ai\nip=2a09:bac5:48e9:682::a6:d\nts=1\nwarp=on\n"
+
+        self.assertEqual(
+            ouc_common._parse_egress_body(body), "2a09:bac5:48e9:682::a6:d"
+        )
+
 
 class HopGuardTests(unittest.TestCase):
     def test_a_disconnected_tunnel_is_not_rotated_in_a_loop(self) -> None:
@@ -595,6 +800,85 @@ class HopGuardTests(unittest.TestCase):
         self.assertEqual(calls, [["connect"]])
 
 
+class HopReportTests(unittest.TestCase):
+    """hop_report distinguishes the four ways a rotation can end."""
+
+    def _run(self, status, rotated, observed, reset=False):
+        with mock.patch.object(
+            ouc_common, "ensure_warp_mode", return_value=True
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_protocol", return_value=True
+        ), mock.patch.object(
+            ouc_common, "warp_status", return_value=status
+        ), mock.patch.object(
+            ouc_common, "run_warp", return_value=(0, "")
+        ), mock.patch.object(
+            ouc_common, "time"
+        ) as fake_time, mock.patch.object(
+            ouc_common, "_rotated_egress", return_value=rotated
+        ), mock.patch.object(
+            ouc_common, "get_public_v6", return_value=observed
+        ), mock.patch.object(
+            ouc_common, "_full_registration_reset", return_value=reset
+        ):
+            fake_time.sleep.return_value = None
+            fake_time.time.return_value = 1_800_000_000.0
+            return ouc_common.hop_report("warp-cli", previous="2606:4700:1::")
+
+    def test_a_new_block_is_reported_as_fresh_with_its_address(self) -> None:
+        report = self._run((True, "warp", ""), "2606:4700:2::7", "")
+
+        self.assertEqual(report["status"], "fresh")
+        self.assertEqual(report["address"], "2606:4700:2::7")
+        self.assertEqual(report["block"], "2606:4700:2::")
+        self.assertEqual(report["previous_block"], "2606:4700:1::")
+
+    def test_a_reused_block_is_reported_without_an_address(self) -> None:
+        report = self._run((True, "warp", ""), "", "2606:4700:1::5")
+
+        self.assertEqual(report["status"], "reused")
+        self.assertEqual(report["address"], "")
+        self.assertEqual(report["block"], "2606:4700:1::")
+        self.assertIn("already", report["detail"])
+
+    def test_a_tunnel_that_never_returns_is_reported_as_down(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            return (0, "")
+
+        with mock.patch.object(
+            ouc_common, "warp_status", return_value=(False, "warp", "Disconnected")
+        ), mock.patch.object(
+            ouc_common, "run_warp", side_effect=fake_run
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_mode"
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_protocol"
+        ), mock.patch.object(
+            ouc_common.time, "sleep"
+        ):
+            report = ouc_common.hop_report("warp-cli")
+
+        self.assertEqual(report["status"], "down")
+        self.assertEqual(report["address"], "")
+        self.assertEqual(calls, [["connect"]])
+
+    def test_a_connected_tunnel_without_a_probe_is_not_called_fresh(self) -> None:
+        report = self._run((True, "warp", ""), "", "")
+
+        self.assertEqual(report["status"], "unreachable")
+        self.assertEqual(report["address"], "")
+        self.assertIn("never answered", report["detail"])
+
+    def test_hop_once_keeps_its_contract_of_an_address_or_nothing(self) -> None:
+        with mock.patch.object(
+            ouc_common, "hop_report", return_value={"status": "reused", "address": ""}
+        ):
+            self.assertEqual(ouc_common.hop_once("warp-cli"), "")
+
+
 class FreeWallTests(unittest.TestCase):
     def test_reset_is_the_next_utc_midnight(self) -> None:
         now = int(datetime(2026, 11, 17, 12, 29, tzinfo=timezone.utc).timestamp())
@@ -611,7 +895,7 @@ class FreeWallTests(unittest.TestCase):
 
         with mock.patch.object(zen_guard, "_save_state"), mock.patch.object(
             zen_guard, "append_log"
-        ):
+        ), mock.patch.object(zen_guard, "_egress_mode", return_value="warp"):
             self.assertFalse(zen_guard._note_wall(state, now))
             self.assertEqual(state["free_wall_hops"], 1)
 
@@ -726,6 +1010,106 @@ class CmdWrapperEncodingTests(unittest.TestCase):
             shim = bin_dir / "opencode.cmd"
             self.assertTrue(shim.is_file())
             self.assertIn(b"chcp 65001 >nul", shim.read_bytes())
+
+
+class RegistrationResetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        ouc_common._LAST_REG_RESET = 0.0
+
+    def tearDown(self) -> None:
+        ouc_common._LAST_REG_RESET = 0.0
+
+    def test_a_second_reset_inside_the_cooldown_is_refused(self) -> None:
+        with mock.patch.object(ouc_common, "run_warp", return_value=(0, "")), mock.patch.object(
+            ouc_common, "warp_registration_healthy", return_value=False
+        ), mock.patch.object(
+            ouc_common, "repair_warp_registration", return_value=True
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_mode", return_value=True
+        ):
+            self.assertTrue(ouc_common._full_registration_reset("warp-cli", "warp"))
+            self.assertFalse(ouc_common._full_registration_reset("warp-cli", "warp"))
+
+    def test_a_refused_registration_leaves_warp_alone(self) -> None:
+        calls: list[str] = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args[0])
+            return 0, ""
+
+        with mock.patch.object(ouc_common, "run_warp", side_effect=fake_run), mock.patch.object(
+            ouc_common, "warp_registration_healthy", return_value=False
+        ), mock.patch.object(
+            ouc_common, "repair_warp_registration", return_value=False
+        ), mock.patch.object(ouc_common, "time") as fake_time:
+            fake_time.sleep.return_value = None
+            fake_time.time.return_value = 1_800_000_000.0
+            self.assertFalse(ouc_common._full_registration_reset("warp-cli", "warp"))
+
+        self.assertIn("registration", calls)
+        self.assertNotIn("connect", calls)
+
+    def test_hop_falls_back_to_a_registration_reset(self) -> None:
+        with mock.patch.object(
+            ouc_common, "ensure_warp_mode", return_value=True
+        ), mock.patch.object(
+            ouc_common, "ensure_warp_protocol", return_value=True
+        ), mock.patch.object(
+            ouc_common, "warp_status", return_value=(True, "warp", "")
+        ), mock.patch.object(
+            ouc_common, "run_warp", return_value=(0, "")
+        ), mock.patch.object(
+            ouc_common, "time"
+        ) as fake_time, mock.patch.object(
+            ouc_common, "_rotated_egress", return_value=""
+        ), mock.patch.object(
+            ouc_common, "_full_registration_reset", return_value=False
+        ) as reset:
+            fake_time.sleep.return_value = None
+            fake_time.time.return_value = 1_800_000_000.0
+            ouc_common.hop_once("warp-cli", previous="2606:4700:1::")
+
+        reset.assert_called_once()
+
+
+class ServiceWiringTests(unittest.TestCase):
+    """The dashboard and doctor agree with OpenCode about the proxy env."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.file = Path(self.tmp.name) / "service.json"
+        self._saved = ouc_common.SERVICE_FILE
+        ouc_common.SERVICE_FILE = self.file
+
+    def tearDown(self) -> None:
+        ouc_common.SERVICE_FILE = self._saved
+        self.tmp.cleanup()
+
+    def _write(self, env) -> None:
+        self.file.write_text(json.dumps({"env": env}), encoding="utf-8")
+
+    def test_lowercase_keys_written_by_opencode_still_count(self) -> None:
+        self._write({"https_proxy": "http://127.0.0.1:41987"})
+
+        self.assertTrue(ouc_common.service_proxy_wired(41987))
+
+    def test_uppercase_keys_count(self) -> None:
+        self._write({"HTTPS_PROXY": "http://127.0.0.1:41987"})
+
+        self.assertTrue(ouc_common.service_proxy_wired(41987))
+
+    def test_a_port_mismatch_is_not_wired(self) -> None:
+        self._write({"HTTPS_PROXY": "http://127.0.0.1:1080"})
+
+        self.assertFalse(ouc_common.service_proxy_wired(41987))
+
+    def test_a_missing_file_is_not_wired(self) -> None:
+        self.assertFalse(ouc_common.service_proxy_wired(41987))
+
+    def test_a_service_file_without_env_is_not_wired(self) -> None:
+        self.file.write_text(json.dumps({"password": "x", "env": None}), encoding="utf-8")
+
+        self.assertFalse(ouc_common.service_proxy_wired(41987))
 
 
 if __name__ == "__main__":

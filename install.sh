@@ -1,5 +1,5 @@
 #!/bin/bash
-# Opencode Unlimited Usage — installer
+# Opencode Unlimited Usage - installer
 #
 # Installs OpenCode + Cloudflare WARP (via apt, dnf, pacman, nix, or zypper)
 # in isolated proxy mode, then sets up the keeper, guard, lane shim,
@@ -26,31 +26,31 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
 
 echo ""
 echo "  ==================================================="
-echo "  Opencode Unlimited Usage (Linux v3.0)"
+echo "  Opencode Unlimited Usage (Linux v4.0)"
 echo "  Created & Maintained by Avatar (ShadowySphinX)"
 echo "  ==================================================="
 echo ""
 
 # ---------------------------------------------------------------- platform
 [ "$(id -u)" = 0 ] && die "run me as your normal user, not root"
-command -v systemctl >/dev/null 2>&1 || die "systemd not found — this build is linux+systemd only"
+command -v systemctl >/dev/null 2>&1 || die "systemd not found - this build is linux+systemd only"
 command -v python3 >/dev/null 2>&1 || die "python3 required (apt/dnf/pacman install python3)"
 command -v curl    >/dev/null 2>&1 || die "curl required"
 systemd-run --user --scope true >/dev/null 2>&1 || die "user systemd not running (are you inside a plain docker?)"
-[ -e /dev/net/tun ] || die "/dev/net/tun missing — enable TUN in your VM/WSL settings first"
+[ -e /dev/net/tun ] || die "/dev/net/tun missing - enable TUN in your VM/WSL settings first"
 
 # ---------------------------------------------------------------- sudo
 # order: cached (sudo -n) → password prompt from your terminal (curl | bash
-# has no usable stdin — rustup and homebrew solve it the same way) →
+# has no usable stdin - rustup and homebrew solve it the same way) →
 # stdin fallback for people who download the script first.
 if ! sudo -n true 2>/dev/null; then
   if bash -c 'sudo -v </dev/tty' 2>/dev/null; then
     ok "sudo authenticated"
   elif [ ! -t 0 ]; then
-    sudo -S -v >/dev/null 2>&1 || die "sudo failed — password came wrong from stdin"
+    sudo -S -v >/dev/null 2>&1 || die "sudo failed - password came wrong from stdin"
     ok "sudo authenticated (from stdin)"
   else
-    die "sudo failed — run me from a real terminal"
+    die "sudo failed - run me from a real terminal"
   fi
 fi
 
@@ -64,7 +64,7 @@ command -v apt-get >/dev/null 2>&1 && PKR=apt
 
 # If warp-cli is already present, we do not require a known package manager!
 if ! command -v warp-cli >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/warp-cli" ] && [ -z "$PKR" ]; then
-  die "no supported package manager found (apt/dnf/pacman/nix/zypper) — please install cloudflare-warp for your distro first, then re-run this script."
+  die "no supported package manager found (apt/dnf/pacman/nix/zypper) - please install cloudflare-warp for your distro first, then re-run this script."
 fi
 
 # ---------------------------------------------------------------- opencode CLI
@@ -81,11 +81,11 @@ elif command -v opencode >/dev/null 2>&1; then
   fi
 fi
 if [ -z "$OC_REAL" ]; then
-  say "opencode CLI not found — installing (official installer)"
+  say "opencode CLI not found - installing (official installer)"
   if curl -fsSL https://opencode.ai/install 2>/dev/null | bash >/dev/null 2>&1; then
     [ -x "$HOME/.opencode/bin/opencode" ] && OC_REAL="$HOME/.opencode/bin/opencode"
   fi
-  [ -n "$OC_REAL" ] || die "opencode install failed — install it manually from https://opencode.ai/install"
+  [ -n "$OC_REAL" ] || die "opencode install failed - install it manually from https://opencode.ai/install"
   ok "opencode installed"
 else
   ok "opencode found: $OC_REAL"
@@ -99,7 +99,7 @@ elif [ -x "$HOME/.local/bin/warp-cli" ]; then
   WARP="$HOME/.local/bin/warp-cli"
 fi
 if [ -z "$WARP" ]; then
-  say "warp-cli not found — installing cloudflare warp client"
+  say "warp-cli not found - installing cloudflare warp client"
   case "$PKR" in
     apt)
       sudo apt-get update -qq >/dev/null 2>&1
@@ -134,7 +134,7 @@ except Exception:
       elif command -v paru >/dev/null 2>&1; then
         paru -S --noconfirm cloudflare-warp-bin >/dev/null 2>&1
       else
-        die "arch needs yay or paru for cloudflare-warp-bin — install either, re-run me"
+        die "arch needs yay or paru for cloudflare-warp-bin - install either, re-run me"
       fi
       ;;
     nix)
@@ -147,7 +147,7 @@ except Exception:
       ;;
   esac
   command -v warp-cli >/dev/null 2>&1 && WARP="$(command -v warp-cli)"
-  [ -n "$WARP" ] || die "warp-cli install failed — see https://pkg.cloudflareclient.com/"
+  [ -n "$WARP" ] || die "warp-cli install failed - see https://pkg.cloudflareclient.com/"
   ok "cloudflare warp installed"
 else
   ok "warp-cli found: $WARP"
@@ -187,7 +187,7 @@ fi
 chmod 644 "$DEST/python/"*.py
 
 # scripts pick the warp binary themselves (OUC_WARP_BIN env if the service
-# provides one, else standard paths). no baking — sed-editing scripts after
+# provides one, else standard paths). no baking - sed-editing scripts after
 # download is how you ship a broken script.
 # hop + doctor on PATH
 ln -sf "$DEST/scripts/zen-hop.sh" "$BIN_DIR/${BRAND}-hop"
@@ -208,16 +208,16 @@ if [ "$SUDOERS_NOW" != "$SUDOERS_NEED" ]; then
   say "sudoers: passwordless warp-cli, keeper rotation, kill-switch verify"
   printf '%s\n' "$SUDOERS_NEED" | sudo tee "$SUDOERS_FILE" >/dev/null
   sudo chmod 440 "$SUDOERS_FILE"
-  sudo visudo -c >/dev/null 2>&1 || { sudo rm -f "$SUDOERS_FILE"; die "sudoers validation failed — rerun the installer"; }
+  sudo visudo -c >/dev/null 2>&1 || { sudo rm -f "$SUDOERS_FILE"; die "sudoers validation failed - rerun the installer"; }
 fi
-sw status || die "passwordless warp-cli did not work — check $SUDOERS_FILE"
+sw status || die "passwordless warp-cli did not work - check $SUDOERS_FILE"
 ok "passwordless warp-cli works"
 
 # ---------------------------------------------------------------- warp: register + isolated proxy mode + connect
 say "starting WARP in isolated proxy mode"
 # Keep an existing device registration; only create one when missing.
 if ! swo registration show >/dev/null 2>&1; then
-  say "no WARP registration found — creating one"
+  say "no WARP registration found - creating one"
   sw registration new >/dev/null 2>&1 || say "registration is not ready yet; the keeper will retry"
 fi
 
@@ -243,12 +243,12 @@ for i in $(seq 1 10); do
 done
 [ "$CONNECTED" = 1 ] \
   && ok "warp tunnel: connected (isolated proxy mode on port 40000)" \
-  || say "warp not up yet — the keeper will keep retrying every 45s"
+  || say "warp not up yet - the keeper will keep retrying every 45s"
 
 # ---------------------------------------------------------------- keeper (root service)
 cat > /tmp/ouc-keeper-unit <<EOF
 [Unit]
-Description=Opencode Unlimited — warp keeper (tunnel enforce + kill-switch)
+Description=Opencode Unlimited - warp keeper (tunnel enforce + kill-switch)
 After=network-online.target
 Wants=network-online.target
 
@@ -269,20 +269,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ${BRAND}-keeper >/dev/null 2>&1
 systemctl is-active ${BRAND}-keeper 2>/dev/null | grep -q active \
   && ok "keeper service (root): running" \
-  || die "keeper did not start — check: systemctl status ${BRAND}-keeper"
+  || die "keeper did not start - check: systemctl status ${BRAND}-keeper"
 
 # ---------------------------------------------------------------- guard (user service)
 # Keep the user guard alive after SSH logs out; otherwise rotation stops on a
 # headless VPS while the root keeper keeps running.
 if command -v loginctl >/dev/null 2>&1; then
   sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1 \
-    || say "could not enable lingering — run: sudo loginctl enable-linger $USER"
+    || say "could not enable lingering - run: sudo loginctl enable-linger $USER"
 fi
 
 mkdir -p "$HOME/.config/systemd/user"
 cat > "$UNIT_GUARD" <<EOF
 [Unit]
-Description=Opencode Unlimited — zen guard (wall watcher, auto /64 rotation)
+Description=Opencode Unlimited - zen guard (wall watcher, auto /64 rotation)
 After=network-online.target
 
 [Service]
@@ -302,26 +302,26 @@ systemctl --user daemon-reload
 systemctl --user enable --now ${BRAND}-guard >/dev/null 2>&1
 systemctl --user is-active ${BRAND}-guard 2>/dev/null | grep -q active \
   && ok "zen-guard service (user): running" \
-  || die "guard did not start — check: systemctl --user status ${BRAND}-guard"
+  || die "guard did not start - check: systemctl --user status ${BRAND}-guard"
 
 # ---------------------------------------------------------------- TUI shim (the lane)
 if [ "$OC_REAL" = "$SHIM" ] || [ "$(readlink -f "$OC_REAL" 2>/dev/null)" = "$(readlink -f "$SHIM" 2>/dev/null)" ]; then
   if grep -qs "zen-lane" "$SHIM"; then
     [ -x "$DEST/real-opencode" ] \
-      || die "opencode entry is already our shim but no real binary was found — set OUC_REAL_BIN or reinstall OpenCode"
+      || die "opencode entry is already our shim but no real binary was found - set OUC_REAL_BIN or reinstall OpenCode"
     OC_REAL="$DEST/real-opencode"
   else
     cp "$SHIM" "$DEST/real-opencode" && chmod +x "$DEST/real-opencode"
     OC_REAL="$DEST/real-opencode"
   fi
 fi
-[ -n "$OC_REAL" ] || die "OpenCode CLI was not found — install it from https://opencode.ai/install"
+[ -n "$OC_REAL" ] || die "OpenCode CLI was not found - install it from https://opencode.ai/install"
 printf '#!/usr/bin/env bash\nexport OUC_DEST="%s"\nexport OUC_REAL_BIN="%s"\nexec bash "%s/scripts/zen-lane.sh" "$@"\n' "$DEST" "$OC_REAL" "$DEST" > "$SHIM"
 chmod +x "$SHIM"
 ok "opencode entry → local proxy lane (WARP egress per launch)"
 
 # ---------------------------------------------------------------- verify end to end (the installer doesn't lie)
-say "verifying the lane end to end (this hits opencode once)…"
+say "verifying the lane end to end (this hits opencode once)..."
 # The installer always leaves WARP in isolated proxy mode. Verify through that
 # listener, not through the host's normal route (which would hide a dead WARP).
 CF_TRACE=$(timeout 12 curl -x socks5h://127.0.0.1:40000 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
@@ -337,10 +337,10 @@ elif [ -n "$V6" ]; then
   FIRST=$(echo "$V6" | cut -d: -f1-4)
   case "$V6" in
     2606:*|2a09:*|104.28.*|8.29.*) ok "egress is cloudflare (warp): $V6" ;;
-    *) bad "egress is not Cloudflare WARP yet — the keeper will retry; run ${BRAND}-doctor if it persists" ;;
+    *) bad "egress is not Cloudflare WARP yet - the keeper will retry; run ${BRAND}-doctor if it persists" ;;
   esac
 else
-  bad "egress is not Cloudflare WARP yet — the keeper will retry; run ${BRAND}-doctor if it persists"
+  bad "egress is not Cloudflare WARP yet - the keeper will retry; run ${BRAND}-doctor if it persists"
 fi
 
 case ":$PATH:" in
@@ -351,8 +351,8 @@ esac
 
 echo ""
 ok "DONE. close & reopen your terminal, then run:  opencode"
-say "first launch: opencode sets up its device identity — if it asks you to log in, complete it once (free)"
+say "first launch: opencode sets up its device identity - if it asks you to log in, complete it once (free)"
 echo ""
-say "wall hits while you work? zen-guard rotates automatically — re-send your message if the automatic resume did not fire."
+say "wall hits while you work? zen-guard rotates automatically - re-send your message if the automatic resume did not fire."
 say "health check any time:  ${BRAND}-doctor   ·   fresh identity now:  ${BRAND}-hop"
 echo ""

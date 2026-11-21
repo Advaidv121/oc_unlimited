@@ -7,6 +7,7 @@ import json
 import shutil
 import socket
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ouc_common import (
@@ -22,6 +23,7 @@ from ouc_common import (
     is_cloudflare_v6,
     normalize_v6_64,
     run_hidden,
+    service_proxy_wired,
     warp_status,
 )
 from ouc_firewall import is_killswitch_installed
@@ -68,7 +70,7 @@ def main() -> int:
 
     print("")
     print("  =============================")
-    print("  Opencode Unlimited — doctor")
+    print("  Opencode Unlimited - doctor")
     print("  =============================")
     print("")
 
@@ -76,9 +78,9 @@ def main() -> int:
     if _is_mutex_held("OpencodeUnlimitedKeeper"):
         _ok("warp-keeper process: running")
     elif _task_exists(TASK_KEEPER):
-        _bad(f"warp-keeper down (task installed) — run: schtasks /Run /TN {TASK_KEEPER}")
+        _bad(f"warp-keeper down (task installed) - run: schtasks /Run /TN {TASK_KEEPER}")
     else:
-        _bad("warp-keeper not running & scheduled task missing — re-run install.ps1")
+        _bad("warp-keeper not running & scheduled task missing - re-run install.ps1")
 
     # 2. Egress Mode Check (WARP, Tor, or Custom Proxy)
     mode = "warp"
@@ -105,17 +107,65 @@ def main() -> int:
                 else:
                     _warn(f"Tor process detected on {tor_target[0]}:{tor_target[1]}, but SOCKS5 probe failed")
             elif is_portable_tor_running():
-                _warn("Tor is starting up — establishing circuit...")
+                _warn("Tor is starting up - establishing circuit...")
             else:
-                _bad("Tor daemon not running — click 'Start Portable Tor' in app")
+                _bad("Tor daemon not running - click 'Start Portable Tor' in app")
         except Exception as exc:
             _bad(f"Tor check error: {exc}")
 
     elif mode == "custom":
         try:
-            from proxy_chain import get_current_custom_proxy
-            phost, pport, idx, total = get_current_custom_proxy()
-            _ok(f"custom proxy pool active: node #{idx+1}/{total} ({phost}:{pport})")
+            from proxy_chain import get_current_proxy_spec, relay_state
+
+            spec = get_current_proxy_spec()
+            phost, pport = spec["host"], int(spec["port"])
+            _ok(f"custom proxy pool active: {phost}:{pport}")
+            if spec.get("type") == "relay":
+                state = relay_state(spec, timeout=8.0)
+                if state.get("ok"):
+                    resets = int(state.get("resets_at") or 0)
+                    when = ""
+                    if resets:
+                        when = datetime.fromtimestamp(
+                            resets, timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M UTC")
+                    lane = str(state.get("lane") or "prefix")
+                    _ok(
+                        f"relay lane {lane} · block {state.get('block') or 'unassigned'} · "
+                        f"requests today {state.get('requests', 0)} · resets {when or '?'}"
+                    )
+                    if state.get("instance"):
+                        _ok(
+                            f"relay exit {state['instance']} via "
+                            f"{state.get('endpoint', '?')} (warp registration)"
+                        )
+                    elif state.get("source"):
+                        _ok(f"relay source address {state['source']}")
+                    stats = state.get("stats") or {}
+                    if stats:
+                        parts = [f"lane {stats.get('lane', '?')}"]
+                        if stats.get("prefix_blocks"):
+                            parts.append(
+                                f"prefix {stats['prefix_blocks']} blocks, "
+                                f"{stats.get('prefix_free', '?')} free"
+                            )
+                        if stats.get("warpgate_instances") is not None:
+                            reachable = stats.get("warpgate_reachable")
+                            parts.append(
+                                f"warpgate {stats['warpgate_instances']} instances"
+                                + ("" if reachable else " (unreachable)")
+                            )
+                        parts.append(f"burnt {stats.get('burnt_blocks', '?')}")
+                        _ok("relay capacity: " + " · ".join(parts))
+                        if stats.get("warpgate_reachable") is False:
+                            _warn(
+                                "relay cannot reach its WarpGate host - rotation will "
+                                "fall back to the prefix lane only"
+                            )
+                        if stats.get("free_blocks") == 0:
+                            _warn("relay has no spare blocks - add a prefix or WarpGate instances")
+                else:
+                    _bad(f"relay control API: {state.get('error', 'unreachable')}")
         except Exception as exc:
             _bad(f"custom proxy configuration error: {exc}")
 
@@ -123,14 +173,14 @@ def main() -> int:
         # WARP Mode Check
         warp_bin = find_warp_cli()
         if not warp_bin:
-            _warn("warp-cli.exe not found — install Cloudflare WARP, or switch to Tor / Custom Proxy mode")
+            _warn("warp-cli.exe not found - install Cloudflare WARP, or switch to Tor / Custom Proxy mode")
         else:
             connected, warp_m, raw = warp_status(warp_bin)
             if connected:
                 mode_tag = f" (mode: {warp_m})" if warp_m else ""
                 _ok(f"warp tunnel: connected{mode_tag}")
             else:
-                _bad(f"warp not connected ({raw or 'unknown'}) — run opencode-unlimited-hop, or reconnect WARP from the dashboard")
+                _bad(f"warp not connected ({raw or 'unknown'}) - run opencode-unlimited-hop, or reconnect WARP from the dashboard")
 
         if warp_scope == "isolated":
             try:
@@ -138,7 +188,7 @@ def main() -> int:
                 if test_socks5_alive(40000, host="127.0.0.1"):
                     _ok("WARP isolated SOCKS5 proxy: active on 127.0.0.1:40000 (app-only mode)")
                 else:
-                    _warn("WARP isolated port 40000 not responding — reconnect WARP or switch the scope to Full TUN")
+                    _warn("WARP isolated port 40000 not responding - reconnect WARP or switch the scope to Full TUN")
             except Exception:
                 pass
         else:
@@ -146,7 +196,7 @@ def main() -> int:
             if local_v6:
                 _ok(f"WARP adapter IPv6: {local_v6}")
             else:
-                _warn("CloudflareWARP adapter IPv6 missing — switch to App-Only (Isolated) mode or check WARP TUN adapter")
+                _warn("CloudflareWARP adapter IPv6 missing - switch to App-Only (Isolated) mode or check WARP TUN adapter")
 
     # 4. External egress check
     egress = get_egress_ip(timeout=8.0)
@@ -158,7 +208,12 @@ def main() -> int:
             else:
                 _ok(f"egress IPv6 verified: {egress}")
         else:
-            _ok(f"egress IPv4 verified: {egress} ({mode.upper()})")
+            # An IPv4 egress cannot be cleared by a /64 rotation: the address
+            # the bucket follows never changes. Name it instead of passing.
+            _warn(
+                f"egress is IPv4 ({egress}) - rotating a /64 cannot move this "
+                "address; check WARP mode and any IPv4 pin on the inference route"
+            )
     else:
         _warn("no external egress check response (offline, tunnel still connecting, or proxy unavailable)")
 
@@ -166,9 +221,9 @@ def main() -> int:
     if _is_mutex_held("OpencodeUnlimitedGuard"):
         _ok("zen-guard process: running")
     elif _task_exists(TASK_GUARD):
-        _bad(f"zen-guard down (task installed) — run: schtasks /Run /TN {TASK_GUARD}")
+        _bad(f"zen-guard down (task installed) - run: schtasks /Run /TN {TASK_GUARD}")
     else:
-        _bad("zen-guard not running & scheduled task missing — re-run install.ps1")
+        _bad("zen-guard not running & scheduled task missing - re-run install.ps1")
 
     if GUARD_STATE_FILE.is_file():
         try:
@@ -199,30 +254,22 @@ def main() -> int:
             proxy_up = True
     except OSError:
         pass
-    svc_cfg = Path.home() / ".config" / "opencode" / "service.json"
-    svc_proxied = False
-    if svc_cfg.is_file():
-        try:
-            cfg = json.loads(svc_cfg.read_text(encoding="utf-8"))
-            env_map = cfg.get("env", {}) if isinstance(cfg.get("env"), dict) else {}
-            svc_proxied = f"127.0.0.1:{SERVICE_PROXY_PORT}" in str(env_map.get("HTTPS_PROXY", ""))
-        except Exception:
-            pass
+    svc_proxied = service_proxy_wired()
     if proxy_up and svc_proxied:
         _ok(f"OpenCode Desktop & background service -> WARP lane (127.0.0.1:{SERVICE_PROXY_PORT})")
     elif proxy_up:
-        _warn(f"service proxy listening on 127.0.0.1:{SERVICE_PROXY_PORT}, but service.json not wired — re-run install.bat")
+        _warn(f"service proxy listening on 127.0.0.1:{SERVICE_PROXY_PORT}, but service.json not wired - re-run install.bat")
     else:
-        _warn(f"Desktop/service proxy not listening on 127.0.0.1:{SERVICE_PROXY_PORT} — restart OpencodeUnlimited-Keeper")
+        _warn(f"Desktop/service proxy not listening on 127.0.0.1:{SERVICE_PROXY_PORT} - restart OpencodeUnlimited-Keeper")
 
     which_oc = shutil.which("opencode")
     expected_shim = str(BIN_DIR / "opencode.cmd").lower()
     if which_oc and which_oc.lower() == expected_shim:
         _ok(f"opencode on PATH -> lane ({which_oc})")
     elif which_oc:
-        _warn(f"opencode on PATH resolves to {which_oc} instead of {BIN_DIR / 'opencode.cmd'} — open a new terminal or move {BIN_DIR} earlier in PATH")
+        _warn(f"opencode on PATH resolves to {which_oc} instead of {BIN_DIR / 'opencode.cmd'} - open a new terminal or move {BIN_DIR} earlier in PATH")
     else:
-        _warn(f"opencode not on PATH — add {BIN_DIR} to User PATH")
+        _warn(f"opencode not on PATH - add {BIN_DIR} to User PATH")
 
     print("")
     print("  all [OK] = ready. run `opencode` from a fresh terminal.")

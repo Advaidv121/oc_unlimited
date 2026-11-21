@@ -1,2 +1,2 @@
 # Assets
-UI previews and visual assets for Opencode Unlimited v3.0.
+UI previews and visual assets for Opencode Unlimited v4.0.

@@ -1,6 +1,6 @@
-<#
+﻿<#
 .SYNOPSIS
-    Builds OpencodeUnlimited-Avatar.exe v3.0 (standalone Windows GUI executable).
+    Builds OpencodeUnlimited-Avatar.exe v4.0 (standalone Windows GUI executable).
 #>
 [CmdletBinding()]
 param()
@@ -106,7 +106,8 @@ $ArgsList = @(
     "--hidden-import", "tor_manager",
     "--hidden-import", "proxy_chain",
     "--hidden-import", "clean_endpoint",
-    "--hidden-import", "auto_resume"
+    "--hidden-import", "auto_resume",
+    "--hidden-import", "desktop_brand"
 )
 
 if (Test-Path $WvHooks) {

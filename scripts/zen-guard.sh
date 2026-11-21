@@ -1,8 +1,8 @@
 #!/bin/bash
-# zen guard — watches OpenCode's error log for the free-usage wall and
+# zen guard - watches OpenCode's error log for the free-usage wall and
 # rotates your /64 automatically.
 #
-# opencode writes its errors to ~/.local/share/opencode/log/opencode.log —
+# opencode writes its errors to ~/.local/share/opencode/log/opencode.log -
 # we tail it with a byte offset and only read new bytes. When a quota error
 # appears:
 #   1. current /64 goes on the blacklist
@@ -70,12 +70,19 @@ fi
 
 cur_v6(){
   local v ep
+  # The address that matters is the one opencode.ai sees. Another Cloudflare
+  # host can answer from a different address and make a rotation that changed
+  # nothing look successful.
   if [ "$USE_PROXY" = "1" ]; then
+    v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 https://opencode.ai/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)
+    case "$v" in *:*) echo "$v"; return;; esac
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 "$ep" 2>/dev/null)
       case "$v" in *:*) echo "$v"; return;; esac
     done
   else
+    v=$(timeout 10 curl -6 -s -m 8 https://opencode.ai/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)
+    case "$v" in *:*) echo "$v"; return;; esac
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -6 -s -m 8 "$ep" 2>/dev/null)
       case "$v" in *:*) echo "$v"; return;; esac
@@ -199,7 +206,7 @@ while true; do
 
   if [ "$WALL" = 1 ] && [ "$AGE" -ge "$COOLDOWN" ]; then
     OLD=$(cur_v6)
-    glog "wall detected — rotating (was: ${OLD:-?})"
+    glog "wall detected - rotating (was: ${OLD:-?})"
     blacklist_add "$OLD"
     NEW=""
     TRY=0
@@ -207,12 +214,12 @@ while true; do
       TRY=$((TRY + 1))
       V=$(hop_once "$OLD")
       if [ -z "$V" ]; then glog "try $TRY: rotation produced no fresh /64"; continue; fi
-      if is_burnt "$V"; then glog "try $TRY: cloudflare returned a blacklisted /64 ($V) — again"; continue; fi
+      if is_burnt "$V"; then glog "try $TRY: cloudflare returned a blacklisted /64 ($V) - again"; continue; fi
       NEW="$V"; break
     done
     # every block burned → recycle the oldest blacklist entry
     if [ -z "$NEW" ]; then
-      glog "everything blacklisted — recycling oldest block"
+      glog "everything blacklisted - recycling oldest block"
       V=$(hop_once "$OLD")
       [ -n "$V" ] && NEW="$V"
     fi
@@ -241,10 +248,10 @@ for db in [Path.home() / '.config' / 'ai.opencode.desktop' / 'drafts.sqlite', Pa
     else
       # Keep the wall pending so the next tick retries instead of losing it.
       state_set offset "$PREV_OFF"
-      glog "rotation failed — keeper will keep the tunnel alive, retrying next tick"
+      glog "rotation failed - keeper will keep the tunnel alive, retrying next tick"
     fi
   elif [ "$WALL" = 1 ]; then
     state_set offset "$PREV_OFF"
-    glog "wall seen but in cooldown (${AGE}s < ${COOLDOWN}s) — waiting"
+    glog "wall seen but in cooldown (${AGE}s < ${COOLDOWN}s) - waiting"
   fi
 done

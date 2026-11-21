@@ -1,5 +1,5 @@
 #!/bin/bash
-# warp keeper — keeps the cloudflare warp tunnel connected and healthy.
+# warp keeper - keeps the cloudflare warp tunnel connected and healthy.
 # runs as a systemd service.
 #
 # every tick (45s):

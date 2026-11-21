@@ -1,8 +1,8 @@
 # PLEASE GIVE PROPER CREDITS. JUST DONT REBRAND AND LAUNCH IT AS YOURS.
-# NEW VERSION-3.0 (Fixed:503,ECONNRESET, keeper flapping, quota resets, drafts.sqlite unlock, WireGuard enforcement, auto-resume and some other BUGS)
+# NEW VERSION-4.0 (Fixed: shared-WARP exhaustion, Tor 403 walls, silent proxy fallback, per-user capacity caps. Adds: two-lane block relay, WarpGate pool, redesigned dashboard)
 # Opencode-Unlimited-Limit-Bypass
 
-[![Version](https://img.shields.io/badge/Version-v3.0-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
+[![Version](https://img.shields.io/badge/Version-v4.0-22c55e?style=for-the-badge&logo=semver)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
 [![Author](https://img.shields.io/badge/Author-Avatar%20%28ShadowySphinX%29-22d3ee?style=for-the-badge&logo=github)](https://github.com/ShadowySphinX)
 [![Repository](https://img.shields.io/badge/GitHub-Opencode--Unlimited-blue?style=for-the-badge&logo=github)](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
@@ -18,7 +18,7 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 ---
 
 ## Table of Contents
-1. [What's New in v3.0](#whats-new-in-v30)
+1. [What's New in v4.0](#whats-new-in-v40)
 2. [Prerequisites & Downloads](#prerequisites--downloads-what-you-need)
 3. [Quick Start (Windows)](#quick-start-windows)
 4. [Recommended Settings for Every Method](#recommended-settings-for-every-method)
@@ -28,6 +28,37 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
 8. [Routing Architecture](#routing-architecture)
 9. [Linux Setup (Headless & VPS)](#linux-setup-headless--vps)
 10. [Building from Source](#building-from-source)
+11. [Block Relay (stable multi-user egress)](relay/README.md)
+
+---
+
+## What's New in v4.0
+
+* **The free wall moved.** The allowance is metered on the egress block, per UTC day,
+  in requests rather than tokens: a `/64` on IPv6 or a `/32` on IPv4. WARP hands out
+  `/64`s from a shared pool that is largely spent, so a fresh WARP address is often a
+  fresh bucket for exactly one request. Tor exits are refused outright.
+* **Two-lane block relay (new).** `relay/` is now a router with two upstream lanes
+  behind one client string. `prefix` source-binds a routed IPv6 prefix; `warpgate`
+  dials through an isolated WARP registration. `hybrid` uses the prefix first and
+  spills into WarpGate. See [Method 5](#method-5-block-relay-stable-unlimited-capacity).
+* **WarpGate capacity layer (new).** `relay/warpgate_pool.py` leases a unique WARP
+  exit per user from a WarpGate instance, so an operator with a single VPS can serve
+  a few hundred distinct exits without owning an IPv6 allocation.
+* **Capacity replaces rationing.** The earlier 2-3 rotations per user per day is gone.
+  A spent block is rotated, never throttled, and capacity grows by widening the
+  prefix or adding a WarpGate.
+* **Silent fallback is dead.** While a relay route is selected, a dead relay fails
+  loudly instead of quietly spending the local WARP address. That mismatch was the
+  main reason a rotation looked "patched" while the dashboard claimed success.
+* **Relay diagnostics in `doctor`.** `opencode-unlimited-doctor` prints the lane, the
+  assigned block or `unassigned`, the exit instance and endpoint, both capacities, and
+  a warning when WarpGate is unreachable.
+* **Dashboard redesign.** Dark single-surface layout, segmented egress tabs, health
+  issues as rows with an inline fix button, sticky log panel that fills its column,
+  glass tooltips, and a confirm modal. Same controls, same ids, same API.
+* **Version 4.0** across `build_exe.ps1`, `build_multi_exe.ps1`, the installers, the
+  window title, and the probe user agent.
 
 ---
 
@@ -56,6 +87,56 @@ This tool monitors OpenCode logs for quota and rate-limit errors, cycles the act
   * Routine repairs renew the WireGuard session keys instead of deleting the device registration.
   * In-flight `Connecting` / `Reconnecting` states get a longer grace period before a repair starts.
   * Non-destructive key rotation (`tunnel rotate-keys`) is used for quota rotation.
+* **Streaming Responses Survive Rotation:**
+  * Reconnecting WARP tears the tunnel adapter down, which resets every live socket. That is what produced `ECONNRESET` in the middle of long answers.
+  * The guard reads the local proxy's live tunnel count and OpenCode's log freshness, and holds the rotation back until the session goes quiet (up to three minutes) instead of reconnecting underneath a streaming response.
+  * A rotation that cannot be confirmed no longer retries in a loop; the guard stays paused so the tunnel is not reconnected over and over.
+  * A one-minute watchdog task restarts the keeper or guard if either process dies or stops writing its heartbeat.
+* **Linux Lane Fixed:**
+  * Linux now runs the same hardened Python HTTP CONNECT proxy as Windows, on an ephemeral loopback port. Bun/OpenCode ignores `socks5://` proxy variables, so pointing `HTTPS_PROXY` at WARP's SOCKS listener was never enough.
+  * The installer deploys `ouc_common.py`, `zen_proxy.py`, `proxy_chain.py`, and `tor_manager.py` to `$DEST/python`, and `zen-lane.sh` wires the launched OpenCode process to that proxy. There is no dead `41987` fallback on Linux.
+  * Isolated proxy mode remains the installer default. `OUC_WARP_MODE=warp` is the explicit opt-in for full TUN.
+  * Rotation pauses the keeper with a pause file plus a service stop/start, so a keeper tick cannot reconnect WARP underneath a rotation.
+  * `opencode-unlimited-doctor` now checks the Python proxy modules, WARP port `40000`, resolved iptables paths, both services, the shim, and stale pause files.
+* **Install/Repair on non-English Windows:**
+  * The `.cmd` shims are written as UTF-8 with `chcp 65001` when the Windows profile path contains non-ASCII characters. Previously the app stopped with `UnicodeEncodeError: 'ascii' codec can't encode characters ...` on those systems.
+  * ASCII-only paths keep the previous plain shims and do not touch the console code page.
+* **Existing Chat Auto-Unlock & History Preservation:**
+  * Removes client-side rate limit lockouts (`free-limit`, `go-upsell`) from `%APPDATA%\ai.opencode.desktop\drafts.sqlite` after a successful rotation.
+  * Leaves the chat history and session tables untouched.
+  * Reloads the Desktop window and sends `continue` when the window can be focused safely; otherwise it falls back to a CLI resume.
+* **Detached Desktop Launching:**
+  * OpenCode Desktop now launches as an independent detached process (`os.startfile`), so it stays open even if the launcher or terminal is closed.
+
+---
+
+  * Fixed a relay bug where the proxy's buffered header reader could swallow the first TLS bytes after `CONNECT`, leaving the tunnel waiting for a response that had already arrived.
+  * The relay is now unbuffered, enables `TCP_NODELAY` and TCP keepalive on both sockets, and drains the client briefly when the upstream sends FIN. Windows closes with FIN instead of turning a completed response into an `ECONNRESET`.
+  * Mid-stream resets are recorded as `stream_reset` and counted separately from connection failures when the client was still waiting for data. A response that already completed before the server sent RST is not counted. The Proxy tab and health panel now distinguish "the route never came up" from "a live stream was cut".
+  * A pinned Cloudflare edge that cuts two live streams within five minutes is retired for new connections. Existing streams are left alone.
+  * If WARP reconnects with a new local IPv6 while a request is connecting, the proxy detects the stale bind (`WinError 10049` / `EADDRNOTAVAIL`) and retries once with the fresh address instead of failing every edge.
+  * WARP tunnel repair is deferred while another proxy tunnel is active, so a repair cannot kill a response that is still generating. The failed request gets one quick retry first.
+* **Connection Recovery & Diagnostics:**
+  * The local proxy fails over to another Cloudflare edge instead of stalling on one dead address.
+  * A dropped WARP tunnel or proxy route is recorded, repaired, and surfaced in the dashboard instead of returning an empty `503`.
+  * **Auto-Repair** is on by default and only performs safe actions: start or restart a stopped proxy, reconnect WARP, repair the tunnel, or re-roll the edge. It never changes the selected mode, clears chats, restarts OpenCode, or deletes the WARP registration, and it respects workers you deliberately disabled.
+  * The **Proxy** log tab shows edge failover, `stream_reset`, direct fallback, and tunnel repair events.
+  * A local `EPIPE: broken pipe` from OpenCode's own console pipe is no longer reported as an upstream network error.
+  * Standard mode still permits a direct fallback so OpenCode stays usable; the health panel labels it **Using a direct connection** and offers a one-click repair. This now also applies to `opencode.ai` traffic in TUN mode, which previously changed the route without recording it.
+* **Honest IP rotation (new):**
+  * A hop only counts when the **public** IPv6 address changes. The WARP adapter keeps its old IPv6 when the tunnel stops carrying traffic, so the old check could report a successful rotation while requests were really leaving over IPv4. Users then saw "rotated" followed by the same free-limit error, which looks like the method was patched.
+  * `hop_once` checks that WARP is connected before rotating, and a hop that cannot be confirmed waits 10 minutes instead of reconnecting the tunnel every 75 seconds.
+  * If two confirmed new IPv6 addresses still hit the free wall, rotation pauses until the allowance resets at 00:00 UTC and the dashboard explains why. Press **Try now** to force one more address.
+* **WARP Keeper Stability:**
+  * A connected tunnel is left alone unless the selected WARP scope changed; the keeper repairs disconnected or error states.
+  * Routine repairs renew the WireGuard session keys instead of deleting the device registration.
+  * In-flight `Connecting` / `Reconnecting` states get a longer grace period before a repair starts.
+  * Non-destructive key rotation (`tunnel rotate-keys`) is used for quota rotation.
+* **Streaming Responses Survive Rotation:**
+  * Reconnecting WARP tears the tunnel adapter down, which resets every live socket. That is what produced `ECONNRESET` in the middle of long answers.
+  * The guard reads the local proxy's live tunnel count and OpenCode's log freshness, and holds the rotation back until the session goes quiet (up to three minutes) instead of reconnecting underneath a streaming response.
+  * A rotation that cannot be confirmed no longer retries in a loop; the guard stays paused so the tunnel is not reconnected over and over.
+  * A one-minute watchdog task restarts the keeper or guard if either process dies or stops writing its heartbeat.
 * **Linux Lane Fixed:**
   * Linux now runs the same hardened Python HTTP CONNECT proxy as Windows, on an ephemeral loopback port. Bun/OpenCode ignores `socks5://` proxy variables, so pointing `HTTPS_PROXY` at WARP's SOCKS listener was never enough.
   * The installer deploys `ouc_common.py`, `zen_proxy.py`, `proxy_chain.py`, and `tor_manager.py` to `$DEST/python`, and `zen-lane.sh` wires the launched OpenCode process to that proxy. There is no dead `41987` fallback on Linux.
@@ -146,7 +227,83 @@ Select the method that best matches your network environment:
   4. Choose protocol: **SOCKS5** or **HTTP**.
   5. On a rate limit, the guard switches to the next pool node and verifies its exit IP before reporting success.
 
+### Method 5: Block Relay (stable, unlimited capacity)
+
+WARP rotation and Tor circuits both burn out. WARP `/64`s come from a small shared
+pool that is mostly spent, and Tor exits are refused with `403 FreeTierError`. The
+relay replaces both with capacity you own, and it grows with demand instead of
+rationing it.
+
+The relay is a blind authenticated CONNECT tunnel: it assigns each user a sticky
+egress block, dials out from it, and hands out a different block when that one is
+burnt. The client's TLS session and fingerprint are untouched, which is what the
+free-tier gate actually checks.
+
+Two upstream lanes, one client string, one config flag:
+
+| Lane | Egress identity | Requirement | Scale |
+| --- | --- | --- | --- |
+| `prefix` | source-bound address from a routed IPv6 prefix | routed `/48` or larger on the VPS | 65,536 blocks per `/48` |
+| `warpgate` | one isolated WARP registration per block (`2a09:bacx::/29`) | nothing beside a VPS | ~500 unique exits per WarpGate |
+| `hybrid` | `prefix` first, `warpgate` when the prefix is exhausted | routed prefix plus WarpGate | sum of both |
+
+* **Best for:** Operators running the app for more than a handful of people.
+* **Setup:** see [`relay/README.md`](relay/README.md) - one `systemd` unit, one config file, one directory for the ledger, plus a WarpGate container for the `warpgate` lane.
+* **Client side, no new tab:** Custom Proxy mode, paste the string the relay prints:
+  ```
+  relay://block:TOKEN@relay.example.com:4443
+  ```
+  Protocol `relay` (TLS) or `relayplain` (no TLS, LAN only).
+* **Rotation:** the guard posts `/api/rotate`, gets a fresh block, and only reports
+  success once the new block is confirmed from outside. The guard log names the
+  block and the exit address.
+* **No silent fallback:** while a relay is selected, a dead relay fails loudly
+  instead of quietly spending the local WARP address. That fallback was the single
+  biggest reason rotations looked "patched" while the dashboard said otherwise.
+* **No per-user cap:** every enrolment gets its own block, and a block that is
+  spent is rotated rather than throttled. Capacity is added by widening the prefix
+  or adding another WarpGate.
+* **Users do not need IPv6.** Only the relay dials over IPv6; the client reaches it
+  over ordinary IPv4/IPv6 TCP.
+* **Portability:** the `warpgate` lane needs no kernel feature, so it runs on
+  Windows and Linux alike. The `prefix` lane needs `IPV6_FREEBIND`, which is
+  Linux-only.
+* **Capacity math:** a `/48` is 65,536 blocks, about 43,000 users/day at 300
+  requests each. One WarpGate adds roughly 480 usable WARP exits, and each exit
+  can be re-registered for another block.
+
 ---
+
+## Desktop Wording (optional)
+
+OpenCode Desktop packs every string it shows into `resources/app.asar`. The free-tier card that replaces the chat box is the one place the app still asks for a subscription, and it does that even when the allowance is about to refill on its own and the guard is already queuing `continue` for that chat.
+
+`src/desktop_brand.py` rewrites that copy, and nothing else:
+
+| Where | Before | After |
+|---|---|---|
+| Free-tier card, title | Free limit reached | Free allowance used up |
+| Free-tier card, body | Subscribe to OpenCode Go for reliable access to the best open-source models for $10/month. | The free allowance refills on a schedule of its own. Nothing needs pressing: chats waiting on it continue by themselves once it reopens. |
+| Free-tier card, button | Subscribe | Pricing |
+| Inline message in the transcript | Free usage exceeded | Free allowance used up |
+| App menu | OpenCode | Opencode Unlimited |
+| Window title | OpenCode | Opencode Unlimited |
+
+From the dashboard: the health panel shows **The desktop app still pushes a subscription** with an **Apply** button while the copy is still the original. From a terminal:
+
+```
+python src/desktop_brand.py status     # what is installed, what would change
+python src/desktop_brand.py apply      # rewrite the copy
+python src/desktop_brand.py restore    # put the archive back byte for byte
+```
+
+How it stays safe:
+
+* **Only strings move.** The changed files are appended to the archive and the header points at the new copies, so every other byte of the 230 MB archive stays where it was. A file that is not patched reads the same bytes it always did, and the read-back check proves it before anything replaces the original.
+* **Nothing is written while OpenCode is running**, because the app holds the archive open. Close it and press Apply, or leave it: the background service retries on its own once the patch has been applied at least once.
+* **It refuses on builds that check their own files.** If Electron's embedded-asar integrity fuse is enabled in `OpenCode.exe`, a rewritten archive would stop the app from starting, so the module reports that and leaves the install alone.
+* **Restore is byte-exact.** The header that came with the install is kept in `%LOCALAPPDATA%\opencode-unlimited\desktop\header.bin`, and restore rebuilds the original file from it — no second copy of the archive is stored, and a stale backup is never used.
+* **An app update is picked up automatically.** The background service compares the archive with the one it patched, and if the updater replaced it the copy is applied again. The comparison is a single `stat`, so a tick costs nothing when nothing changed.
 
 ## How Limit Reset Works on Existing Chats
 
@@ -172,6 +329,8 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 2. **Client-Side Lockout Removal:** When OpenCode Desktop hits a rate limit, the local Electron app writes a lockout timestamp into `%APPDATA%\ai.opencode.desktop\drafts.sqlite` (`state` table). Zen Guard deletes this key (`DELETE FROM state WHERE key IN ('free-limit', 'go-upsell')`).
 3. **History Preservation:** The reset only touches those lockout keys. Chat history, system prompts, code blocks, and context in the `document` and `session_v2` tables are left unchanged.
 4. **Window Reload & Resume:** The app reloads OpenCode Desktop, which refreshes the view and clears the banner, then sends `continue{ENTER}`. If the window cannot be focused safely, it falls back to a CLI resume.
+5. **Resume at the Allowance Window:** When the free wall proves it is not following the address, the pause the guard takes *is* the allowance window. Nothing has to be pressed when it ends: the guard clears the lockout, sends `continue` to every chat that was waiting on it, and logs `allowance window reopened` so the dashboard history shows why the chat moved.
+6. **Chats Left on the Wall Before a Start:** A reboot, an update or a manual stop means the wall happened while the guard was not reading the log. On start it looks in `opencode.db` for recent chats whose newest message is the free-limit error itself (`finish = error`), queues them and resumes them. A chat that was answered afterwards is not touched, and a rescue that just failed is not repeated for 15 minutes.
 
 ---
 
@@ -179,7 +338,7 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
 
 ### 1. What to do when you hit a rate limit wall
 * **Automatic Behavior:** With Zen Guard and Auto-Resume on, the guard rotates the egress address, clears the client lockout, and attempts to resume the session. A rotation usually completes within a minute.
-* **If the limit comes back on a confirmed new address:** the free allowance is not following your IP. After two confirmed new IPv6 addresses, rotation pauses until 00:00 UTC so it stops reconnecting WARP and cutting live streams. Use another provider (`/connect`), subscribe to OpenCode Go, or press **Try now** to force another address.
+* **If the limit comes back on a confirmed new address:** the free allowance is not following your IP. After two confirmed new IPv6 addresses, rotation pauses until 00:00 UTC so it stops reconnecting WARP and cutting live streams. That pause is the allowance window itself, so when it ends the waiting chats continue by themselves. Use another provider (`/connect`), subscribe to OpenCode Go, or press **Try now** to force another address.
 * **Manual Override:** To rotate now, click the hop button on the dashboard. Its label follows the active mode: **Rotate /64 Now (Hop)** for WARP, **Rotate Circuit (Hop)** for Tor, and **Rotate Proxy (Hop)** for a custom pool.
 
 ### 2. What to do if OpenCode shows "You've reached your free usage limit" banner in an existing chat
@@ -252,9 +411,16 @@ A common concern is whether rotating limits requires starting a brand-new chat. 
             +-- [3] Clean Endpoint     -> clean WireGuard IP:2408 -> selected Anycast edge
             +-- [4] Tor Network        -> 127.0.0.1:9050 / 9150 -> 3-hop circuit / fresh IPv4
             +-- [5] Custom Proxy Pool  -> node #1 -> node #2 -> ... -> verified upstream
+            +-- [6] Block Relay        -> TLS CONNECT -> VPS router
+                                            |
+                                            +-- prefix   -> bind routed IPv6 -> fresh /64
+                                            +-- warpgate -> WARP exit N      -> fresh /64
+                                            +-- hybrid   -> prefix, then warpgate overflow
 ```
 
 On Linux the lane starts this same proxy on an ephemeral loopback port and exports it only to the launched OpenCode process. Port `41987` is the Windows service proxy.
+
+The block relay counts as mode 5 in the dashboard: it is entered through the **Custom Proxy** tab with a `relay://` string, so there is no extra control to learn.
 
 ---
 

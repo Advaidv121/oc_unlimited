@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Opencode Unlimited Usage v3.0 — clean Windows uninstaller.
+    Opencode Unlimited Usage v4.0 - clean Windows uninstaller.
 #>
 [CmdletBinding()]
 param()
@@ -13,6 +13,7 @@ $BinDest = Join-Path $Dest "bin"
 $ScriptsDest = Join-Path $Dest "scripts"
 $TaskKeeper = "OpencodeUnlimited-Keeper"
 $TaskGuard = "OpencodeUnlimited-Guard"
+$TaskWatchdog = "OpencodeUnlimited-Watchdog"
 
 function Ok([string]$Msg) { Write-Host "  [OK] $Msg" -ForegroundColor Green }
 function Warn([string]$Msg) { Write-Host "  [!]  $Msg" -ForegroundColor Yellow }
@@ -22,7 +23,7 @@ Write-Host "  removing Opencode Unlimited (Windows)..."
 Write-Host ""
 
 # 1. Stop and remove Scheduled Tasks & HKCU Run entries
-foreach ($tn in @($TaskGuard, $TaskKeeper)) {
+foreach ($tn in @($TaskWatchdog, $TaskGuard, $TaskKeeper)) {
     Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $tn -ErrorAction SilentlyContinue
@@ -72,7 +73,7 @@ if ($LASTEXITCODE -eq 0 -and ($FwShow -match "OUC_LEAKGUARD_CLI")) {
         netsh advfirewall firewall delete rule name=OUC_LEAKGUARD_CLI | Out-Null
         Ok "firewall kill-switch removed"
     } else {
-        Warn "OUC_LEAKGUARD_CLI firewall rule exists — re-run uninstall.bat as Administrator to remove it"
+        Warn "OUC_LEAKGUARD_CLI firewall rule exists - re-run uninstall.bat as Administrator to remove it"
     }
 }
 

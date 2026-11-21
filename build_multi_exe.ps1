@@ -1,6 +1,6 @@
-<#
+﻿<#
 .SYNOPSIS
-    Builds OpencodeUnlimited-Multi.exe v3.0 (standalone multi-egress Windows GUI executable).
+    Builds OpencodeUnlimited-Multi.exe v4.0 (standalone multi-egress Windows GUI executable).
     Supports Cloudflare WARP /64, Tor Network (SOCKS5), Custom Proxies, and Clean Endpoints.
     Keeps OpencodeUnlimited-Avatar.exe unchanged.
 #>
@@ -108,7 +108,8 @@ $ArgsList = @(
     "--hidden-import", "tor_manager",
     "--hidden-import", "proxy_chain",
     "--hidden-import", "clean_endpoint",
-    "--hidden-import", "auto_resume"
+    "--hidden-import", "auto_resume",
+    "--hidden-import", "desktop_brand"
 )
 
 if (Test-Path $WvHooks) {

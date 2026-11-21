@@ -1,0 +1,27 @@
+[Unit]
+Description=blockrelay - IPv6 /64 block relay for OpenCode free tier
+Documentation=file:/opt/blockrelay/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blockrelay
+Group=blockrelay
+WorkingDirectory=/opt/blockrelay
+ExecStart=/usr/bin/python3 /opt/blockrelay/blockrelay.py -c /etc/blockrelay/config.json serve
+Restart=always
+RestartSec=3
+# The relay only needs to read its config and write its ledger.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/blockrelay
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET6 AF_INET
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

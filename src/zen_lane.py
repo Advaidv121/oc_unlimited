@@ -122,7 +122,7 @@ def main() -> int:
         target = find_opencode_cli()
         if not target:
             print(
-                "opencode CLI binary not found — set OUC_REAL_BIN or reinstall OpenCode.",
+                "opencode CLI binary not found - set OUC_REAL_BIN or reinstall OpenCode.",
                 file=sys.stderr,
             )
             return 1

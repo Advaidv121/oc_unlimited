@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ouc_common import (
     LANE_DIR,
+    PAUSE_FILE,
     append_log,
     ensure_dirs,
     fetch_opencode_aaaa_pool,
@@ -44,6 +45,19 @@ FALLBACK_FLAG = LANE_DIR / "fallback.flag"
 EDGE_CONNECT_TIMEOUT = 3.0
 EDGE_TRY_LIMIT = 3
 EDGE_FAILURE_COOLDOWN = 120.0
+# A WARP reconnect replaces the tunnel address; give the adapter a short,
+# bounded window to publish the new one before declaring the route dead.
+STALE_ADDRESS_WAIT = 6.0
+STALE_ADDRESS_POLL = 0.25
+# A rotation closes the tunnel for a few seconds. Holding the request beats
+# handing OpenCode a connection error it cannot retry, but the wait is capped so
+# a wedged rotation cannot pin a request open forever.
+ROTATION_HOLD_SECONDS = 30.0
+ROTATION_POLL_SECONDS = 0.4
+# The keeper pause file is created before a rotation and deleted after it. A
+# guard killed mid-rotation leaves it behind until its own lease runs out, which
+# can be minutes, so only a freshly written pause is trusted as "rotating now".
+ROTATION_FRESH_SECONDS = 120.0
 STATUS_LOCK = threading.Lock()
 _LAST_FALLBACK_NOTE = 0.0
 _RESET_LOCK = threading.Lock()
@@ -63,7 +77,7 @@ ERROR_KINDS = {
     "fallback",
     "bind_fail",
 }
-LOG_KINDS = ERROR_KINDS | {"repair", "start"}
+LOG_KINDS = ERROR_KINDS | {"repair", "start", "hold"}
 
 
 def _read_proxy_status() -> dict:
@@ -161,16 +175,30 @@ def _active_tunnels() -> int:
         return _ACTIVE_TUNNELS
 
 
+def _publish_tunnel_count() -> None:
+    """Mirror the live tunnel count into proxy_status for the guard and dashboard."""
+    try:
+        with STATUS_LOCK:
+            data = _read_proxy_status()
+            data["active_tunnels"] = _active_tunnels()
+            data["active_tunnels_ts"] = int(time.time())
+            _write_proxy_status(data)
+    except Exception:
+        pass
+
+
 def _enter_tunnel() -> None:
     global _ACTIVE_TUNNELS
     with _TUNNEL_LOCK:
         _ACTIVE_TUNNELS += 1
+    _publish_tunnel_count()
 
 
 def _leave_tunnel() -> None:
     global _ACTIVE_TUNNELS
     with _TUNNEL_LOCK:
         _ACTIVE_TUNNELS = max(0, _ACTIVE_TUNNELS - 1)
+    _publish_tunnel_count()
 
 
 def _clear_fallback() -> None:
@@ -198,6 +226,7 @@ def proxy_status() -> dict:
     data["fallbacks_5m"] = sum(1 for e in recent if e.get("kind") == "fallback")
     fallback_ts = float(data.get("fallback_ts", 0) or 0)
     data["fallback_age"] = max(0, int(now - fallback_ts)) if fallback_ts else None
+    data["active_tunnels"] = _active_tunnels()
     return data
 
 
@@ -583,6 +612,25 @@ def _local_address_stale(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == 10049 or exc.errno == errno.EADDRNOTAVAIL
 
 
+def _wait_for_new_local_v6(
+    warp_state: _WarpState, previous: str, deadline: float
+) -> str:
+    """Poll for the address WARP assigns after a reconnect.
+
+    WARP drops the old tunnel address and adds the new one a moment later, so a
+    single immediate re-read usually still sees the stale value and the proxy
+    reports a dead route for a tunnel that is seconds from working again.
+    """
+    while True:
+        warp_state.invalidate()
+        fresh, _ = warp_state.get(wait_if_rotating=False)
+        if fresh and fresh != previous:
+            return fresh
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(STALE_ADDRESS_POLL)
+
+
 def _open_pinned_any(
     label: str,
     port: int,
@@ -599,7 +647,10 @@ def _open_pinned_any(
         raise ConnectionRefusedError("WARP tunnel has no IPv6 address")
 
     last: Exception | None = None
-    for attempt in range(2):
+    attempts = 0
+    deadline = time.monotonic() + STALE_ADDRESS_WAIT
+    while attempts < 2:
+        attempts += 1
         stale_local = False
         for edge in warp_state.edges_to_try():
             try:
@@ -616,11 +667,10 @@ def _open_pinned_any(
                 warp_state.mark_edge_failed(edge)
                 _record_event("edge_fail", f"{type(exc).__name__}: {exc}", label, edge)
 
-        if not stale_local or attempt:
+        if not stale_local:
             break
-        warp_state.invalidate()
-        fresh, _ = warp_state.get(wait_if_rotating=True)
-        if not fresh or fresh == local_v6:
+        fresh = _wait_for_new_local_v6(warp_state, local_v6, deadline)
+        if not fresh:
             break
         local_v6 = fresh
         _record_event("repair", "local WARP address changed; retrying", label)
@@ -829,7 +879,7 @@ def _open_upstream(
         return sock
 
     try:
-        from proxy_chain import get_egress_config, open_multi_egress_upstream
+        from proxy_chain import get_egress_config, is_relay_mode, open_multi_egress_upstream
 
         cfg = get_egress_config()
         if cfg.get("mode") in ("tor", "custom"):
@@ -840,7 +890,9 @@ def _open_upstream(
                     lambda h, p: _open_warp_direct(h, p, warp_state),
                 )
             except Exception as exc:
-                if _strict_mode():
+                # A relay is selected on purpose; quietly spending the local
+                # WARP address instead would burn it and mask a dead relay.
+                if _strict_mode() or is_relay_mode(cfg):
                     raise ConnectionRefusedError(
                         f"Multi-egress ({cfg.get('mode')}) upstream error: {exc}"
                     ) from exc
@@ -853,29 +905,63 @@ def _open_upstream(
     return _open_warp_direct(clean_host, port, warp_state)
 
 
+def _rotation_in_progress() -> bool:
+    """True only while the guard is actively replacing the tunnel address."""
+    if not is_keeper_paused():
+        return False
+    try:
+        age = time.time() - PAUSE_FILE.stat().st_mtime
+    except OSError:
+        return False
+    return age <= ROTATION_FRESH_SECONDS
+
+
 def _connect_upstream(
     host: str,
     port: int,
     warp_state: _WarpState,
 ) -> socket.socket:
-    """Open the configured route, retrying once before repairing WARP.
+    """Open the configured route, holding through a rotation and then repairing.
 
-    Reconnecting the tunnel is destructive to every live response stream, so
-    it is deferred while another tunnel is active. The failed connection still
-    gets one quick retry, which covers brief edge hiccups.
+    Reconnecting the tunnel is destructive to every live response stream, so the
+    repair is deferred while another tunnel is active. While the guard is
+    rotating, the route is down on purpose: waiting the rotation out turns a
+    hard connection failure into a short delay the client never sees.
     """
-    try:
-        return _open_upstream(host, port, warp_state)
-    except Exception as first:
-        repaired = False
-        if _active_tunnels() == 0:
-            repaired = _repair_warp_tunnel(warp_state)
-        time.sleep(0.5 if repaired else 0.25)
+    deadline = time.monotonic() + ROTATION_HOLD_SECONDS
+    repaired = False
+    held = False
+
+    def hold() -> None:
+        """Keep the request waiting while the tunnel is being replaced."""
+        nonlocal held
+        if not held:
+            held = True
+            _record_event("hold", "waiting for the tunnel rotation to finish", host)
+
+    while True:
         try:
-            return _open_upstream(host, port, warp_state)
-        except Exception as second:
-            _record_event("connect_fail", f"{type(second).__name__}: {second}", host)
-            raise second from first
+            sock = _open_upstream(host, port, warp_state)
+        except Exception as exc:
+            if _rotation_in_progress() and time.monotonic() < deadline:
+                hold()
+                time.sleep(ROTATION_POLL_SECONDS)
+                continue
+            if not repaired and _active_tunnels() == 0:
+                repaired = True
+                if _repair_warp_tunnel(warp_state):
+                    hold()
+                    continue
+            _record_event("connect_fail", f"{type(exc).__name__}: {exc}", host)
+            raise
+        if _rotation_in_progress() and time.monotonic() < deadline:
+            # The tunnel answered but is about to be replaced: a new socket now
+            # would land on the old IP and be reset mid-response anyway.
+            hold()
+            sock.close()
+            time.sleep(ROTATION_POLL_SECONDS)
+            continue
+        return sock
 
 
 def _make_handler(warp_state: _WarpState):
@@ -1054,6 +1140,9 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
         raise
     actual_port = srv.server_address[1]
     _clear_fallback()
+    # A fresh proxy owns no tunnels; republishing zero clears the count left by
+    # the process it replaces so the guard does not wait on a phantom stream.
+    _publish_tunnel_count()
     _record_event(
         "start",
         f"listening on 127.0.0.1:{actual_port} (edge={chosen_edge or 'isolated'})",

@@ -374,8 +374,14 @@ def open_socks5_tunnel(
     """Establish an upstream TCP tunnel through a SOCKS5 proxy server."""
     sock = socket.create_connection((socks_host, socks_port), timeout=timeout)
     try:
-        # Offer no-auth and username/password; the server picks one.
-        sock.sendall(b"\x05\x02\x00\x02")
+        # Offer no-auth, and username/password only when credentials were
+        # supplied. Tor's SOCKS port prefers method 2 whenever it is offered,
+        # even though it also accepts 0, so advertising it without credentials
+        # makes every tunnel fail with "requires credentials".
+        if username:
+            sock.sendall(b"\x05\x02\x00\x02")
+        else:
+            sock.sendall(b"\x05\x01\x00")
         resp = _recv_exact(sock, 2)
         if len(resp) < 2 or resp[0] != 5:
             raise ConnectionError("SOCKS5 proxy returned an invalid greeting")

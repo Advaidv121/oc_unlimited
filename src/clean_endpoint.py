@@ -20,12 +20,12 @@ KNOWN_CLEAN_ENDPOINTS = (
     "188.114.97.1:2408",
     "188.114.98.1:2408",
     "188.114.99.1:2408",
-    # Alternative Port 500 (IPsec IKE — universally unblocked by ISPs)
+    # Alternative Port 500 (IPsec IKE - universally unblocked by ISPs)
     "162.159.192.1:500",
     "162.159.193.1:500",
     "188.114.96.1:500",
     "188.114.97.1:500",
-    # Alternative Port 4500 (IPsec NAT-T — bypasses UDP 2408 filtering)
+    # Alternative Port 4500 (IPsec NAT-T - bypasses UDP 2408 filtering)
     "162.159.192.1:4500",
     "162.159.193.1:4500",
     "188.114.96.1:4500",

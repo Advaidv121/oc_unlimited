@@ -51,6 +51,10 @@ TASK_KEEPER = "OpencodeUnlimited-Keeper"
 TASK_GUARD = "OpencodeUnlimited-Guard"
 FW_RULE_PREFIX = "OUC_LEAKGUARD_"
 SERVICE_PROXY_PORT = int(os.environ.get("OUC_SERVICE_PROXY_PORT", "41987"))
+# The OpenCode background service reads its proxy from this file and rewrites
+# it on its own, so either spelling of a key can be in there.
+SERVICE_FILE = Path.home() / ".config" / "opencode" / "service.json"
+SERVICE_PROXY_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 
 _WARP_CANDIDATES = (
     Path(r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe"),
@@ -105,6 +109,20 @@ _FALLBACK_OPENCODE_AAAA = (
 )
 
 _IPV6_RE = re.compile(r"\b([0-9a-fA-F:]+:[0-9a-fA-F:]+)\b")
+
+
+def service_proxy_wired(port: int | None = None) -> bool:
+    """True when OpenCode's service env sends HTTPS through the local proxy."""
+    port = SERVICE_PROXY_PORT if port is None else port
+    try:
+        cfg = json.loads(SERVICE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    env = cfg.get("env") if isinstance(cfg, dict) else None
+    if not isinstance(env, dict):
+        return False
+    needle = f"127.0.0.1:{port}"
+    return any(needle in str(env.get(key, "")) for key in SERVICE_PROXY_KEYS)
 
 
 def ensure_dirs() -> None:
@@ -526,6 +544,10 @@ def get_warp_local_v6() -> str | None:
 
 
 _EGRESS_ENDPOINTS = (
+    # Measured first because it is the host the model traffic goes to. A trace
+    # from another Cloudflare host can take a different route and report an
+    # address that the inference path never uses.
+    "https://opencode.ai/cdn-cgi/trace",
     "https://api64.ipify.org",
     "https://cloudflare.com/cdn-cgi/trace",
     "https://1.1.1.1/cdn-cgi/trace",
@@ -563,7 +585,7 @@ def _parse_egress_body(text: str) -> str:
     return _valid_public_ip(text or "")
 
 
-def _curl_egress(curl: str, proxy: str, ipv6: bool, timeout: float) -> str:
+def _curl_egress(curl: str, proxy: str, ipv6: bool, timeout: float, insecure: bool = False) -> str:
     """Probe a public IP echo service, optionally through a proxy."""
     for endpoint in _EGRESS_ENDPOINTS:
         args = [curl, "-sS", "--max-time", str(max(2, int(timeout)))]
@@ -571,6 +593,8 @@ def _curl_egress(curl: str, proxy: str, ipv6: bool, timeout: float) -> str:
             args.append("-6")
         if proxy:
             args.extend(["-x", proxy])
+            if insecure and proxy.lower().startswith("https://"):
+                args.append("--proxy-insecure")
         args.append(endpoint)
         try:
             res = run_hidden(args, timeout=timeout + 1.5)
@@ -588,15 +612,33 @@ def _proxy_url(
     proxy_type: str = "socks5",
     username: str = "",
     password: str = "",
+    use_tls: bool = False,
 ) -> str:
     """Build a curl proxy URL, including credentials when configured."""
     from urllib.parse import quote
 
-    scheme = "socks5h" if proxy_type.lower().startswith("socks") else "http"
+    if proxy_type.lower().startswith("socks"):
+        scheme = "socks5h"
+    else:
+        scheme = "https" if use_tls else "http"
     auth = ""
     if username:
         auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
     return f"{scheme}://{auth}{host}:{port}"
+
+
+def probe_proxy_egress(proxy_url: str, timeout: float = 6.0, insecure: bool = False) -> str:
+    """Return the public address seen through ``proxy_url``, or an empty string.
+
+    Used when the exit has to be confirmed against a specific pool node, not
+    whichever node the persisted index happens to point at.
+    """
+    if not proxy_url:
+        return ""
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        return ""
+    return _curl_egress(curl, proxy_url, False, timeout, insecure)
 
 
 def get_egress_ip(timeout: float = 6.0) -> str:
@@ -632,8 +674,9 @@ def get_egress_ip(timeout: float = 6.0) -> str:
                     return found
         elif mode == "custom":
             proxy = ""
+            insecure = False
             try:
-                from proxy_chain import get_current_proxy_spec
+                from proxy_chain import get_current_proxy_spec, relay_tls_insecure
 
                 spec = get_current_proxy_spec()
                 proxy = _proxy_url(
@@ -642,11 +685,13 @@ def get_egress_ip(timeout: float = 6.0) -> str:
                     str(spec.get("type", "socks5")),
                     str(spec.get("username", "")),
                     str(spec.get("password", "")),
+                    bool(spec.get("tls")),
                 )
+                insecure = bool(spec.get("tls")) and relay_tls_insecure()
             except Exception:
                 proxy = ""
             if proxy:
-                found = _curl_egress(curl, proxy, False, timeout)
+                found = _curl_egress(curl, proxy, False, timeout, insecure)
                 if found:
                     return found
         else:
@@ -772,6 +817,49 @@ def acquire_mutex(name: str) -> int | None:
     return int(handle)
 
 
+def is_mutex_held(name: str) -> bool:
+    """True while another process owns a worker mutex.
+
+    Liveness of the keeper and guard is defined by their named mutex: the
+    process takes it on start and Windows drops it when the process ends, so it
+    cannot go stale the way a heartbeat file can.
+    """
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenMutexW.restype = ctypes.c_void_p
+    handle = kernel32.OpenMutexW(0x00100000, False, f"Local\\{name}")
+    if handle:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return True
+    return False
+
+
+def task_exists(task_name: str) -> bool:
+    """True when a scheduled task with this name is registered."""
+    try:
+        res = run_hidden(["schtasks", "/Query", "/TN", task_name], timeout=5.0)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def task_enabled(task_name: str) -> bool:
+    """True only for a registered task that is not disabled.
+
+    Auto-repair and the watchdog use this so a worker the user deliberately
+    turned off is never started behind their back.
+    """
+    try:
+        res = run_hidden(["schtasks", "/Query", "/TN", task_name, "/XML"], timeout=5.0)
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    # schtasks writes UTF-16, which run_hidden may decode as single-byte text.
+    # Removing NULs recovers the ASCII XML we need on every Windows locale.
+    text = (res.stdout or "").replace("\x00", "")
+    return not re.search(r"<enabled>\s*false\s*</enabled>", text, re.IGNORECASE)
+
+
 def is_admin() -> bool:
     """Return True if the current process has administrator/root privileges."""
     if sys.platform != "win32":
@@ -864,19 +952,31 @@ def warp_registration_healthy(warp_bin: str) -> bool:
     return rc == 0
 
 
+# Cloudflare refuses new registrations in bursts, typically for a few seconds.
+# Waiting the same two seconds every try burns the whole budget inside one
+# refusal window, so each retry waits longer than the one before it.
+REGISTRATION_BACKOFF = (0.0, 2.0, 4.0, 8.0, 12.0, 16.0)
+# Deleting the device registration is the only rotation that cannot reuse the
+# old /64, and the only one that can leave WARP unregistered for a while. One
+# reset every ten minutes is enough to unstick a rotation without turning a
+# Cloudflare refusal into an outage.
+REG_RESET_COOLDOWN = 600.0
+_LAST_REG_RESET = 0.0
+
+
 def repair_warp_registration(warp_bin: str, max_tries: int = 3) -> bool:
     """Recreate a broken registration without touching a healthy one."""
     if warp_registration_healthy(warp_bin):
         return True
     for attempt in range(max(1, max_tries)):
+        wait = REGISTRATION_BACKOFF[min(attempt, len(REGISTRATION_BACKOFF) - 1)]
+        if wait:
+            time.sleep(wait)
         rc, out = run_warp(["registration", "new"], warp_bin=warp_bin, timeout=30.0)
         if rc == 0:
             return True
         if "old registration" in out.lower():
             run_warp(["registration", "delete"], warp_bin=warp_bin, timeout=20.0)
-            continue
-        if attempt + 1 < max_tries:
-            time.sleep(4.0)
     return False
 
 
@@ -894,17 +994,51 @@ def _rotated_egress(
     return candidate
 
 
-def hop_once(
+def _full_registration_reset(warp_bin: str, scope: str) -> bool:
+    """Last resort when key rotation keeps landing on the same /64.
+
+    Deleting the registration is the one rotation that cannot reuse the old
+    block, but it is also the one that can leave WARP without a device if
+    Cloudflare refuses the new one. A long cooldown keeps a stuck guard from
+    repeating it on every attempt.
+    """
+    global _LAST_REG_RESET
+    now = time.time()
+    if now - _LAST_REG_RESET < REG_RESET_COOLDOWN:
+        return False
+    _LAST_REG_RESET = now
+
+    run_warp(["disconnect"], warp_bin=warp_bin, timeout=10.0)
+    run_warp(["registration", "delete"], warp_bin=warp_bin, timeout=20.0)
+    # The delete returns before the daemon lets go of the old registration.
+    for _ in range(15):
+        if not warp_registration_healthy(warp_bin):
+            break
+        time.sleep(0.3)
+    if not repair_warp_registration(warp_bin, 4):
+        return False
+    ensure_warp_mode(warp_bin, scope)
+    run_warp(["connect"], warp_bin=warp_bin, timeout=15.0)
+    return True
+
+
+def hop_report(
     warp_bin: str,
     max_reg_tries: int = 3,
     avoid_prefixes: set[str] | None = None,
     previous: str = "",
-) -> str:
-    """Rotate the WARP session until an unused public /64 is observed.
+) -> dict:
+    """Rotate the WARP session and return the outcome of the attempt.
 
-    Returns an address whose /64 differs from the previous egress and from
-    every prefix in ``avoid_prefixes``. Returns an empty string when the
-    tunnel cannot produce a fresh block.
+    Four outcomes are possible:
+
+    ``fresh``       a block outside every avoided /64 was observed;
+    ``reused``      the tunnel stayed up but came back on a block already in
+                    use, which a caller must not treat as a rotation;
+    ``down``        the tunnel did not come back up;
+    ``unreachable`` the tunnel reports connected but the probe did not return.
+
+    ``address`` holds the observed egress on ``fresh`` and is empty otherwise.
     """
     avoid: set[str] = set()
     for value in avoid_prefixes or ():
@@ -919,6 +1053,7 @@ def hop_once(
     ensure_warp_mode(warp_bin, scope)
     ensure_warp_protocol("wireguard", warp_bin=warp_bin)
 
+    seen = ""
     # A disconnected tunnel cannot produce a /64. Reconnecting a few times is
     # fine, but rotate-keys/disconnect/connect in a loop only cuts live
     # sessions without changing anything.
@@ -931,7 +1066,13 @@ def hop_once(
             if connected:
                 break
         if not connected:
-            return ""
+            return {
+                "status": "down",
+                "address": "",
+                "block": "",
+                "previous_block": old_prefix,
+                "detail": "the tunnel would not come back up",
+            }
 
     for _rotation in range(3):
         # rotate-keys keeps the device registration and only renews the
@@ -945,7 +1086,18 @@ def hop_once(
             time.sleep(1.5)
             candidate = _rotated_egress(warp_bin, avoid)
             if candidate:
-                return candidate
+                return {
+                    "status": "fresh",
+                    "address": candidate,
+                    "block": normalize_v6_64(candidate),
+                    "previous_block": old_prefix,
+                    "detail": "",
+                }
+        # Record the block the tunnel came back on. Read once per rotation:
+        # polling it every second only makes a failing path slower.
+        observed = get_public_v6(timeout=2.5)
+        if observed:
+            seen = observed
 
         connected, _, _raw = warp_status(warp_bin=warp_bin, force=True)
         if not connected:
@@ -953,4 +1105,66 @@ def hop_once(
                 ensure_warp_mode(warp_bin, scope)
                 run_warp(["connect"], warp_bin=warp_bin, timeout=15.0)
 
-    return ""
+    # Key rotation reused its block every time. A full registration reset is the
+    # only step left that cannot hand back the same /64.
+    if _full_registration_reset(warp_bin, scope):
+        for _ in range(6):
+            time.sleep(1.5)
+            candidate = _rotated_egress(warp_bin, avoid)
+            if candidate:
+                return {
+                    "status": "fresh",
+                    "address": candidate,
+                    "block": normalize_v6_64(candidate),
+                    "previous_block": old_prefix,
+                    "detail": "",
+                }
+            observed = get_public_v6(timeout=2.5)
+            if observed:
+                seen = observed
+
+    connected, _, _ = warp_status(warp_bin=warp_bin, force=True)
+    if not connected:
+        return {
+            "status": "down",
+            "address": "",
+            "block": "",
+            "previous_block": old_prefix,
+            "detail": "the tunnel dropped and would not reconnect",
+        }
+    if seen:
+        return {
+            "status": "reused",
+            "address": "",
+            "block": normalize_v6_64(seen),
+            "previous_block": old_prefix,
+            "detail": "the tunnel came back on the block it was already using",
+        }
+    return {
+        "status": "unreachable",
+        "address": "",
+        "block": "",
+        "previous_block": old_prefix,
+        "detail": "the tunnel is connected but the address probe never answered",
+    }
+
+
+def hop_once(
+    warp_bin: str,
+    max_reg_tries: int = 3,
+    avoid_prefixes: set[str] | None = None,
+    previous: str = "",
+) -> str:
+    """Rotate the WARP session until an unused public /64 is observed.
+
+    Returns an address whose /64 differs from the previous egress and from
+    every prefix in ``avoid_prefixes``. Returns an empty string when the
+    tunnel cannot produce a fresh block; use :func:`hop_report` to learn which
+    of the four ways it happened.
+    """
+    return hop_report(
+        warp_bin,
+        max_reg_tries=max_reg_tries,
+        avoid_prefixes=avoid_prefixes,
+        previous=previous,
+    )["address"]

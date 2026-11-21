@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Opencode Unlimited Usage — native Windows installer.
+    Opencode Unlimited Usage - native Windows installer.
 #>
 [CmdletBinding()]
 param(
@@ -15,6 +15,7 @@ $ScriptsDest = Join-Path $Dest "scripts"
 $BinDest = Join-Path $Dest "bin"
 $TaskKeeper = "OpencodeUnlimited-Keeper"
 $TaskGuard = "OpencodeUnlimited-Guard"
+$TaskWatchdog = "OpencodeUnlimited-Watchdog"
 $RepoWinDir = Join-Path $PSScriptRoot "src"
 if (-not (Test-Path (Join-Path $RepoWinDir "ouc_common.py"))) {
     $RepoWinDir = Join-Path $PSScriptRoot "windows"
@@ -33,7 +34,7 @@ function Test-IsAdmin {
 
 Write-Host ""
 Write-Host "  ==================================================="
-Write-Host "  Opencode Unlimited (Windows v3.0)"
+Write-Host "  Opencode Unlimited (Windows v4.0)"
 Write-Host "  Created & Maintained by Avatar (ShadowySphinX)"
 Write-Host "  ==================================================="
 Write-Host ""
@@ -60,7 +61,7 @@ if (-not $PyExe) {
 }
 if (-not $PyExe) {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Say "Python 3.10+ not found — attempting install via winget..."
+        Say "Python 3.10+ not found - attempting install via winget..."
         winget install --id Python.Python.3.12 -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
         $env:PATH = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
         $found = Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -99,7 +100,7 @@ if (-not $OcReal) {
     if ($onPath) { $OcReal = $onPath.Source }
 }
 if (-not $OcReal) {
-    Say "opencode CLI not found — running official Windows installer..."
+    Say "opencode CLI not found - running official Windows installer..."
     try {
         Invoke-Expression (Invoke-RestMethod -Uri "https://opencode.ai/install.ps1")
     } catch {
@@ -107,7 +108,7 @@ if (-not $OcReal) {
     }
     $OcReal = $OcCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
-if (-not $OcReal) { Die "opencode CLI not found — install OpenCode first (https://opencode.ai)." }
+if (-not $OcReal) { Die "opencode CLI not found - install OpenCode first (https://opencode.ai)." }
 Ok "opencode found: $OcReal"
 
 # ---------------------------------------------------------------- warp-cli.exe
@@ -123,13 +124,13 @@ if (-not $WarpBin) {
 }
 if (-not $WarpBin) {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Say "Cloudflare WARP not found — installing via winget..."
+        Say "Cloudflare WARP not found - installing via winget..."
         winget install --id Cloudflare.Warp -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
         Start-Sleep -Seconds 3
         $WarpBin = $WarpCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     }
 }
-if (-not $WarpBin) { Die "warp-cli.exe not found — install Cloudflare WARP from https://1.1.1.1/ and re-run." }
+if (-not $WarpBin) { Die "warp-cli.exe not found - install Cloudflare WARP from https://1.1.1.1/ and re-run." }
 Ok "warp-cli found: $WarpBin"
 
 # ---------------------------------------------------------------- Stop existing workers
@@ -186,7 +187,7 @@ if (Test-IsAdmin) {
         Warn "firewall kill-switch skipped: $fwOut"
     }
 } else {
-    Warn "not elevated — skipping optional Windows Firewall rule (zen-proxy still fails closed via WARP IPv6 bind)"
+    Warn "not elevated - skipping optional Windows Firewall rule (zen-proxy still fails closed via WARP IPv6 bind)"
 }
 
 # ---------------------------------------------------------------- Connect WARP in the selected mode (before starting keeper so they never race)
@@ -210,7 +211,7 @@ if (-not $SkipWarmCheck) {
     # invalidates the existing device and drops the tunnel.
     $regOut = (Invoke-Warp @("registration", "show") | Out-String)
     if ($LASTEXITCODE -ne 0 -or $regOut -match "registration missing|not registered|no registration") {
-        Say "no WARP registration found — creating one..."
+        Say "no WARP registration found - creating one..."
         Invoke-Warp @("registration", "new") | Out-Null
     }
 
@@ -266,7 +267,7 @@ if (-not $SkipWarmCheck) {
         if ($Connected) {
             Ok "warp tunnel: connected"
         } else {
-            Warn "warp tunnel still connecting — warp-keeper will keep retrying"
+            Warn "warp tunnel still connecting - warp-keeper will keep retrying"
         }
     }
 }
@@ -276,6 +277,12 @@ function Register-BgTask([string]$TaskName, [string]$ScriptFile, [string]$Desc) 
     $ScriptPath = Join-Path $ScriptsDest $ScriptFile
     $Action = New-ScheduledTaskAction -Execute $PywExe -Argument "`"$ScriptPath`""
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    # A worker that is killed or exits mid-session must come back without a
+    # logon or a dashboard click. The repetition starts it again every minute;
+    # IgnoreNew makes that a no-op while the live process holds its mutex.
+    $Watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     $Settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -287,7 +294,7 @@ function Register-BgTask([string]$TaskName, [string]$ScriptFile, [string]$Desc) 
 
     try {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description $Desc -ErrorAction Stop | Out-Null
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger @($Trigger, $Watchdog) -Settings $Settings -Description $Desc -ErrorAction Stop | Out-Null
         Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         return $true
     } catch {
@@ -299,8 +306,9 @@ function Register-BgTask([string]$TaskName, [string]$ScriptFile, [string]$Desc) 
     }
 }
 
-$tk1 = Register-BgTask -TaskName $TaskKeeper -ScriptFile "warp_keeper.py" -Desc "Opencode Unlimited — WARP keeper"
-$tk2 = Register-BgTask -TaskName $TaskGuard  -ScriptFile "zen_guard.py"  -Desc "Opencode Unlimited — quota wall auto-rotator"
+$tk1 = Register-BgTask -TaskName $TaskKeeper -ScriptFile "warp_keeper.py" -Desc "Opencode Unlimited - WARP keeper"
+$tk2 = Register-BgTask -TaskName $TaskGuard  -ScriptFile "zen_guard.py"  -Desc "Opencode Unlimited - quota wall auto-rotator"
+$tk3 = Register-BgTask -TaskName $TaskWatchdog -ScriptFile "ouc_watchdog.py" -Desc "Opencode Unlimited - restarts a dead keeper or guard"
 if ($tk1 -and $tk2) {
     Ok "scheduled background tasks registered & started ($TaskKeeper, $TaskGuard)"
 }
@@ -365,7 +373,7 @@ if ($ProxyReady) {
         $ErrorActionPreference = $prevEap
     }
 } else {
-    Warn "service proxy not yet listening on 127.0.0.1:41987 — CLI still works via per-launch zen-lane"
+    Warn "service proxy not yet listening on 127.0.0.1:41987 - CLI still works via per-launch zen-lane"
 }
 
 # ---------------------------------------------------------------- Run Doctor

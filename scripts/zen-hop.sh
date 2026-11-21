@@ -1,5 +1,5 @@
 #!/bin/bash
-# zen hop — manual identity rotation. renews the WireGuard session keys and
+# zen hop - manual identity rotation. renews the WireGuard session keys and
 # reconnects to obtain a new IPv6 /64. the device registration is kept.
 #
 # the keeper is paused during the hop so its tick cannot reconnect the tunnel
@@ -39,12 +39,17 @@ fi
 
 cur_v6(){
   local v ep
+  # Same rule as the guard: measure the host the model traffic uses.
   if [ "$USE_PROXY" = "1" ]; then
+    v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 https://opencode.ai/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)
+    case "$v" in *:*) echo "$v"; return;; esac
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -x socks5h://127.0.0.1:40000 -s -m 8 "$ep" 2>/dev/null)
       case "$v" in *:*) echo "$v"; return;; esac
     done
   else
+    v=$(timeout 10 curl -6 -s -m 8 https://opencode.ai/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)
+    case "$v" in *:*) echo "$v"; return;; esac
     for ep in https://api6.ipify.org https://api64.ipify.org; do
       v=$(timeout 10 curl -6 -s -m 8 "$ep" 2>/dev/null)
       case "$v" in *:*) echo "$v"; return;; esac

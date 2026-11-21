@@ -1,4 +1,4 @@
-"""Opencode Unlimited — Control Center GUI (Made by Avatar)."""
+"""Opencode Unlimited - Control Center GUI (Made by Avatar)."""
 
 from __future__ import annotations
 
@@ -56,21 +56,26 @@ from ouc_common import (
     get_egress_ip,
     get_warp_local_v6,
     hop_once,
+    hop_report,
     is_admin,
     is_cloudflare_v6,
     is_keeper_paused,
+    is_mutex_held,
     keeper_pause_ctx,
     normalize_v6_64,
     opencode_command,
     repair_warp_registration,
     run_hidden,
     run_warp,
+    service_proxy_wired,
+    task_enabled,
+    task_exists,
     warp_registration_healthy,
     warp_status,
 )
 from ouc_firewall import install_killswitch, is_killswitch_installed, remove_killswitch
 
-WINDOW_TITLE = "Opencode Unlimited v3.0 — Made by Avatar"
+WINDOW_TITLE = "Opencode Unlimited v4.0 - Made by Avatar"
 DETACHED_PROCESS = 0x00000008
 _WORKER_FILES = (
     "ouc_common.py",
@@ -85,6 +90,9 @@ _WORKER_FILES = (
     "proxy_chain.py",
     "clean_endpoint.py",
     "auto_resume.py",
+    "account_pool.py",
+    "desktop_brand.py",
+    "ouc_watchdog.py",
 )
 _SERVICE_ENV_KEYS = (
     "HTTPS_PROXY",
@@ -135,16 +143,6 @@ def _enable_dark_titlebar() -> None:
         pass
 
 
-def _is_mutex_held(name: str) -> bool:
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenMutexW.restype = ctypes.c_void_p
-    handle = kernel32.OpenMutexW(0x00100000, False, f"Local\\{name}")
-    if handle:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
-        return True
-    return False
-
-
 def clear_opencode_free_limit() -> int:
     """Delete client-side free-limit and go-upsell lockout rows from drafts.sqlite."""
     try:
@@ -155,33 +153,32 @@ def clear_opencode_free_limit() -> int:
         return 0
 
 
-def _task_exists(task_name: str) -> bool:
+_BRAND_CACHE: tuple[float, dict] = (0.0, {})
+# Reading an archive is not free; the answer changes about once per app update,
+# so the health panel holds it for five minutes instead of re-reading on every
+# refresh. A press of Apply clears it immediately.
+BRAND_CACHE_SECONDS = 300.0
+
+
+def _desktop_brand_state() -> dict:
+    """The desktop copy patch, cached: reading an archive on every refresh is noise."""
+    global _BRAND_CACHE
+    stamp, cached = _BRAND_CACHE
+    if cached and time.time() - stamp < BRAND_CACHE_SECONDS:
+        return cached
     try:
-        res = run_hidden(["schtasks", "/Query", "/TN", task_name], timeout=5.0)
-        return res.returncode == 0
+        import desktop_brand
+
+        state = desktop_brand.copy_status()
     except Exception:
-        return False
+        state = {}
+    _BRAND_CACHE = (time.time(), state)
+    return state
 
 
-def _task_xml_enabled(xml: str) -> bool:
-    """Parse a task XML export; enabled tasks omit the Enabled element."""
-    # schtasks writes UTF-16, which run_hidden may decode as single-byte text.
-    # Removing NULs recovers the ASCII XML we need on every Windows locale.
-    text = (xml or "").replace("\x00", "")
-    return not re.search(r"<enabled>\s*false\s*</enabled>", text, re.IGNORECASE)
-
-
-def _task_enabled(task_name: str) -> bool:
-    """True only for an existing, enabled logon task.
-
-    Auto-repair uses this so a worker the user deliberately turned off is
-    never restarted behind their back.
-    """
-    try:
-        res = run_hidden(["schtasks", "/Query", "/TN", task_name, "/XML"], timeout=5.0)
-        return res.returncode == 0 and _task_xml_enabled(res.stdout or "")
-    except Exception:
-        return False
+def _forget_desktop_brand() -> None:
+    global _BRAND_CACHE
+    _BRAND_CACHE = (0.0, {})
 
 
 def _port_open(port: int) -> bool:
@@ -212,7 +209,7 @@ def _probe_http(url: str, proxy: str | None, timeout: float = PROBE_TIMEOUT) -> 
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "opencode-unlimited-probe/3.0",
+            "User-Agent": "opencode-unlimited-probe/4.0",
             "Cache-Control": "no-cache",
             "Accept": "*/*",
         },
@@ -543,7 +540,7 @@ class AvatarControlApi:
 
         action = ""
         reason = ""
-        keeper_allowed = services["keeper_running"] or _task_enabled(TASK_KEEPER)
+        keeper_allowed = services["keeper_running"] or task_enabled(TASK_KEEPER)
         if wired and not services["proxy_listening"] and keeper_allowed:
             action, reason = "start_keeper", "OpenCode is wired to the local proxy but it stopped"
         elif services["keeper_running"] and services["keeper_heartbeat"] is not None and services["keeper_heartbeat"] > HEARTBEAT_STALE:
@@ -776,15 +773,7 @@ class AvatarControlApi:
             if val:
                 edge_override = val
 
-        svc_cfg = Path.home() / ".config" / "opencode" / "service.json"
-        svc_wired = False
-        if svc_cfg.is_file():
-            try:
-                cfg = json.loads(svc_cfg.read_text(encoding="utf-8"))
-                env_map = cfg.get("env", {}) if isinstance(cfg.get("env"), dict) else {}
-                svc_wired = f"127.0.0.1:{SERVICE_PROXY_PORT}" in str(env_map.get("HTTPS_PROXY", ""))
-            except Exception:
-                pass
+        svc_wired = service_proxy_wired()
 
         cli_path = find_opencode_cli() or ""
         desktop_path = find_opencode_desktop() or ""
@@ -819,10 +808,10 @@ class AvatarControlApi:
                 "rotating": is_keeper_paused(),
             },
             "services": {
-                "keeper_running": _is_mutex_held("OpencodeUnlimitedKeeper"),
-                "guard_running": _is_mutex_held("OpencodeUnlimitedGuard"),
-                "keeper_task": _task_exists(TASK_KEEPER),
-                "guard_task": _task_exists(TASK_GUARD),
+                "keeper_running": is_mutex_held("OpencodeUnlimitedKeeper"),
+                "guard_running": is_mutex_held("OpencodeUnlimitedGuard"),
+                "keeper_task": task_exists(TASK_KEEPER),
+                "guard_task": task_exists(TASK_GUARD),
                 "proxy_listening": _port_open(SERVICE_PROXY_PORT),
                 "proxy_port": SERVICE_PROXY_PORT,
                 "firewall_installed": is_killswitch_installed(),
@@ -1080,9 +1069,10 @@ class AvatarControlApi:
                 "warn",
                 "The free limit is not following the IP",
                 f"Two confirmed new IPv6 addresses still hit the free limit, so the allowance is no "
-                f"longer tied to your address. Rotation is paused until it resets around {reset} "
-                f"(your time). Use another provider, subscribe to OpenCode Go, or press Try now to "
-                f"force another address.",
+                f"longer tied to your address. Rotation is paused until it refills around {reset} "
+                f"(your time); the chats waiting on it continue by themselves then, without you typing "
+                f"anything. Use another provider, subscribe to OpenCode Go, or press Try now to force "
+                f"another address.",
                 "hop",
                 "Try now",
             )
@@ -1096,6 +1086,19 @@ class AvatarControlApi:
                 "that, or press Try now to get a new IP immediately.",
                 "hop",
                 "Try now",
+            )
+
+        brand_state = _desktop_brand_state()
+        if brand_state.get("supported") and not brand_state.get("patched"):
+            add(
+                "warn",
+                "The desktop app still pushes a subscription",
+                "OpenCode Desktop replaces the chat box with a card that asks you to subscribe, even "
+                "after the free allowance is about to refill by itself. Press Apply and the app is "
+                "rewritten with wording that matches what actually happens. Nothing else in the app "
+                "changes, and it can be put back the same way.",
+                "brand_desktop",
+                "Apply",
             )
 
         bad = any(i["level"] == "bad" for i in issues)
@@ -1133,6 +1136,15 @@ class AvatarControlApi:
 
     def fix_issue(self, action: str) -> dict:
         """One-click fixes for the problems listed in the health panel."""
+        if action == "brand_desktop":
+            try:
+                import desktop_brand
+
+                ok, message = desktop_brand.apply_copy()
+            except Exception as exc:
+                return {"ok": False, "message": f"The desktop patch could not run ({exc})."}
+            _forget_desktop_brand()
+            return {"ok": ok, "message": message}
         if action == "start_keeper":
             res = self.toggle_worker("keeper", True)
             for _ in range(20):
@@ -1503,14 +1515,23 @@ class AvatarControlApi:
                 except Exception:
                     pass
             with keeper_pause_ctx("avatar-ui-hop", seconds=300):
-                new_v6 = hop_once(
+                report = hop_report(
                     warp,
                     max_reg_tries=5,
                     avoid_prefixes=avoid,
                     previous=old_v6,
                 )
+            new_v6 = report["address"]
             if not new_v6:
-                return {"ok": False, "message": "Rotation failed — keeper will retry automatically."}
+                why = {
+                    "reused": "WARP came back on the same block",
+                    "down": "the tunnel would not come back up",
+                    "unreachable": "the tunnel is up but the address probe did not answer",
+                }.get(report.get("status", ""), "no fresh block was observed")
+                return {
+                    "ok": False,
+                    "message": f"Rotation failed - {why}. Keeper will retry automatically.",
+                }
             with self._egress_lock:
                 self._egress_v6 = new_v6
                 self._last_egress_ts = time.time()
@@ -1553,7 +1574,7 @@ class AvatarControlApi:
         if not enable:
             # Disable the logon task first so its restart-on-failure policy
             # cannot bring the worker back after the kill below.
-            if _task_exists(task_name):
+            if task_exists(task_name):
                 run_hidden(
                     ["schtasks", "/Change", "/TN", task_name, "/DISABLE"], timeout=8.0
                 )
@@ -1569,7 +1590,7 @@ class AvatarControlApi:
             return {"ok": True, "message": f"Stopped {name} ({killed} process{'es' if killed != 1 else ''})."}
 
         _deploy_scripts_and_shims()
-        if _task_exists(task_name):
+        if task_exists(task_name):
             run_hidden(
                 ["schtasks", "/Change", "/TN", task_name, "/ENABLE"], timeout=8.0
             )
@@ -1969,15 +1990,7 @@ class AvatarControlApi:
 
         if not _port_open(SERVICE_PROXY_PORT):
             self.toggle_worker("keeper", True)
-        svc_cfg = Path.home() / ".config" / "opencode" / "service.json"
-        already_wired = False
-        if svc_cfg.is_file():
-            try:
-                cfg = json.loads(svc_cfg.read_text(encoding="utf-8"))
-                env_map = cfg.get("env", {}) if isinstance(cfg.get("env"), dict) else {}
-                already_wired = f"127.0.0.1:{SERVICE_PROXY_PORT}" in str(env_map.get("HTTPS_PROXY", ""))
-            except Exception:
-                pass
+        already_wired = service_proxy_wired()
         if not already_wired:
             self.toggle_desktop_service_proxy(True)
         env = os.environ.copy()
@@ -2225,7 +2238,7 @@ def _prompt_webview2_install() -> None:
     ans = ctypes.windll.user32.MessageBoxW(
         None,
         msg,
-        "Opencode Unlimited — WebView2 Required",
+        "Opencode Unlimited - WebView2 Required",
         MB_YESNO | MB_ICONEXCLAMATION,
     )
     if ans == IDYES:
@@ -2270,7 +2283,7 @@ def _log_startup_error(exc: Exception) -> None:
         None,
         f"Failed to initialize Opencode Unlimited UI:\n\n{exc}\n\n"
         f"Details have been written to:\n{DEST_DIR}\\logs\\avatar_ui_error.log",
-        "Opencode Unlimited — Startup Error",
+        "Opencode Unlimited - Startup Error",
         MB_OK | MB_ICONERROR,
     )
 

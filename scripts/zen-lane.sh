@@ -1,5 +1,5 @@
 #!/bin/bash
-# zen lane — launches OpenCode through the local egress proxy.
+# zen lane - launches OpenCode through the local egress proxy.
 #
 # OpenCode's free-tier limit is applied to the public IP address the server
 # sees. On Linux, WARP runs in isolated proxy mode and listens on
@@ -27,9 +27,9 @@ if [ ! -x "$REAL" ]; then
     break
   done
 fi
-[ -x "$REAL" ] || { echo "opencode binary not found — set OUC_REAL_BIN or reinstall" >&2; exit 1; }
+[ -x "$REAL" ] || { echo "opencode binary not found - set OUC_REAL_BIN or reinstall" >&2; exit 1; }
 [ -f "$PYPROXY" ] || {
-  echo "zen-lane: local proxy missing at $PYPROXY — rerun install.sh" >&2
+  echo "zen-lane: local proxy missing at $PYPROXY - rerun install.sh" >&2
   exit 1
 }
 
@@ -68,7 +68,7 @@ for _ in $(seq 1 60); do
 done
 
 if [ -z "$PROXY_PORT" ]; then
-  echo "zen-lane: local egress proxy did not start — refusing to leak the home IP." >&2
+  echo "zen-lane: local egress proxy did not start - refusing to leak the home IP." >&2
   [ -s "$PROXY_LOG" ] && tail -n 6 "$PROXY_LOG" >&2
   echo "Run opencode-unlimited-doctor, then retry." >&2
   exit 1

@@ -24,3 +24,14 @@ Desktop.ini
 
 # Deprecated single-purpose binary
 OpencodeUnlimited-Avatar.exe
+
+# Local state and artifacts
+.env
+.env.*
+*.log
+*.jsonl
+*.sqlite*
+*.db
+*.deb
+reg.json
+attempts.json

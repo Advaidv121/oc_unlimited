@@ -845,7 +845,7 @@ def _repair_warp_tunnel(warp_state: _WarpState) -> bool:
             if not repair_warp_registration(warp_bin, 2):
                 return False
         try:
-            ensure_warp_protocol("wireguard", warp_bin=warp_bin)
+            ensure_warp_protocol("masque" if scope == "isolated" else "wireguard", warp_bin=warp_bin)
         except Exception:
             pass
         ensure_warp_mode(warp_bin, scope)
@@ -940,6 +940,12 @@ def _connect_upstream(
             _record_event("hold", "waiting for the tunnel rotation to finish", host)
 
     while True:
+        if _rotation_in_progress():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("WARP rotation is still in progress")
+            hold()
+            time.sleep(ROTATION_POLL_SECONDS)
+            continue
         try:
             sock = _open_upstream(host, port, warp_state)
         except Exception as exc:
@@ -1134,7 +1140,8 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
     warp_state = _WarpState(pool=pool, initial_edge=chosen_edge, ttl=1.5)
     handler = _make_handler(warp_state)
     try:
-        srv = _ThreadedTCPServer(("127.0.0.1", port), handler)
+        bind_host = os.environ.get("OUC_BIND_HOST", "127.0.0.1")
+        srv = _ThreadedTCPServer((bind_host, port), handler)
     except OSError as exc:
         _record_event("bind_fail", f"127.0.0.1:{port}: {exc}")
         raise
@@ -1145,7 +1152,7 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
     _publish_tunnel_count()
     _record_event(
         "start",
-        f"listening on 127.0.0.1:{actual_port} (edge={chosen_edge or 'isolated'})",
+        f"listening on {bind_host}:{actual_port} (edge={chosen_edge or 'isolated'})",
     )
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -1154,6 +1161,7 @@ def start_proxy_server(port: int = 0) -> tuple[_ThreadedTCPServer, int, str]:
         while True:
             time.sleep(1.0)
             try:
+                _publish_tunnel_count()
                 warp_state.poll_controls()
             except Exception:
                 pass

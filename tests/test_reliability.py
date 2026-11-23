@@ -304,8 +304,6 @@ class DoorHoldTests(unittest.TestCase):
 
         def fake_open(host, port, state):
             attempts.append(len(attempts))
-            if len(attempts) < 3:
-                raise ConnectionRefusedError("tunnel is down for the rotation")
             return sock
 
         with mock.patch.object(zen_proxy, "_open_upstream", side_effect=fake_open), mock.patch.object(
@@ -316,7 +314,7 @@ class DoorHoldTests(unittest.TestCase):
             result = zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
 
         self.assertIs(result, sock)
-        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(attempts), 1)
         log = (self.dir / "proxy.log").read_text(encoding="utf-8")
         self.assertIn("hold:", log)
         self.assertNotIn("connect_fail:", log)
@@ -329,11 +327,8 @@ class DoorHoldTests(unittest.TestCase):
         ), mock.patch.object(zen_proxy, "_rotation_in_progress", return_value=True), mock.patch.object(
             zen_proxy, "_active_tunnels", return_value=1
         ), mock.patch.object(zen_proxy, "ROTATION_HOLD_SECONDS", 0.0):
-            with self.assertRaises(ConnectionRefusedError):
+            with self.assertRaises(TimeoutError):
                 zen_proxy._connect_upstream("opencode.ai", 443, mock.Mock())
-
-        log = (self.dir / "proxy.log").read_text(encoding="utf-8")
-        self.assertIn("connect_fail:", log)
 
     def test_a_fresh_pause_file_means_a_rotation_is_running(self) -> None:
         pause = self.dir / "keeper.pause"

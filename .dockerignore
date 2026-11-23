@@ -1,0 +1,7 @@
+.git
+**/__pycache__
+*.exe
+*.deb
+*.log
+*.jsonl
+.env*

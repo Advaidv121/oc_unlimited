@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+ARG WARP_VERSION=2026.8.2115.0
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends ca-certificates curl gpg iproute2 iptables python3 \
+    && curl -fsSLo /tmp/cloudflare-warp.key https://pkg.cloudflareclient.com/pubkey.gpg \
+    && gpg --batch --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg /tmp/cloudflare-warp.key \
+    && rm /tmp/cloudflare-warp.key \
+    && echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ noble main' > /etc/apt/sources.list.d/cloudflare-warp.list \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends "cloudflare-warp=$WARP_VERSION" \
+    && useradd -m tester \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/ /opt/unlimited-v2/src/
+COPY start-mac.sh rotation_mac.py /opt/unlimited-v2/
+CMD ["bash", "/opt/unlimited-v2/start-mac.sh"]

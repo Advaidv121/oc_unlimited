@@ -43,7 +43,8 @@ def summarize(connection, since):
         quota_failure_count=len(failures),
         failures_by_model=dict(collections.Counter(x['model'] or 'unknown' for x in failures)),
         recent_failures=failures[-20:],
-        interpretation='A provider.free-limit response is an upstream quota rejection. '
+        interpretation='A provider.free-limit response is an upstream free-tier rejection. '
+        'It can represent quota exhaustion or a client/network eligibility restriction. '
         'Preceding token counts describe an earlier request; they do not establish '
         'the rejected request size or the provider quota accounting rules.',
     )

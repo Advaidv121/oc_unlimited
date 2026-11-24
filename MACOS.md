@@ -31,7 +31,14 @@ Run this from the checkout to inspect the last seven days of saved failures:
 
     python3 scripts/quota-diagnostics.py --days 7
 
-The report reads OpenCode's database without modifying it and includes models, status codes, retry delays, and the preceding request's context size. It omits prompts, response bodies, and credentials. A provider.free-limit error with HTTP 429 is an upstream quota rejection. The context size of a preceding successful request does not reveal the provider's quota formula or prove why the next request was rejected.
+The report reads OpenCode's database without modifying it and includes models, status codes, retry delays, and the preceding request's context size. It omits prompts, response bodies, and credentials. A provider.free-limit error with HTTP 429 is an upstream free-tier rejection. OpenCode can use this error for quota exhaustion or client/network eligibility restrictions; the error alone does not distinguish them. The context size of a preceding successful request does not reveal the provider's quota formula or prove why the next request was rejected.
+
+For passive request tracing on OpenCode 2.4.1, copy the plugin directory to the global plugins folder:
+
+    mkdir -p "$HOME/.config/opencode/plugins"
+    cp -R plugins/quota-trace "$HOME/.config/opencode/plugins/oc-quota-trace"
+
+OpenCode watches this directory and loads the plugin automatically. Confirm it appears as oc.quota-trace in the bundled CLI's plugin list. Metadata is written to ~/Library/Application Support/OpenCodeProxyQuotaGuard/request-trace.jsonl. The trace records model, request kind, message/text counts, output limits, header names, HTTP status, and retry decisions. It does not read request or response bodies or change model requests, identifiers, or retries. Session correlation uses a random, process-local keyed hash. Logs rotate at approximately 2 MB, retaining one previous file. Remove the installed plugin folder to stop tracing.
 
 This is an HTTPS CONNECT proxy: it forwards encrypted traffic and cannot inspect or rewrite model requests, quota responses, or session IDs. A verified WARP route change establishes connectivity, not recovered model allowance. The guard waits until all sessions are idle; if it cannot act within five minutes, it reports the expired event. For a confirmed free-limit response, use the reported retry delay or choose a model with available allowance. Repeated retries are not a guarantee of recovery.
 

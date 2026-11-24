@@ -8,6 +8,16 @@ const correlate = (value) => value ? createHmac('sha256', salt).update(String(va
 const directory = join(homedir(), 'Library/Application Support/OpenCodeProxyQuotaGuard');
 const logfile = join(directory, 'request-trace.jsonl');
 
+// A failed stream may already have run upstream. Permit one transport retry,
+// then stop replaying it. Never turn an upstream free-tier rejection into a retry.
+export function boundTransportRetries(event) {
+  if (event.error?.type === 'provider.transport' && event.attempt >= 3) {
+    event.decision = { retry: false };
+    return true;
+  }
+  return false;
+}
+
 // Deliberately select fields; never serialize a request, error, header values,
 // tool schema, prompt, or response body into the trace.
 export function contextMetadata(event) {
@@ -71,10 +81,16 @@ export default {
       write(event, { event: 'http-response', status: event.response.status,
         timeToHeadersMs: start === undefined ? null : Date.now() - start, headers });
     });
-    await hook('retry', (event) => write(event, { event: 'retry',
+    await hook('retry', (event) => {
+      const proposedRetry = event.decision?.retry;
+      const proposedDelayMs = event.decision?.delay;
+      const bounded = boundTransportRetries(event);
+      write(event, { event: 'retry',
       errorType: event.error?.type, status: event.error?.status,
       retryAfterMs: event.error?.retryAfterMs, attempt: event.attempt,
-      proposedRetry: event.decision?.retry, proposedDelayMs: event.decision?.delay }));
+      proposedRetry, proposedDelayMs, boundedTransportRetry: bounded,
+      effectiveRetry: event.decision?.retry });
+    });
     write({}, { event: 'loaded', version: ctx.app?.version });
     return async () => {
       for (const registration of registrations) await registration.dispose();

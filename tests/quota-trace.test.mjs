@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import plugin, { contextMetadata } from '../plugins/quota-trace/index.js';
+import plugin, { contextMetadata, boundTransportRetries } from '../plugins/quota-trace/index.js';
 
 test('metadata counts text without saving it or unapproved options', () => {
   const result = contextMetadata({ messages: [{ content: [{ text: 'secret' }, { type: 'image' }] }],
@@ -28,4 +28,22 @@ test('registers passive hooks and disposes all registrations', async () => {
   assert.deepEqual(event.decision, { retry: false });
   await cleanup();
   assert.equal(disposed, 5);
+});
+
+test('permits one transport retry and vetoes subsequent replays', () => {
+  const event = { error: { type: 'provider.transport' }, attempt: 2,
+    decision: { retry: true, delay: 2000 } };
+  assert.equal(boundTransportRetries(event), false);
+  assert.equal(event.decision.retry, true);
+  event.attempt = 3;
+  assert.equal(boundTransportRetries(event), true);
+  assert.deepEqual(event.decision, { retry: false });
+});
+
+test('preserves free-tier rejection and other retry decisions', () => {
+  for (const type of ['provider.free-limit', 'provider.rate-limit', 'provider.internal']) {
+    const event = { error: { type }, attempt: 5, decision: { retry: false } };
+    assert.equal(boundTransportRetries(event), false);
+    assert.deepEqual(event.decision, { retry: false });
+  }
 });

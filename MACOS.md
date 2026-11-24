@@ -25,6 +25,16 @@ For optional automatic WARP rotation, run the following from the checkout:
 
 The guard reads the local error log and checks the desktop service's active-session API before rotating. It attempts at most two rotations per hour and verifies whether the public WARP IPv6 block changed. Retry manually in OpenCode after a rotation. The guard does not resend chat messages or switch accounts.
 
+## Diagnose recurring quota errors
+
+Run this from the checkout to inspect the last seven days of saved failures:
+
+    python3 scripts/quota-diagnostics.py --days 7
+
+The report reads OpenCode's database without modifying it and includes models, status codes, retry delays, and the preceding request's context size. It omits prompts, response bodies, and credentials. A provider.free-limit error with HTTP 429 is an upstream quota rejection. The context size of a preceding successful request does not reveal the provider's quota formula or prove why the next request was rejected.
+
+This is an HTTPS CONNECT proxy: it forwards encrypted traffic and cannot inspect or rewrite model requests, quota responses, or session IDs. A verified WARP route change establishes connectivity, not recovered model allowance. The guard waits until all sessions are idle; if it cannot act within five minutes, it reports the expired event. For a confirmed free-limit response, use the reported retry delay or choose a model with available allowance. Repeated retries are not a guarantee of recovery.
+
 To stop the guard, run:
 
     launchctl bootout "gui/$(id -u)/local.opencode-proxy-quota-guard"

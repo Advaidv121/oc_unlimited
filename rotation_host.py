@@ -88,9 +88,17 @@ def main():
     print('Mac quota guard ready; checks OpenCode active sessions; retries remain manual')
     while True:
         cursor, found = scan(cursor)
-        pending = max(found, pending)
         now = time.time()
+        if found > pending and 0 <= now - found <= 300:
+            print('Quota guard: upstream quota rejection detected; waiting for idle '
+                  'sessions before a route check. A route change does not confirm recovery.')
+        pending = max(found, pending)
         attempts = [x for x in attempts if now - x < 3600]
+        if pending and now - pending > 300:
+            print('Quota guard: quota event expired without recovery verification; '
+                  'no task was resumed. Run scripts/quota-diagnostics.py for upstream '
+                  'status and retry delay.')
+            pending = 0
         if 6 <= now - pending <= 300 and (not attempts or pending > max(attempts)):
             if len(attempts) >= 2:
                 print('Quota guard: two rotation attempts this hour; waiting for a new error')
@@ -114,7 +122,8 @@ def main():
                             time.sleep(1)
                             after = route(while_paused=True)
                             if after is not None and after != before:
-                                print('Quota guard: new public IPv6 block verified; retry manually')
+                                print('Quota guard: new public IPv6 block verified; '
+                                      'upstream recovery unverified; retry manually')
                                 break
                         else:
                             print('Quota guard: no new public IPv6 block verified')

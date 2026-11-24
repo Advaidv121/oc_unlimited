@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac, randomBytes } from 'node:crypto';
+import { SessionRecovery } from './recovery.js';
 
 const salt = randomBytes(32);
 const correlate = (value) => value ? createHmac('sha256', salt).update(String(value)).digest('hex').slice(0, 16) : null;
@@ -9,7 +10,7 @@ const directory = join(homedir(), 'Library/Application Support/OpenCodeProxyQuot
 const logfile = join(directory, 'request-trace.jsonl');
 
 // A failed stream may already have run upstream. Permit one transport retry,
-// then stop replaying it. Never turn an upstream free-tier rejection into a retry.
+// then stop replaying it. Session recovery separately permits one bounded retry.
 export function boundTransportRetries(event) {
   if (event.error?.type === 'provider.transport' && event.attempt >= 3) {
     event.decision = { retry: false };
@@ -42,6 +43,8 @@ export default {
   async setup(ctx) {
     const registrations = [];
     const requests = new WeakMap();
+    const recovery = new SessionRecovery();
+    const recoveryEnabled = ctx.options?.sessionRecovery === true;
     function write(event, fields) {
       try {
         mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -57,12 +60,15 @@ export default {
       registrations.push(await ctx.session.hook(name, fn, { providerID: 'opencode' }));
     }
     await hook('context', (event) => write(event, { event: 'context', ...contextMetadata(event) }));
-    await hook('model.request', (event) => write(event, {
+    await hook('model.request', (event) => {
+      const replaced = recoveryEnabled && recovery.apply(event);
+      write(event, {
       event: 'model-request', headerNames: Object.keys(event.headers || {}).map(x => x.toLowerCase()).sort(),
       affinity: correlate(event.headers?.['x-session-affinity']),
       parent: correlate(event.headers?.['x-opencode-parent-session-id']),
-      client: event.headers?.['x-opencode-client'],
-    }));
+      client: event.headers?.['x-opencode-client'], recoveredAffinity: Boolean(replaced),
+    });
+    });
     await hook('http.request', (event) => {
       requests.set(event.request, Date.now());
       const url = new URL(event.request.url);
@@ -70,6 +76,7 @@ export default {
         headerNames: [...event.request.headers.keys()].sort() });
     });
     await hook('http.response', (event) => {
+      const recovered = recoveryEnabled ? recovery.response(event) : null;
       const start = requests.get(event.request);
       requests.delete(event.request);
       // This duration ends at response headers, not at the end of generation.
@@ -79,19 +86,22 @@ export default {
         if (value !== null) headers[name] = value.slice(0, 100);
       }
       write(event, { event: 'http-response', status: event.response.status,
-        timeToHeadersMs: start === undefined ? null : Date.now() - start, headers });
+        timeToHeadersMs: start === undefined ? null : Date.now() - start, headers,
+        recoveryAccepted: recovered });
     });
     await hook('retry', (event) => {
       const proposedRetry = event.decision?.retry;
       const proposedDelayMs = event.decision?.delay;
       const bounded = boundTransportRetries(event);
+      const recovering = recoveryEnabled && recovery.begin(event);
+      if (recoveryEnabled && !recovering) recovery.failure(event);
       write(event, { event: 'retry',
       errorType: event.error?.type, status: event.error?.status,
       retryAfterMs: event.error?.retryAfterMs, attempt: event.attempt,
       proposedRetry, proposedDelayMs, boundedTransportRetry: bounded,
-      effectiveRetry: event.decision?.retry });
+      sessionRecoveryRetry: Boolean(recovering), effectiveRetry: event.decision?.retry });
     });
-    write({}, { event: 'loaded', version: ctx.app?.version });
+    write({}, { event: 'loaded', version: ctx.app?.version, sessionRecovery: recoveryEnabled });
     return async () => {
       for (const registration of registrations) await registration.dispose();
     };

@@ -34,3 +34,9 @@ Use the official client and retain its normal request identity. If one model rej
 The plugin leaves the model, request parameters, route, and identifiers intact. After observing a stalled stream followed by three lengthy transport retries and a free-tier rejection, the plugin now permits at most one transport retry. It preserves free-tier rejection decisions. This bounds replay waste; it does not fix quota or eligibility. At the next failure, correlate the response status/retry event with request kind and context metrics. Only then compare normal-network versus proxy behavior, or reduce output/context settings in an isolated test. Changing many variables simultaneously makes a temporary success uninterpretable.
 
 No verified unlimited workaround has been established. The gateway's implementation and quota formula are not established by the client source, public issue comments, or route changes.
+
+## Port of earlier session recovery
+
+The earlier native engine had successful saved recovery evidence, including a real same-tab 94,620-token test on 15 November. That mechanism was absent from the later CONNECT relay. An opt-in plugin port now implements bounded replacement headers, parent/child consistency, in-memory successful mappings, and success/failure cooldowns. Eight focused JavaScript tests passed.
+
+The 24 November same-chat DeepSeek test recorded an initial 429, one retry with a different hashed upstream affinity, then another 429. The replacement was discarded and further automatic attempts stopped. The port leaves OpenCode's separately built promptCacheKey intact and therefore does not reproduce every part of the former engine's serialization. It is disabled by default because this live test did not restore DeepSeek access. Local chat IDs and messages were not rewritten.

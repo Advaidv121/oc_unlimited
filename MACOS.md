@@ -42,6 +42,12 @@ OpenCode watches this directory and loads the plugin automatically. Confirm it a
 
 This is an HTTPS CONNECT proxy: it forwards encrypted traffic and cannot inspect or rewrite model requests, quota responses, or session IDs. A verified WARP route change establishes connectivity, not recovered model allowance. The guard waits until all sessions are idle; if it cannot act within five minutes, it reports the expired event. For a confirmed free-limit response, use the reported retry delay or choose a model with available allowance. Repeated retries are not a guarantee of recovery.
 
+### Experimental session recovery
+
+The plugin includes an opt-in port of the older engine's bounded upstream identity recovery. Enable it by explicitly configuring the installed plugin directory with options.sessionRecovery=true. Disable its automatic discovery entry first with -oc.quota-trace so it is not loaded twice. The recovery uses one replacement-header retry for an initial free-model 429, keeps mappings in memory, limits failed recovery to once per ten minutes, and permits another recovery thirty seconds after accepted response headers. Parent/child headers are replaced consistently. Local database IDs and message bodies are untouched. HTTP 200 headers establish acceptance, not stream completion.
+
+This port changes model-request headers through OpenCode's supported hook; it does not rewrite the separately constructed promptCacheKey, so it is not identical to the former opencode2api request builder. A same-chat DeepSeek test on 24 November verified that replacement headers were applied, but both original and replacement requests returned 429. Recovery is therefore disabled by default. It is an experiment, not a demonstrated fix for that rejection.
+
 To stop the guard, run:
 
     launchctl bootout "gui/$(id -u)/local.opencode-proxy-quota-guard"

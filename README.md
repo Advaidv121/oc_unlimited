@@ -46,4 +46,11 @@ A local WARP routing setup for OpenCode Desktop on macOS, with an optional backg
 
 See the [macOS guide](MACOS.md) for the optional guard and how to undo the setup, or the [upstream documentation](UPSTREAM.md) for other platforms.
 
+For automatic recovery when a free model rejects a request, install the included OpenCode 2.4.1 plugin from the checkout:
+
+    mkdir -p "$HOME/.config/opencode/plugins/oc-quota-trace"
+    cp plugins/quota-trace/*.js plugins/quota-trace/package.json "$HOME/.config/opencode/plugins/oc-quota-trace/"
+
+It retries the same chat step with a compatible available free model, without switching providers or replacing chat IDs. See [automatic free-model fallback](MACOS.md#automatic-free-model-fallback) for its bounds and how to disable it.
+
 Based on the work of [ShadowySphinX (Avatar)](https://github.com/ShadowySphinX). Distributed under the [MIT License](LICENSE).

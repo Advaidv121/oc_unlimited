@@ -22,12 +22,12 @@ test('registers passive hooks and disposes all registrations', async () => {
       return { dispose: async () => { disposed++; } };
     },
   } });
-  assert.deepEqual([...hooks.keys()], ['context', 'model.request', 'http.request', 'http.response', 'retry']);
+  assert.deepEqual([...hooks.keys()], ['context', 'experimental.model.resolve', 'model.request', 'http.request', 'http.response', 'retry']);
   const event = { error: { type: 'provider.free-limit', status: 429 }, decision: { retry: false } };
-  hooks.get('retry')(event);
+  await hooks.get('retry')(event);
   assert.deepEqual(event.decision, { retry: false });
   await cleanup();
-  assert.equal(disposed, 5);
+  assert.equal(disposed, 6);
 });
 
 test('permits one transport retry and vetoes subsequent replays', () => {
@@ -46,4 +46,25 @@ test('preserves free-tier rejection and other retry decisions', () => {
     assert.equal(boundTransportRetries(event), false);
     assert.deepEqual(event.decision, { retry: false });
   }
+});
+
+test('registered hooks recover a rejected step by resolving a free alternative', async () => {
+  const hooks = new Map();
+  const info = id => ({ id, providerID: 'opencode', enabled: true, status: 'active',
+    capabilities: { input: ['text'], output: ['text'], tools: true },
+    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+    limit: { context: 200000, output: 32000 } });
+  const cleanup = await plugin.setup({ app: { version: 'test' },
+    model: { list: async () => [info('deepseek-v4.1-flash-free'), info('hy4-flash-free')] },
+    session: { hook: async (name, fn) => { hooks.set(name, fn); return { dispose: async () => {} }; } } });
+  const event = { sessionID: 'integration', agent: 'build', kind: 'primary',
+    model: { providerID: 'opencode', id: 'deepseek-v4.1-flash-free' }, headers: { 'x-opencode-session-id': 'integration' } };
+  await hooks.get('model.request')(event);
+  const failed = { ...event, attempt: 2, error: { type: 'provider.free-limit', status: 429 }, decision: { retry: false } };
+  await hooks.get('retry')(failed);
+  assert.deepEqual(failed.decision, { retry: true, delay: 1000 });
+  await hooks.get('experimental.model.resolve')(event);
+  assert.equal(event.model.id, 'hy4-flash-free');
+  assert.equal(event.headers['x-opencode-session-id'], 'integration');
+  await cleanup();
 });

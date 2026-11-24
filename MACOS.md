@@ -33,12 +33,20 @@ Run this from the checkout to inspect the last seven days of saved failures:
 
 The report reads OpenCode's database without modifying it and includes models, status codes, retry delays, and the preceding request's context size. It omits prompts, response bodies, and credentials. A provider.free-limit error with HTTP 429 is an upstream free-tier rejection. OpenCode can use this error for quota exhaustion or client/network eligibility restrictions; the error alone does not distinguish them. The context size of a preceding successful request does not reveal the provider's quota formula or prove why the next request was rejected.
 
-For passive request tracing on OpenCode 2.4.1, copy the plugin directory to the global plugins folder:
+For request tracing and automatic free-model fallback on OpenCode 2.4.1, copy the plugin directory to the global plugins folder:
 
-    mkdir -p "$HOME/.config/opencode/plugins"
-    cp -R plugins/quota-trace "$HOME/.config/opencode/plugins/oc-quota-trace"
+    mkdir -p "$HOME/.config/opencode/plugins/oc-quota-trace"
+    cp plugins/quota-trace/*.js plugins/quota-trace/package.json "$HOME/.config/opencode/plugins/oc-quota-trace/"
 
-OpenCode watches this directory and loads the plugin automatically. Confirm it appears as oc.quota-trace in the bundled CLI's plugin list. Metadata is written to ~/Library/Application Support/OpenCodeProxyQuotaGuard/request-trace.jsonl. The trace records model, request kind, message/text counts, output limits, header names, HTTP status, and retry decisions. It does not read request or response bodies or change model requests or identifiers. It allows at most one retry after a transport failure, then stops repeated replays; it preserves upstream free-tier rejection decisions. Session correlation uses a random, process-local keyed hash. Logs rotate at approximately 2 MB, retaining one previous file. Remove the installed plugin folder to stop tracing.
+OpenCode watches this directory and loads the plugin automatically. Confirm it appears as oc.quota-trace in the bundled CLI's plugin list. Metadata is written to ~/Library/Application Support/OpenCodeProxyQuotaGuard/request-trace.jsonl. The trace records model, request kind, message/text counts, output limits, header names, HTTP status, and retry decisions. It does not read request or response bodies. Session correlation uses a random, process-local keyed hash. Logs rotate at approximately 2 MB, retaining one previous file. Remove the installed plugin folder to stop tracing and fallback.
+
+### Automatic free-model fallback
+
+The plugin is enabled by default and retries the same primary step on another compatible free model after a free-tier 429 or repeated transport failure. It tries at most two alternatives in a recovery chain, choosing from HY4 Flash Free, DeepSeek Flash Free, and MiMo Flash Free. It checks the current catalog for availability, zero pricing, tool support, input modalities, and sufficient model input capacity. Auxiliary title/generation traffic is excluded. Ambiguous overlapping traffic is left to OpenCode's normal retry policy. Subagents have independent state.
+
+The current session, history, permission rules, credentials, and proxy connection stay in place. The selection in the model picker can remain on the original model while the response record shows the actual fallback model. Subsequent steps reuse the fallback in memory; an explicit different model selection resets that routing choice. Plugin reloads/service restarts reset the mappings. Server-provided retry delays keep rejected models out of the candidate set for that session. Transport failures allow one retry on the original model before considering an alternative.
+
+This uses available allowance on another model and does not remove upstream limits. If every compatible candidate is rejected, the bounded chain ends with the provider error. Set the configured plugin option freeModelFallback=false to disable model fallback. Experimental session-ID replacement stays disabled unless explicitly enabled.
 
 This is an HTTPS CONNECT proxy: it forwards encrypted traffic and cannot inspect or rewrite model requests, quota responses, or session IDs. A verified WARP route change establishes connectivity, not recovered model allowance. The guard waits until all sessions are idle; if it cannot act within five minutes, it reports the expired event. For a confirmed free-limit response, use the reported retry delay or choose a model with available allowance. Repeated retries are not a guarantee of recovery.
 

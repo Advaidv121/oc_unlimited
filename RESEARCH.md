@@ -35,6 +35,23 @@ The plugin leaves the model, request parameters, route, and identifiers intact. 
 
 No verified unlimited workaround has been established. The gateway's implementation and quota formula are not established by the client source, public issue comments, or route changes.
 
+## Implementation comparison
+
+| Project | Recovery approach inspected | Implication for this macOS setup |
+| --- | --- | --- |
+| [ebouther/opencode-unlimited-proxy](https://github.com/ebouther/opencode-unlimited-proxy) | An application gateway prepares requests, owns WARP exit pools, and retries failures; the previous local modified engine added bounded affinity recovery. | This is a different protocol gateway from the current CONNECT relay. Earlier same-chat success does not establish current gateway eligibility; porting its header recovery did not restore DeepSeek. |
+| [ignicat/opencode-unlimited-usage](https://github.com/ignicat/opencode-unlimited-usage) | Shell guards monitor quota log text, avoid previously rejected network blocks, and rotate the route. | A different route does not demonstrate model recovery. It does not solve the captured repeated stream failures or make the failed chat continue automatically. |
+| [ShadowySphinX/Opencode-Unlimited-Limit-Bypass-](https://github.com/ShadowySphinX/Opencode-Unlimited-Limit-Bypass-) | CONNECT routing, route guard, and platform-specific continuation/lockout handling. | This is the basis of the current Mac port. Its HTTPS relay cannot read the rejection. Upstream continuation code has no working native Mac keystroke path and selects the latest session rather than the exact failing step. |
+| [Tazmyan/OpenCode-Unlimited](https://github.com/Tazmyan/OpenCode-Unlimited) | Windows tools clear local limit records, rewrite session IDs, and coordinate network routes. | Direct database rewriting introduces consistency risks. The local same-chat tests demonstrate that usable model allowance can exist without replacing local IDs. |
+
+The improvement implemented here uses OpenCode's supported retry and model-resolution hooks, rather than copying database mutation or foreground keystroke automation. It changes only the model serving a primary step, under the same provider, with normal chat history and permissions. Candidate selection is conservative: known free models, zero catalog pricing, tool support, matching modalities, and at least the source model's input capacity. It respects known per-session/model rejection delays and bounds alternatives. A stopped task is never resumed by an unrelated synthetic continuation.
+
+## Verified automatic fallback
+
+On 24 November, a real request in the previously failing Desktop chat returned DeepSeek HTTP 429. The plugin scheduled one normal retry and resolved that attempt to HY4 with identical local session/affinity and context. HY4 finished with AUTO_FALLBACK_OK, reporting 1,445 input and 132,864 cached tokens. The saved assistant record named HY4, so response accounting followed the routed model.
+
+A following primary turn reused HY4 and completed three separate shell arithmetic calls plus a final response with TOOL_CHAIN_OK. The four model steps each carried approximately 134,000 input/cached tokens and returned without an error. The calculations produced 5,050, 338,350, and 25,502,500. After plugin reload, a further same-chat follow-up again encountered DeepSeek 429, automatically retried HY4, and completed with FOLLOWUP_OK and correct prior results. This verifies quota-to-fallback recovery and a short tool workflow in the same chat; it is not a test of indefinite operation, all-model exhaustion, or live subagent failure. Seventeen JavaScript and four diagnostic Python tests passed.
+
 ## Port of earlier session recovery
 
 The earlier native engine had successful saved recovery evidence, including a real same-tab 94,620-token test on 15 November. That mechanism was absent from the later CONNECT relay. An opt-in plugin port now implements bounded replacement headers, parent/child consistency, in-memory successful mappings, and success/failure cooldowns. Eight focused JavaScript tests passed.

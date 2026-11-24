@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac, randomBytes } from 'node:crypto';
 import { SessionRecovery } from './recovery.js';
+import { FreeModelFallback } from './fallback.js';
 
 const salt = randomBytes(32);
 const correlate = (value) => value ? createHmac('sha256', salt).update(String(value)).digest('hex').slice(0, 16) : null;
@@ -45,6 +46,9 @@ export default {
     const requests = new WeakMap();
     const recovery = new SessionRecovery();
     const recoveryEnabled = ctx.options?.sessionRecovery === true;
+    const fallback = new FreeModelFallback();
+    const fallbackEnabled = ctx.options?.freeModelFallback !== false;
+    const listModels = () => ctx.model.list();
     function write(event, fields) {
       try {
         mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -60,7 +64,15 @@ export default {
       registrations.push(await ctx.session.hook(name, fn, { providerID: 'opencode' }));
     }
     await hook('context', (event) => write(event, { event: 'context', ...contextMetadata(event) }));
+    await hook('experimental.model.resolve', async (event) => {
+      if (!fallbackEnabled) return;
+      try {
+        const routed = await fallback.resolve(event, listModels);
+        if (routed) write(event, { event: 'model-fallback-resolved', ...routed });
+      } catch { /* Keep the requested model on a registry/diagnostic failure. */ }
+    });
     await hook('model.request', (event) => {
+      fallback.noteRequest(event);
       const replaced = recoveryEnabled && recovery.apply(event);
       write(event, {
       event: 'model-request', headerNames: Object.keys(event.headers || {}).map(x => x.toLowerCase()).sort(),
@@ -89,19 +101,25 @@ export default {
         timeToHeadersMs: start === undefined ? null : Date.now() - start, headers,
         recoveryAccepted: recovered });
     });
-    await hook('retry', (event) => {
+    await hook('retry', async (event) => {
       const proposedRetry = event.decision?.retry;
       const proposedDelayMs = event.decision?.delay;
       const bounded = boundTransportRetries(event);
-      const recovering = recoveryEnabled && recovery.begin(event);
+      let switched = null;
+      if (fallbackEnabled) {
+        try { switched = await fallback.retry(event, listModels); } catch {}
+      }
+      const recovering = !switched && recoveryEnabled && recovery.begin(event);
       if (recoveryEnabled && !recovering) recovery.failure(event);
       write(event, { event: 'retry',
       errorType: event.error?.type, status: event.error?.status,
       retryAfterMs: event.error?.retryAfterMs, attempt: event.attempt,
       proposedRetry, proposedDelayMs, boundedTransportRetry: bounded,
-      sessionRecoveryRetry: Boolean(recovering), effectiveRetry: event.decision?.retry });
+      sessionRecoveryRetry: Boolean(recovering), freeModelFallback: switched,
+      effectiveRetry: event.decision?.retry });
     });
-    write({}, { event: 'loaded', version: ctx.app?.version, sessionRecovery: recoveryEnabled });
+    write({}, { event: 'loaded', version: ctx.app?.version, sessionRecovery: recoveryEnabled,
+      freeModelFallback: fallbackEnabled });
     return async () => {
       for (const registration of registrations) await registration.dispose();
     };
